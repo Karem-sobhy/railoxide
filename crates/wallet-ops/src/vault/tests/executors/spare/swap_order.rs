@@ -1,4 +1,4 @@
-use super::swap_setup::{USDC, WETH, broadcaster, password};
+use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
 use crate::{
@@ -8,7 +8,8 @@ use crate::{
 };
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
 use broadcaster_core::contracts::cow::{
-    AppData, ORDER_KIND_SELL, Order, order_digest, order_uid, recover_order_signer,
+    AppData, BUY_NATIVE_TOKEN, ORDER_KIND_SELL, Order, TOKEN_BALANCE_ERC20, order_digest,
+    order_uid, recover_order_signer,
 };
 use broadcaster_core::contracts::railgun::{approveCall, transferCall};
 
@@ -294,6 +295,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
             sell_token: WETH,
             buy_token: USDC,
             amount,
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         profile.app_data_byte_budget(),
@@ -479,7 +481,12 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     .unwrap();
     let operation = ExecutorOperationId::random().unwrap();
     let executor = setup_owner
-        .prepare_swap_setup(operation, broadcaster(delegate), WETH, USDC, &password())
+        .prepare_swap_setup(
+            operation,
+            broadcaster(delegate),
+            setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            &password(),
+        )
         .await
         .unwrap()
         .context()
@@ -592,6 +599,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             sell_token: WETH,
             buy_token: USDC,
             amount,
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         swap_profile.app_data_byte_budget(),
@@ -993,6 +1001,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             sell_token: WETH,
             buy_token: USDC,
             amount: amount / U256::from(2),
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         swap_profile.app_data_byte_budget(),
@@ -1050,6 +1059,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             sell_token: WETH,
             buy_token: dai,
             amount,
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         swap_profile.app_data_byte_budget(),
@@ -1144,7 +1154,12 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
     .unwrap();
     let operation = ExecutorOperationId::random().unwrap();
     let prepared = owner
-        .prepare_swap_setup(operation, broadcaster(delegate), WETH, USDC, &password())
+        .prepare_swap_setup(
+            operation,
+            broadcaster(delegate),
+            setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            &password(),
+        )
         .await
         .unwrap();
     let reserved = crate::SwapExecutor::reserved(&prepared).unwrap();
@@ -1192,6 +1207,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             sell_token: WETH,
             buy_token: USDC,
             amount,
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         swap_profile.app_data_byte_budget(),
@@ -1229,12 +1245,10 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
     // At 1 gwei and this quote's rate of at least 3,000 USDC/ETH, the cost must cover the
     // estimated hook gas. The declared limits' margin only caps execution and isn't priced.
     let estimated_gas = plan.hook_gas_estimate();
-    assert!(estimated_gas < plan.pre_hook_gas_limit() + plan.post_hook_gas_limit());
+    let declared_gas = plan.pre_hook_gas_limit() + plan.post_hook_gas_limit().unwrap();
+    assert!(estimated_gas < declared_gas);
     assert!(review.hook_cost() >= U256::from(estimated_gas) * U256::from(3));
-    assert!(
-        review.hook_cost()
-            < U256::from(plan.pre_hook_gas_limit() + plan.post_hook_gas_limit()) * U256::from(3)
-    );
+    assert!(review.hook_cost() < U256::from(declared_gas) * U256::from(3));
     let private_minimum = review.suggested_private_minimum();
     // An unverified price is approved only with the user's acknowledgement.
     assert!(review.approval(private_minimum, false).is_err());
@@ -1354,6 +1368,372 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
     owner.shutdown().await;
     drop(owner);
     drop(restarted);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// An External order pays its approved receiver and carries only the pre-hook. The setup's
+// approval, with its pair and delivery, binds the first order; later orders on the account may
+// choose either delivery kind.
+#[tokio::test]
+async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let profile = chain.accepted_executor_profile().unwrap();
+    let delegate = profile.delegate();
+    let swap_profile = chain.swap_profile().unwrap();
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let approved = SwapDelivery::External {
+        receiver: Address::repeat_byte(0x91),
+    };
+    let receiver = Address::repeat_byte(0x92);
+    let moved = SwapDelivery::External { receiver };
+
+    // The approved terms are in the write that creates the record, before its address is bound.
+    let reserved = ExecutorOperationId::random().unwrap();
+    store
+        .reserve_with_swap_approval(
+            reserved,
+            delegate,
+            Some("Private swap"),
+            &[crate::ExecutorAsset::Erc20(USDC)],
+            Some(setup_approval(USDC, Address::ZERO, approved)),
+        )
+        .unwrap();
+    let record = store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == reserved)
+        .unwrap();
+    assert_eq!(record.swap_approval_tokens(), Some((USDC, Address::ZERO)));
+    assert_eq!(
+        record.swap_approval().map(|approval| approval.delivery),
+        Some(approved)
+    );
+
+    let operation = ExecutorOperationId::random().unwrap();
+    let executor = owner
+        .prepare_swap_setup(
+            operation,
+            broadcaster(delegate),
+            setup_approval(USDC, Address::ZERO, approved),
+            &password(),
+        )
+        .await
+        .unwrap()
+        .context()
+        .executor;
+    let before =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    store.reconcile(operation, before, &[]).unwrap();
+    let setup = B256::repeat_byte(3);
+    store
+        .record_issued(
+            operation,
+            IssuedExecutorPayload::new(
+                U256::ZERO,
+                delegate,
+                setup,
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(Bytes::from_static(b"setup"), before, Vec::new()),
+            ),
+        )
+        .unwrap();
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    let setup_won = (
+        setup,
+        ExecutorPayloadInclusion::new(
+            BlockNumHash::new(11, B256::repeat_byte(11)),
+            B256::repeat_byte(4),
+            ExecutorExecutionResult::Executed,
+        ),
+    );
+    let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+    let code = [
+        EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+        delegate.as_slice(),
+    ]
+    .concat();
+    let SwapSetupStatus::Delegated(delegated) =
+        swap_setup_status(&record, observed.block(), &code, profile)
+    else {
+        panic!("the setup delegated the executor");
+    };
+
+    let amount = U256::from(1_000_000);
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(
+            view.scan_keys().master_public_key,
+            USDC,
+            amount,
+            [7; 16],
+        ),
+        0,
+        0,
+        UtxoSource {
+            tx_hash: B256::ZERO,
+            block_number: 0,
+            block_timestamp: 0,
+        },
+        UtxoCommitmentKind::Shield,
+    );
+    let builder = railgun_wallet::TransactionBuilder {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: Address::repeat_byte(4),
+        relay_adapt_contract: Address::repeat_byte(5),
+    };
+    let quote: CowQuote = serde_json::from_value(json!({
+        "quote": {
+            "sellToken": USDC, "buyToken": BUY_NATIVE_TOKEN, "sellAmount": "997500",
+            "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0", "gasAmount": "0",
+            "gasPrice": "0", "sellTokenPrice": "1000000000000", "kind": "sell",
+            "partiallyFillable": false
+        },
+        "expiration": "", "id": 7, "verified": true
+    }))
+    .unwrap();
+    let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
+    let review = |buy_token, delivery| {
+        let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
+            &builder,
+            &swap_profile,
+            delegated,
+            std::slice::from_ref(&input),
+            &SwapAmountRequest {
+                sell_token: USDC,
+                buy_token,
+                amount,
+                delivery,
+                byte_budget: None,
+            },
+            swap_profile.app_data_byte_budget(),
+            None,
+        )
+        .unwrap() else {
+            panic!("one note fits one order");
+        };
+        crate::price_swap_review(
+            plan,
+            quote.clone(),
+            SwapPrice::Unverified,
+            U256::from(25),
+            U256::from(25),
+            50,
+            1,
+            U256::ZERO,
+            isolation,
+        )
+        .unwrap()
+    };
+    let first = review(Address::ZERO, approved);
+    let changed = review(Address::ZERO, moved);
+    let private_minimum = changed.suggested_private_minimum();
+
+    // The receiver's address is part of the approved terms; its label is not, so the same
+    // address keeps the approval.
+    let approval = first
+        .approval(first.suggested_private_minimum(), true)
+        .unwrap();
+    assert_eq!(first.approval_change(&approval), None);
+    assert_eq!(
+        changed.approval_change(&approval),
+        Some(SwapReviewChange::Delivery)
+    );
+    let mut private = approval.clone();
+    private.delivery = SwapDelivery::Reshield;
+    assert_eq!(
+        first.approval_change(&private),
+        Some(SwapReviewChange::Delivery)
+    );
+    // No post-hook, no shield fee: the receiver's minimum is the buy amount.
+    assert_eq!(approval.bounds.post_hook_gas_limit, None);
+    assert_eq!(approval.bounds.shield_fee_bps, U256::ZERO);
+    assert_eq!(approval.bounds.buy_amount, approval.bounds.private_minimum);
+
+    let (orderbook_url, submissions, orderbook_task) = spawn_orderbook_with_lost_response(
+        db.clone(),
+        view.clone(),
+        operation,
+        swap_profile.settlement(),
+        true,
+    )
+    .await;
+    let orderbook = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        orderbook_url,
+        1,
+    )
+    .unwrap();
+    let transaction = Transaction {
+        proof: SnarkProof::default(),
+        merkleRoot: B256::ZERO,
+        nullifiers: vec![B256::from(input.nullifier(view.scan_keys().nullifying_key))],
+        commitments: vec![B256::ZERO],
+        boundParams: BoundParams::new_transact(0, 0, 1, Vec::new(), executor, B256::ZERO),
+        unshieldPreimage: CommitmentPreimage::empty(),
+    };
+    let authorization = password();
+    let output_pois = OutputPois::default();
+    let anchors = crate::TokenAnchorRateCache::new();
+    let tokens = crate::settings::EffectiveTokenRegistry {
+        tokens: std::collections::BTreeMap::new(),
+    };
+    macro_rules! issue {
+        ($review:expr) => {
+            owner
+                .issue_swap_order(crate::SwapOrderSigning {
+                    review: $review,
+                    private_minimum: $review.suggested_private_minimum(),
+                    price_acknowledged: true,
+                    transactions: vec![transaction.clone()],
+                    inputs: std::slice::from_ref(&input),
+                    change_output_pois: Vec::new(),
+                    output_pois: &output_pois,
+                    authorization: &authorization,
+                    orderbook: &orderbook,
+                    anchor_cache: &anchors,
+                    token_registry: &tokens,
+                })
+                .await
+        };
+    }
+    let record = || {
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    };
+
+    // The first order must be the one approved with the setup. Another receiver returns to
+    // review and another pair is refused, both before anything is signed.
+    assert_eq!(
+        issue!(&changed).unwrap(),
+        SwapOrderOutcome::ReviewRequired(SwapReviewChange::Delivery)
+    );
+    let dai = alloy::primitives::address!("6b175474e89094c44da98b954eedeac495271d0f");
+    let other_pair = review(dai, approved);
+    assert!(
+        issue!(&other_pair)
+            .unwrap_err()
+            .to_string()
+            .contains("differ from the ones approved")
+    );
+    let unsigned = record();
+    assert!(unsigned.swap().is_none());
+    assert_eq!(unsigned.issued().len(), 1);
+    assert_eq!(
+        unsigned.swap_approval().map(|approval| approval.delivery),
+        Some(approved)
+    );
+    assert!(submissions.lock().unwrap().is_empty());
+
+    // Once the user approves the new receiver, the same order is signed and persisted. Its
+    // submission response is lost, and the resubmission rebuilds the identical order.
+    owner
+        .record_swap_approval(operation, changed.approval(private_minimum, true).unwrap())
+        .unwrap();
+    assert!(
+        issue!(&changed)
+            .unwrap_err()
+            .downcast_ref::<crate::cow::CowApiError>()
+            .is_some()
+    );
+    let signed = record();
+    let saved = signed.swap().unwrap().orders()[0].clone();
+    assert_eq!(saved.delivery(), moved);
+    assert!(saved.post_hook().is_none());
+    let [_, pre_hook] = signed.issued() else {
+        panic!("an External order issues only its pre-hook");
+    };
+    assert_eq!(pre_hook.purpose(), ExecutorPayloadPurpose::SwapPreHook);
+    // The executor never holds the bought asset, so recovery doesn't track it.
+    assert_eq!(signed.assets(), &[crate::ExecutorAsset::Erc20(USDC)]);
+    assert_eq!(
+        owner
+            .resubmit_swap_order(operation, &orderbook)
+            .await
+            .unwrap(),
+        SwapOrderOutcome::Submitted { uid: saved.uid() }
+    );
+    let submitted = submissions.lock().unwrap().clone();
+    let [(persisted, body), (_, resent)] = submitted.as_slice() else {
+        panic!("one initial request and one resubmission");
+    };
+    assert!(*persisted);
+    assert_eq!(body, resent);
+    let order = submitted_order(body);
+    assert_eq!(
+        (order.receiver, order.buyToken, order.buyAmount),
+        (receiver, BUY_NATIVE_TOKEN, private_minimum)
+    );
+    assert_eq!(order.buyTokenBalance, TOKEN_BALANCE_ERC20);
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    assert_eq!((hooks.pre.len(), hooks.post.len()), (1, 0));
+
+    // After that order ends, the account can place a Reshield order for another pair.
+    let expired = SwapOrderObservations {
+        pre_hook_dead: Some(SwapPreHookDeath {
+            cause: SwapPreHookDeathCause::Expired,
+            observation: SwapObservation {
+                block: observed.block(),
+                transaction_hash: None,
+            },
+        }),
+        ..SwapOrderObservations::default()
+    };
+    store
+        .record_swap_observations(operation, saved.uid(), expired)
+        .unwrap();
+    // The fixture expires the order immediately; a real expiry also advances the deadline.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let reshield = review(WETH, SwapDelivery::Reshield);
+    assert!(matches!(
+        issue!(&reshield).unwrap(),
+        SwapOrderOutcome::Submitted { .. }
+    ));
+    let body = submissions.lock().unwrap()[2].1.clone();
+    assert_eq!(submitted_order(&body).receiver, executor);
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    assert_eq!(hooks.post.len(), 1);
+    assert_eq!(
+        record().assets(),
+        &[
+            crate::ExecutorAsset::Erc20(USDC),
+            crate::ExecutorAsset::Erc20(WETH)
+        ]
+    );
+
+    orderbook_task.abort();
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
     drop(view);
     drop(vault);
     drop(db);

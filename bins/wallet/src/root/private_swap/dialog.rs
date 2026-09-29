@@ -26,12 +26,12 @@ use ui::controls::{
 use ui::theme;
 use wallet_ops::{
     SwapOrderState, is_swap_record,
-    vault::{ExecutorOperationId, ExecutorRecord, SwapOrderRecord},
+    vault::{ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord},
 };
 
 use super::model::{
-    SwapLabels, SwapOrderGroup, SwapStage, record_swap_ranges, swap_order_group, swap_order_stage,
-    swap_order_status, swap_private_minimum,
+    SwapLabels, SwapOrderGroup, SwapStage, record_swap_ranges, swap_delivery, swap_order_group,
+    swap_order_stage, swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -557,13 +557,15 @@ impl PrivateSwapsView {
         let stage = match view {
             Some(SwapDialogView::Detail(operation)) => self
                 .record(operation)
-                .map(|record| self.progress_stage(record)),
+                .map(|record| (self.progress_stage(record), swap_delivery(record))),
             Some(SwapDialogView::PastDetail(operation, first)) => self
                 .past_swap(operation, first)
-                .map(|(record, _, order)| swap_order_stage(record, order)),
+                .map(|(record, _, order)| (swap_order_stage(record, order), order.delivery())),
             _ => None,
         };
-        let completed = stage == Some(SwapStage::Order(SwapOrderState::Done));
+        let completed = stage.and_then(|(stage, delivery)| {
+            (stage == SwapStage::Order(SwapOrderState::Done)).then_some(delivery)
+        });
         div()
             .w(width)
             .min_w_0()
@@ -589,13 +591,19 @@ impl PrivateSwapsView {
             // Beside a chip, the title only takes its own width, so the chip follows it.
             .child(
                 app_strong_text(title)
-                    .when(!completed, gpui::Styled::flex_1)
+                    .when(completed.is_none(), gpui::Styled::flex_1)
                     .min_w_0()
                     .truncate(),
             )
-            .when(completed, |row| {
+            .when_some(completed, |row, delivery| {
+                // Completed means back in the private balance; a Public address swap was
+                // delivered to its receiver.
+                let label = match delivery {
+                    SwapDelivery::Reshield => "Completed",
+                    SwapDelivery::External { .. } => "Delivered",
+                };
                 row.child(
-                    app_text("Completed")
+                    app_text(label)
                         .flex_none()
                         .text_xs()
                         .px_2()
@@ -853,11 +861,19 @@ impl PrivateSwapsView {
                 format!("valid until {}", local_date_time_label(at))
             }
         });
-        let meta = [started, Some(format!("#{}", record.index()))]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
+        // A Public address swap names its receiver; Private swaps return to the private balance.
+        let meta = [
+            started,
+            Some(format!("#{}", record.index())),
+            labels
+                .receiver
+                .as_ref()
+                .map(|receiver| format!("to {receiver}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
         let stopped = latest && record.is_swap_setup_stopped();
         SwapOrderRow {
             view: entry.view,
@@ -870,6 +886,18 @@ impl PrivateSwapsView {
                 [self.token_icon(sell, cx), self.token_icon(buy, cx)]
             }),
         }
+    }
+
+    /// My orders' rows as their second line and status, newest first.
+    #[cfg(test)]
+    pub(super) fn order_rows_for_test(&self, cx: &App) -> Vec<(String, String)> {
+        self.order_entries(cx)
+            .iter()
+            .map(|entry| {
+                let row = self.order_row(entry, cx);
+                (row.meta, row.status)
+            })
+            .collect()
     }
 
     /// What waits in the stealth account after `order`: the unshielded sell amount before a

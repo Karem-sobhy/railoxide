@@ -25,22 +25,26 @@ fn note(tree: u32, position: u64, value: u64) -> Utxo {
     )
 }
 
-#[test]
-fn swap_planning_offers_the_largest_amount_that_fits_one_order() {
-    let profile =
-        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
-            .unwrap()
-            .get(1)
-            .unwrap()
-            .swap_profile()
-            .unwrap();
-    let builder = TransactionBuilder {
+fn mainnet_profile() -> SwapProfile {
+    crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+        .unwrap()
+        .get(1)
+        .unwrap()
+        .swap_profile()
+        .unwrap()
+}
+
+fn builder() -> TransactionBuilder {
+    TransactionBuilder {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
         relay_adapt_contract: Address::repeat_byte(5),
-    };
-    let delegated = DelegatedSwapExecutor {
+    }
+}
+
+fn delegated_executor() -> DelegatedSwapExecutor {
+    DelegatedSwapExecutor {
         operation: ExecutorOperationId::random().unwrap(),
         executor: Address::repeat_byte(0xe0),
         delegate: Address::repeat_byte(0xde),
@@ -49,7 +53,14 @@ fn swap_planning_offers_the_largest_amount_that_fits_one_order() {
             BlockNumHash::new(12, B256::repeat_byte(12)),
             U256::ONE,
         ),
-    };
+    }
+}
+
+#[test]
+fn swap_planning_offers_the_largest_amount_that_fits_one_order() {
+    let profile = mainnet_profile();
+    let builder = builder();
+    let delegated = delegated_executor();
     let budget = profile.app_data_byte_budget();
     let plan = |utxos: &[Utxo], amount: U256| {
         plan_swap_inputs(
@@ -61,6 +72,7 @@ fn swap_planning_offers_the_largest_amount_that_fits_one_order() {
                 sell_token: WETH,
                 buy_token: USDC,
                 amount,
+                delivery: SwapDelivery::Reshield,
                 byte_budget: None,
             },
             budget,
@@ -88,6 +100,102 @@ fn swap_planning_offers_the_largest_amount_that_fits_one_order() {
             SwapAmountPlan::Fits(largest)
         );
     }
+}
+
+// An External order pays its receiver directly: no post-hook in its gas, limits or app data,
+// no shield fee in its buy amount, and its quote still names only the executor.
+#[test]
+fn external_delivery_prices_only_the_pre_hook_and_no_shield_fee() {
+    let profile = mainnet_profile();
+    let delegated = delegated_executor();
+    let receiver = Address::repeat_byte(0x99);
+    let notes = [note(0, 0, 1_000_000)];
+    let plan = |buy_token, delivery| {
+        let SwapAmountPlan::Fits(plan) = plan_swap_inputs(
+            &builder(),
+            &profile,
+            delegated,
+            &notes,
+            &SwapAmountRequest {
+                sell_token: WETH,
+                buy_token,
+                amount: U256::from(1_000_000),
+                delivery,
+                byte_budget: None,
+            },
+            profile.app_data_byte_budget(),
+            None,
+        )
+        .unwrap() else {
+            panic!("one note fits one order");
+        };
+        plan
+    };
+    let reshield = plan(USDC, SwapDelivery::Reshield);
+    let external = plan(Address::ZERO, SwapDelivery::External { receiver });
+    assert_eq!(external.post_hook_gas_limit(), None);
+    assert_eq!(
+        external.hook_gas_estimate(),
+        reshield.hook_gas_estimate() - post_hook_gas(reshield.gas_model)
+    );
+    assert!(external.app_data_len() < reshield.app_data_len());
+
+    // 10,002 quoted less a 1-unit hook cost and 1 bp slippage delivers 9,999.
+    let quote: CowQuote = serde_json::from_value(serde_json::json!({
+        "quote": {
+            "sellToken": WETH, "buyToken": USDC,
+            "sellAmount": "997500", "buyAmount": "10002",
+            "validTo": 1, "feeAmount": "0", "gasAmount": "0", "gasPrice": "0",
+            "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+        },
+        "expiration": "", "id": 7, "verified": true
+    }))
+    .unwrap();
+    let price = |plan: &SwapInputPlan| {
+        price_swap_review(
+            plan.clone(),
+            quote.clone(),
+            SwapPrice::Verified {
+                rate: PairAnchorRate {
+                    sell_rate: U256::ONE,
+                    buy_rate: U256::ONE,
+                },
+                observations: Vec::new(),
+            },
+            U256::from(25),
+            U256::from(25),
+            1,
+            1,
+            U256::ZERO,
+            OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        )
+        .unwrap()
+    };
+    let (reshield_review, external_review) = (price(&reshield), price(&external));
+    assert_eq!(external_review.shield_fee_bps(), U256::ZERO);
+    assert_eq!(
+        external_review.suggested_private_minimum(),
+        U256::from(9_999)
+    );
+    assert_eq!(
+        reshield_review.suggested_private_minimum(),
+        U256::from(9_975)
+    );
+    // An approved minimum of 9,975 is the External buy amount; Reshield grosses it up.
+    let minimum = U256::from(9_975);
+    assert_eq!(external_review.buy_amount_for(minimum).unwrap(), minimum);
+    assert_eq!(
+        reshield_review.buy_amount_for(minimum).unwrap(),
+        U256::from(9_999)
+    );
+
+    let request = swap_quote_request(&external, U256::from(997_500), 1);
+    assert_eq!(
+        (request.from, request.receiver, request.buy_token),
+        (delegated.executor, delegated.executor, BUY_NATIVE_TOKEN)
+    );
+    // The native asset is anchored by the chain's wrapped-native token.
+    assert_eq!(anchor_token(1, Address::ZERO), WETH);
 }
 
 #[test]

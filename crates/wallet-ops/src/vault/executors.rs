@@ -754,6 +754,20 @@ impl ExecutorStore {
         purpose_summary: Option<&str>,
         assets: &[ExecutorAsset],
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.reserve_with_swap_approval(operation, delegate, purpose_summary, assets, None)
+    }
+
+    /// [`Self::reserve`] that stores `swap_approval` in the write that creates the record, so
+    /// a new swap's record never exists without its approved terms. An existing record is
+    /// returned unchanged, with its own approval.
+    pub fn reserve_with_swap_approval(
+        &self,
+        operation: ExecutorOperationId,
+        delegate: Address,
+        purpose_summary: Option<&str>,
+        assets: &[ExecutorAsset],
+        swap_approval: Option<SwapApproval>,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
         let _guard = EXECUTOR_RECORD_LOCK
             .lock()
             .map_err(|_| ExecutorStoreError::Unavailable)?;
@@ -804,7 +818,7 @@ impl ExecutorStore {
             recovery_observation: None,
             public_account_uuid: None,
             swap: None,
-            swap_approval: None,
+            swap_approval,
             swap_setup_stopped: false,
             released_payloads: Vec::new(),
         };

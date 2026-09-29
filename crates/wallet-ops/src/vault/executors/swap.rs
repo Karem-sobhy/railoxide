@@ -98,8 +98,8 @@ impl SwapProof {
     }
 }
 
-/// Swap state in the operation's encrypted executor record. v1 writes one
-/// Reshield order per attempt; the order list keeps later order kinds additive.
+/// Swap state in the operation's encrypted executor record. Each attempt writes
+/// one order; the order list keeps later order kinds additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapOperationRecord {
     terms: SwapTerms,
@@ -132,7 +132,7 @@ impl SwapOperationRecord {
         &self.orders
     }
     /// A new attempt may start once each earlier attempt has either ended before its pre-hook
-    /// ran or traded and delivered its private minimum. Unrecovered executed pre-hooks block it.
+    /// ran or traded and completed delivery. Unrecovered executed pre-hooks block it.
     #[must_use]
     pub fn admits_attempt(&self) -> bool {
         self.orders.iter().all(|order| {
@@ -143,11 +143,14 @@ impl SwapOperationRecord {
 }
 
 /// Serialized with serde's external tag, so later kinds such as keeping the
-/// output in the executor or paying an external receiver decode additively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// output in the executor decode additively. Approvals without one are Reshield.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapDelivery {
     /// The executor receives the bought token and the post-hook shields it.
+    #[default]
     Reshield,
+    /// The order pays the bought token to `receiver` and carries no post-hook.
+    External { receiver: Address },
 }
 
 /// One anchor reading approved with an order: a Chainlink aggregator with its
@@ -183,7 +186,9 @@ pub struct SwapApprovedBounds {
     pub shield_fee_bps: U256,
     pub slippage_bps: u32,
     pub pre_hook_gas_limit: u64,
-    pub post_hook_gas_limit: u64,
+    /// `None` for an order without a post-hook.
+    #[serde(default)]
+    pub post_hook_gas_limit: Option<u64>,
     /// The reviewed maximum network and hook cost, in buy-token units.
     #[serde(default)]
     pub hook_cost: Option<U256>,
@@ -199,8 +204,8 @@ impl SwapApprovedBounds {
 }
 
 /// Terms the user approved before the swap's setup, kept with the record so the order can be
-/// placed once the setup is confirmed, also after a restart. The tokens are the record's
-/// assets. The order uses these bounds only while a fresh review keeps them.
+/// placed once the setup is confirmed, also after a restart. The order uses these bounds only
+/// while a fresh review keeps them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapApproval {
     pub bounds: SwapApprovedBounds,
@@ -210,6 +215,20 @@ pub struct SwapApproval {
     pub price_verified: Option<bool>,
     /// The user accepted a price that no configured anchor checks.
     pub price_acknowledged: bool,
+    /// Older approvals decode as Reshield.
+    #[serde(default)]
+    pub delivery: SwapDelivery,
+    /// `None` in older approvals, whose pair is the record's assets. Read the pair through
+    /// [`ExecutorRecord::swap_approval_tokens`].
+    #[serde(default)]
+    pub tokens: Option<SwapApprovalTokens>,
+}
+
+/// The approved sell and buy tokens. A native Buy asset is `Address::ZERO`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapApprovalTokens {
+    pub sell: Address,
+    pub buy: Address,
 }
 
 /// Identity of an issued hook payload, also retained in the record's issued list.
@@ -290,8 +309,9 @@ pub struct SwapOrderObservations {
     /// before amounts were kept; a retained trade isn't read again to fill them in.
     #[serde(default)]
     pub trade_amounts: Option<SwapTradeAmounts>,
-    /// Finalized block establishing the approved private minimum was delivered.
-    /// The transaction is the post-hook shield.
+    /// Finalized block establishing delivery. For Reshield delivery it establishes the
+    /// approved private minimum, and the transaction is the post-hook shield. For External
+    /// delivery it is the trade itself.
     pub delivered: Option<SwapObservation>,
     /// Retained separately so a later page can establish delivery after a balance change.
     #[serde(default)]
@@ -377,7 +397,9 @@ pub struct SwapOrderRecord {
     delivery: SwapDelivery,
     bounds: SwapApprovedBounds,
     pre_hook: SwapHookPayload,
-    post_hook: SwapHookPayload,
+    /// `None` for an order without a post-hook, such as External delivery.
+    #[serde(default)]
+    post_hook: Option<SwapHookPayload>,
     invalidates: Option<FixedBytes<56>>,
     observations: SwapOrderObservations,
     #[serde(default)]
@@ -432,7 +454,7 @@ impl SwapOrderRecord {
         self.pre_hook
     }
     #[must_use]
-    pub const fn post_hook(&self) -> SwapHookPayload {
+    pub const fn post_hook(&self) -> Option<SwapHookPayload> {
         self.post_hook
     }
     /// An earlier order of this executor that the pre-hook invalidates.
@@ -451,7 +473,7 @@ impl SwapOrderRecord {
     }
 }
 
-/// A new attempt's approved order and both signed hooks. The store assigns the
+/// A new attempt's approved order and its signed hooks. The store assigns the
 /// attempt index and derives hook identities from the payloads.
 #[derive(Debug, Clone)]
 pub struct SwapAttempt {
@@ -463,7 +485,8 @@ pub struct SwapAttempt {
     pub bounds: SwapApprovedBounds,
     pub invalidates: Option<OrderUid>,
     pub pre_hook: IssuedExecutorPayload,
-    pub post_hook: IssuedExecutorPayload,
+    /// Required for Reshield delivery and absent for External delivery.
+    pub post_hook: Option<IssuedExecutorPayload>,
 }
 
 impl ExecutorRecord {
@@ -482,7 +505,9 @@ impl ExecutorRecord {
                 ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook => {
                     swap.orders.iter().any(|order| {
                         order.pre_hook.payload == payload.hash
-                            || order.post_hook.payload == payload.hash
+                            || order
+                                .post_hook
+                                .is_some_and(|hook| hook.payload == payload.hash)
                     })
                 }
                 ExecutorPayloadPurpose::Operation => payload.inclusion.is_some_and(|inclusion| {
@@ -502,6 +527,24 @@ impl ExecutorRecord {
     #[must_use]
     pub const fn swap_approval(&self) -> Option<&SwapApproval> {
         self.swap_approval.as_ref()
+    }
+
+    /// The sell and buy tokens approved with the setup. Approvals that predate the recorded
+    /// pair, and records without an approval, use the setup's assets in sell-then-buy order.
+    #[must_use]
+    pub fn swap_approval_tokens(&self) -> Option<(Address, Address)> {
+        if let Some(tokens) = self
+            .swap_approval
+            .as_ref()
+            .and_then(|approval| approval.tokens)
+        {
+            return Some((tokens.sell, tokens.buy));
+        }
+        let mut tokens = self.assets.iter().filter_map(|asset| match asset {
+            super::ExecutorAsset::Erc20(token) => Some(*token),
+            _ => None,
+        });
+        Some((tokens.next()?, tokens.next()?))
     }
 
     /// Stopping setup prevents further swap work without discarding issued payloads.
@@ -622,7 +665,7 @@ impl ExecutorRecord {
     fn swap_post_hook_took_nonce(&self, nonce: U256) -> bool {
         self.swap.as_ref().is_some_and(|swap| {
             swap.orders.iter().any(|order| {
-                (order.post_hook.nonce == nonce
+                (order.post_hook.is_some_and(|hook| hook.nonce == nonce)
                     && order.observations.shielded.is_some()
                     && self
                         .nonce_observation
@@ -649,14 +692,16 @@ impl ExecutorRecord {
         {
             return Some(order.pre_hook.payload);
         }
-        if let Some(order) = swap.orders.iter().find(|order| {
-            order.post_hook.nonce == nonce
-                && order.observations.shielded.is_some()
-                && self
-                    .nonce_observation
-                    .is_some_and(|observed| observed.nonce > nonce)
+        if let Some(post_hook) = swap.orders.iter().find_map(|order| {
+            order.post_hook.filter(|hook| {
+                hook.nonce == nonce
+                    && order.observations.shielded.is_some()
+                    && self
+                        .nonce_observation
+                        .is_some_and(|observed| observed.nonce > nonce)
+            })
         }) {
-            return Some(order.post_hook.payload);
+            return Some(post_hook.payload);
         }
         if !swap.orders.iter().any(|order| {
             order.pre_hook.nonce == nonce
@@ -670,9 +715,10 @@ impl ExecutorRecord {
         let mut older = swap
             .orders
             .iter()
-            .filter(|order| order.post_hook.nonce == nonce);
+            .filter_map(|order| order.post_hook)
+            .filter(|hook| hook.nonce == nonce);
         match (older.next(), older.next()) {
-            (Some(order), None) => Some(order.post_hook.payload),
+            (Some(hook), None) => Some(hook.payload),
             _ => None,
         }
     }
@@ -705,10 +751,11 @@ impl ExecutorStore {
         })
     }
 
-    /// Persist a swap attempt's order and both hook payloads in one write, before
-    /// the order request exposes them. The pre-hook holds the current nonce `k`
-    /// and the post-hook `k + 1`; no other payload may use a future nonce. A retry
-    /// is admitted only after every earlier attempt ended or completed private delivery.
+    /// Persist a swap attempt's order and hook payloads in one write, before the
+    /// order request exposes them. The pre-hook holds the current nonce `k`. A
+    /// Reshield order's post-hook holds `k + 1`; an External order has none. No
+    /// other payload may use a future nonce. A retry is admitted only after every
+    /// earlier attempt ended or completed delivery.
     pub fn record_swap_attempt(
         &self,
         operation: ExecutorOperationId,
@@ -739,17 +786,24 @@ impl ExecutorStore {
                         || swap.terms.setup_payload != terms.setup_payload
                 })
                 || pre_hook.delegate != record.delegate
-                || post_hook.delegate != record.delegate
                 || pre_hook.purpose != ExecutorPayloadPurpose::SwapPreHook
-                || post_hook.purpose != ExecutorPayloadPurpose::SwapPostHook
-                || pre_hook.hash == post_hook.hash
                 || record
                     .issued
                     .iter()
-                    .any(|issued| issued.hash == pre_hook.hash || issued.hash == post_hook.hash)
+                    .any(|issued| issued.hash == pre_hook.hash)
+                || post_hook.is_some() != matches!(delivery, SwapDelivery::Reshield)
+                || post_hook.as_ref().is_some_and(|post_hook| {
+                    post_hook.delegate != record.delegate
+                        || post_hook.purpose != ExecutorPayloadPurpose::SwapPostHook
+                        || pre_hook.hash == post_hook.hash
+                        || record
+                            .issued
+                            .iter()
+                            .any(|issued| issued.hash == post_hook.hash)
+                        || !post_hook.context.inputs.is_empty()
+                })
                 || proof.inputs.is_empty()
                 || pre_hook.context.inputs != proof.inputs
-                || !post_hook.context.inputs.is_empty()
                 || orders.iter().any(|order| order.uid == uid.0)
                 || invalidates.is_some_and(|old| orders.iter().all(|order| order.uid != old.0))
                 || !record.issued.iter().any(|issued| {
@@ -782,11 +836,13 @@ impl ExecutorStore {
             // Post-hooks below the current nonce need execution evidence or finalized
             // delivery; the current nonce makes their old signatures unusable either way.
             if record.nonce_observation != Some(observed)
-                || post_hook.context.observed != observed
                 || observed.nonce != nonce
-                || nonce.checked_add(U256::ONE) != Some(post_hook.nonce)
                 || pre_hook.context.calldata.is_empty()
-                || post_hook.context.calldata.is_empty()
+                || post_hook.as_ref().is_some_and(|post_hook| {
+                    post_hook.context.observed != observed
+                        || nonce.checked_add(U256::ONE) != Some(post_hook.nonce)
+                        || post_hook.context.calldata.is_empty()
+                })
                 || !record.issued.iter().any(|issued| {
                     issued.hash == terms.setup_payload
                         && record.winner(issued.nonce) == Some(issued.hash)
@@ -797,7 +853,9 @@ impl ExecutorStore {
                         && !(issued.purpose == ExecutorPayloadPurpose::SwapPostHook
                             && (record.swap_post_hook_took_nonce(issued.nonce)
                                 || orders.iter().any(|order| {
-                                    order.post_hook.payload == issued.hash
+                                    order
+                                        .post_hook
+                                        .is_some_and(|hook| hook.payload == issued.hash)
                                         && order.settled_at(observed.block.number)
                                 })))
                         && !orders
@@ -814,7 +872,7 @@ impl ExecutorStore {
                 delivery,
                 bounds,
                 pre_hook: SwapHookPayload::of(&pre_hook),
-                post_hook: SwapHookPayload::of(&post_hook),
+                post_hook: post_hook.as_ref().map(SwapHookPayload::of),
                 invalidates: invalidates.map(|old| old.0),
                 observations: SwapOrderObservations::default(),
                 submission,
@@ -830,8 +888,16 @@ impl ExecutorStore {
                     orders: vec![order],
                 });
             }
-            record.issued.extend([pre_hook, post_hook]);
-            for token in [terms.sell_token, terms.buy_token] {
+            record.issued.push(pre_hook);
+            record.issued.extend(post_hook);
+            // Only a Reshield order pays the bought token to the executor; an External order
+            // pays its receiver. Earlier attempts' assets stay. The wallet's native marker is
+            // not an ERC-20 asset.
+            let bought = matches!(delivery, SwapDelivery::Reshield).then_some(terms.buy_token);
+            for token in std::iter::once(terms.sell_token).chain(bought) {
+                if token == Address::ZERO {
+                    continue;
+                }
                 let asset = super::ExecutorAsset::Erc20(token);
                 if !record.assets.contains(&asset) {
                     record.assets.push(asset);
@@ -860,14 +926,17 @@ impl ExecutorStore {
             if order.submission_status != SwapSubmissionStatus::Accepted {
                 order.submission_status = status;
             }
-            let hooks = [order.pre_hook.payload, order.post_hook.payload];
+            let hooks = [
+                Some(order.pre_hook.payload),
+                order.post_hook.map(|hook| hook.payload),
+            ];
             if matches!(
                 status,
                 SwapSubmissionStatus::Pending | SwapSubmissionStatus::Accepted
             ) {
                 record
                     .released_payloads
-                    .retain(|hash| !hooks.contains(hash));
+                    .retain(|hash| !hooks.contains(&Some(*hash)));
             }
             Ok(())
         })
@@ -938,6 +1007,8 @@ impl ExecutorStore {
 
     /// Persist receipt evidence checked at head minus finality depth by the owner.
     /// This deliberately leaves account nonce reconciliation and input reservations alone.
+    /// A Reshield order is delivered only with a private credit. An External order is
+    /// delivered by its trade and never carries a credit.
     pub(crate) fn record_swap_settlement(
         &self,
         operation: ExecutorOperationId,
@@ -952,7 +1023,9 @@ impl ExecutorStore {
                 .as_mut()
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
+            let external = matches!(order.delivery, SwapDelivery::External { .. });
             if traded.transaction_hash.is_none()
+                || external && credit.is_some()
                 || credit.is_some_and(|credit| {
                     credit.observation != traded
                         || credit.private_amount < order.bounds.private_minimum
@@ -968,6 +1041,8 @@ impl ExecutorStore {
             order.observations.trade_amounts = Some(amounts);
             if let Some(credit) = credit {
                 order.observations.settlement_credit = Some(credit);
+            }
+            if external || credit.is_some() {
                 order.observations.delivered = Some(traded);
                 order.observations.undelivered = None;
             }

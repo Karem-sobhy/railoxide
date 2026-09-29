@@ -86,6 +86,9 @@ pub struct ExecutorOwner {
     synced_observation: StdMutex<Option<(WalletHandle, watch::Receiver<WalletSyncTip>)>>,
     unused: StdMutex<spare::UnusedInspections>,
     changes: watch::Sender<u64>,
+    /// Notes that UI tests plan swaps from in place of the session's, which doesn't sync.
+    #[cfg(feature = "test-support")]
+    swap_notes_for_tests: StdMutex<Vec<railgun_wallet::Utxo>>,
 }
 
 struct ExecutorActivityGuard<'a> {
@@ -133,6 +136,8 @@ impl ExecutorOwner {
             synced_observation: StdMutex::new(None),
             unused: StdMutex::new(spare::UnusedInspections::default()),
             changes: watch::channel(0).0,
+            #[cfg(feature = "test-support")]
+            swap_notes_for_tests: StdMutex::new(Vec::new()),
         })
     }
 

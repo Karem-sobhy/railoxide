@@ -24,7 +24,7 @@ use wallet_ops::{
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
     SwapOrderState, WakuDeliveryClient,
     vault::{
-        ExecutorOperationId, ExecutorRecord, SwapOrderRecord, SwapPreHookDeathCause,
+        ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
         SwapSubmissionStatus,
     },
 };
@@ -38,8 +38,8 @@ use super::model::{
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-    SwapAction, SwapJobKind, local_date_time_label, local_time_label, now_unix,
-    swap_recovery_token, swap_tokens,
+    SwapAction, SwapJobKind, local_date_time_label, local_time_label, now_unix, short_receiver,
+    swap_delivery, swap_recovery_token, swap_tokens,
 };
 use crate::assets::WalletIconSource;
 use crate::root::broadcaster_picker::broadcaster_candidate_label;
@@ -265,6 +265,7 @@ impl PrivateSwapsView {
         let started = pending
             .map(|pending| ("Started", pending.started_at))
             .or_else(|| self.swap_started(record, latest.as_ref(), cx));
+        let delivery = pending.map_or_else(|| swap_delivery(record), |pending| pending.delivery);
         let outcome =
             order.and_then(|order| self.render_outcome(record, order, stage, started, cx));
         let body = div()
@@ -276,7 +277,7 @@ impl PrivateSwapsView {
                     .then(|| render_submission_progress_stepper(steps)),
             )
             .children(if outcome.is_none() {
-                self.render_facts(order, minimum, started, cx)
+                self.render_facts(order, delivery, minimum, started, cx)
             } else {
                 None
             })
@@ -352,7 +353,7 @@ impl PrivateSwapsView {
                     .then(|| render_submission_progress_stepper(steps)),
             )
             .children(if outcome.is_none() {
-                self.render_facts(Some(order), None, started, cx)
+                self.render_facts(Some(order), order.delivery(), None, started, cx)
             } else {
                 None
             })
@@ -365,10 +366,12 @@ impl PrivateSwapsView {
         (body, Some(footer))
     }
 
-    /// The order ID, who settles it, the minimum while it can fill, and when the swap started.
+    /// The order ID, who settles it, a Public address swap's receiver, the minimum while it can
+    /// fill, and when the swap started.
     fn render_facts(
         &self,
         order: Option<&SwapOrderRecord>,
+        delivery: SwapDelivery,
         minimum: Option<(Address, U256)>,
         started: Option<(&'static str, u64)>,
         cx: &App,
@@ -380,6 +383,9 @@ impl PrivateSwapsView {
             rows.push(hash_row("Order ID", order_id, copy_id, "Copy order ID"));
             rows.push(fact_row("Settled by", settled_by_cow()));
         }
+        if let SwapDelivery::External { receiver } = delivery {
+            rows.push(self.receiver_row(receiver, cx));
+        }
         if let Some((buy, minimum)) = minimum {
             rows.push(fact_row(
                 "Receive at least",
@@ -390,6 +396,40 @@ impl PrivateSwapsView {
             rows.push(fact_row(label, app_text(local_date_time_label(at))));
         }
         (!rows.is_empty()).then(|| div().w_full().flex().flex_col().gap_2().children(rows))
+    }
+
+    /// A Public address swap's receiver, laid out like [`hash_row`]: the wallet's label for it
+    /// when it has one, and its address, shortened, with a control that copies it in full.
+    fn receiver_row(&self, receiver: Address, cx: &App) -> gpui::Div {
+        let address = receiver.to_checksum(None);
+        let copy_id = SharedString::from(format!("swap-receiver-{address}-copy"));
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .debug_selector(|| "swap-detail-receiver".into())
+            .child(app_muted_text("Receiver").flex_none())
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(
+                        self.receiver_label(receiver, cx)
+                            .map(|(label, _)| app_text(label).min_w_0().truncate()),
+                    )
+                    .child(
+                        app_strong_text(short_receiver(receiver))
+                            .flex_none()
+                            .font_family(theme::APP_MONO_FONT_FAMILY),
+                    )
+                    .child(clipboard_with_toast(copy_id, address).tooltip("Copy receiver address")),
+            )
     }
 
     /// What a traded order sold and delivered, from its approved bounds and canonical
@@ -423,11 +463,18 @@ impl PrivateSwapsView {
             .received_privately
             .map(|(private, _)| private)
             .or_else(|| outcome.trade.map(|trade| trade.buy_amount));
-        let destination = match state {
-            SwapOrderState::Done => "in your private balance",
-            SwapOrderState::NotDelivered => "in the stealth account",
-            _ => "arriving",
-        };
+        let destination = self.receiver_name(order.delivery(), cx).map_or_else(
+            || {
+                match state {
+                    SwapOrderState::Done => "in your private balance",
+                    SwapOrderState::NotDelivered => "in the stealth account",
+                    _ => "arriving",
+                }
+                .to_owned()
+            },
+            // The trade paid the receiver in the same settlement.
+            |receiver| format!("delivered to {receiver}"),
+        );
         let with_usd_prefix = |usd: Option<String>, note: &str| {
             usd.map_or_else(|| note.to_owned(), |usd| format!("{usd} {note}"))
         };
@@ -461,12 +508,15 @@ impl PrivateSwapsView {
                 ),
                 with_usd_prefix(
                     received.and_then(|received| self.usd_value(buy, received, cx)),
-                    destination,
+                    destination.as_str(),
                 ),
                 true,
             ));
 
         let mut rows = Vec::new();
+        if let SwapDelivery::External { receiver } = order.delivery() {
+            rows.push(self.receiver_row(receiver, cx).into_any_element());
+        }
         let limit = self.pair_rate_label(sell, buy, outcome.limit_sell, outcome.minimum, cx);
         let (price, limit) = match outcome.trade.and_then(|trade| {
             self.pair_rate_label(sell, buy, trade.sell_amount, trade.buy_amount, cx)
@@ -1184,7 +1234,7 @@ impl PrivateSwapsView {
         let Some((sell, buy)) = swap_tokens(record) else {
             return;
         };
-        let token = swap_recovery_token(self.stage(record), sell, buy);
+        let token = swap_recovery_token(self.stage(record), swap_delivery(record), sell, buy);
         let target = StealthAccountTarget::new(&self.session, operation);
         let return_focus = self.swap_dialog_focus();
         let _ = self.root.update(cx, |root, cx| {
@@ -1292,11 +1342,11 @@ fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>)
 fn progress_step(step: &SwapStep, detail: String, error_copy_id: String) -> SubmissionProgressStep {
     SubmissionProgressStep {
         detail: if detail.is_empty() {
-            step.label.to_owned()
+            step.label.clone()
         } else {
             detail
         },
-        label: step.label.to_owned(),
+        label: step.label.clone(),
         status: step.status,
         error_copy_id: SharedString::from(error_copy_id),
         action: None,

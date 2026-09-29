@@ -1,6 +1,7 @@
 //! Routine settlement confirmation sends only block identifiers to RPC. Private sync's
 //! spend location of the pre-hook inputs and the orderbook's trade block are hints; the
-//! receipt's trade and private credit establish the outcome.
+//! receipt's trade establishes the outcome, together with its private credit for Reshield
+//! delivery.
 
 use alloy::network::{AnyRpcBlock, ReceiptResponse as _, primitives::HeaderResponse as _};
 use alloy::primitives::{Address, U256};
@@ -13,13 +14,14 @@ use eyre::{Result, eyre};
 use tracing::Instrument as _;
 
 use super::observation::{SwapSettlement, issued, shielded_amount};
+use super::order::cow_buy_token;
 use crate::ExecutorOwner;
 use crate::block_observer::fetch_checked_block_receipts;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    ExecutorOperationId, ExecutorRecord, SwapObservation, SwapOrderRecord, SwapShieldObservation,
-    SwapTradeAmounts,
+    ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapObservation, SwapOrderRecord,
+    SwapShieldObservation, SwapTradeAmounts,
 };
 
 // The pinned shared ERC20 bindings do not expose the Transfer event.
@@ -92,6 +94,7 @@ impl ExecutorOwner {
 struct Settlement {
     trade: SwapObservation,
     amounts: SwapTradeAmounts,
+    /// Always `None` for External delivery, which the trade alone establishes.
     credit: Option<SwapShieldObservation>,
 }
 
@@ -135,16 +138,19 @@ async fn read_settlement(
         .ok_or_else(|| eyre!("swap account is unavailable"))?;
     let swap = record.swap().ok_or_else(|| eyre!("swap is unavailable"))?;
     let terms = swap.order_terms(order);
-    let shields = expected_shields(
-        executor,
-        railgun,
-        &RelayAdapt7702::multicallCall::abi_decode(
-            issued(record, order.post_hook().payload())?
-                .context()
-                .calldata(),
-        )?
-        ._calls,
-    )?;
+    let buy_token = cow_buy_token(terms.buy_token());
+    // An order without a post-hook has no post-hook shield to match.
+    let shields = match order.post_hook() {
+        Some(post_hook) => expected_shields(
+            executor,
+            railgun,
+            &RelayAdapt7702::multicallCall::abi_decode(
+                issued(record, post_hook.payload())?.context().calldata(),
+            )?
+            ._calls,
+        )?,
+        None => Vec::new(),
+    };
     let mut found = None;
     for receipt in receipts {
         if !receipt.status() {
@@ -171,7 +177,7 @@ async fn read_settlement(
             if trade.owner != executor
                 || trade.orderUid != order.uid().0[..]
                 || trade.sellToken != terms.sell_token()
-                || trade.buyToken != terms.buy_token()
+                || trade.buyToken != buy_token
             {
                 continue;
             }
@@ -182,6 +188,10 @@ async fn read_settlement(
                 block: identity,
                 transaction_hash: Some(receipt.transaction_hash()),
             };
+            // The order UID commits to an External receiver, and the settlement pays it in the
+            // call that emits this Trade, so the trade alone establishes External delivery.
+            // Native buys emit no Transfer.
+            let reshield = matches!(order.delivery(), SwapDelivery::Reshield);
             // A second matching payout could mean a funded post-hook ran before the
             // actual fill's payout. Do not attribute that earlier credit to this trade.
             let payouts = logs
@@ -199,7 +209,7 @@ async fn read_settlement(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, log)| {
-                    if payouts != 1 || index <= trade_index {
+                    if !reshield || payouts != 1 || index <= trade_index {
                         return None;
                     }
                     let (private_amount, fee) = shielded_amount(railgun, log, &shields)?;

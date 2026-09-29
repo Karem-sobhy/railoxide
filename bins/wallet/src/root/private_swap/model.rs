@@ -6,12 +6,12 @@
 
 use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
-    ExecutorAsset, SwapOrderState, SwapSetupStatus, swap_order_state,
+    SwapOrderState, SwapSetupStatus, swap_order_state,
     vault::{
         ExecutorExecutionResult, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
         ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind, SwapApprovedBounds,
-        SwapOrderObservations, SwapOrderRecord, SwapPreHookDeathCause, SwapSubmissionStatus,
-        SwapTradeAmounts,
+        SwapDelivery, SwapOrderObservations, SwapOrderRecord, SwapPreHookDeathCause,
+        SwapSubmissionStatus, SwapTradeAmounts,
     },
 };
 
@@ -270,24 +270,30 @@ pub(in crate::root) fn swap_order_stage(
     }
 }
 
-/// Splits a record's orders, given in order as their sell token, buy token, and whether each
-/// traded, into swaps. A retry keeps the pair after an attempt that ended without a trade;
-/// a different pair, or any order after a traded one, starts a new swap on the reused account.
+/// Splits a record's orders, given in order as their sell token, buy token, delivery, and
+/// whether each traded, into swaps. A retry keeps the pair and delivery after an attempt that
+/// ended without a trade; a different pair or delivery, or any order after a traded one,
+/// starts a new swap on the reused account.
 pub(in crate::root) fn swap_order_ranges(
-    orders: impl IntoIterator<Item = (Address, Address, bool)>,
+    orders: impl IntoIterator<Item = (Address, Address, SwapDelivery, bool)>,
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut previous: Option<(Address, Address, bool)> = None;
-    for (index, (sell, buy, traded)) in orders.into_iter().enumerate() {
-        let retry = previous.is_some_and(|(previous_sell, previous_buy, previous_traded)| {
-            !previous_traded && previous_sell == sell && previous_buy == buy
-        });
+    let mut previous: Option<(Address, Address, SwapDelivery, bool)> = None;
+    for (index, (sell, buy, delivery, traded)) in orders.into_iter().enumerate() {
+        let retry = previous.is_some_and(
+            |(previous_sell, previous_buy, previous_delivery, previous_traded)| {
+                !previous_traded
+                    && previous_sell == sell
+                    && previous_buy == buy
+                    && previous_delivery == delivery
+            },
+        );
         if retry && let Some(range) = ranges.last_mut() {
             range.end = index + 1;
         } else {
             ranges.push(index..index + 1);
         }
-        previous = Some((sell, buy, traded));
+        previous = Some((sell, buy, delivery, traded));
     }
     ranges
 }
@@ -301,6 +307,7 @@ pub(in crate::root) fn record_swap_ranges(record: &ExecutorRecord) -> Vec<std::o
             (
                 terms.sell_token(),
                 terms.buy_token(),
+                order.delivery(),
                 order.observations().traded.is_some(),
             )
         }))
@@ -349,16 +356,12 @@ fn recorded_setup_stage(statuses: &[Option<ExecutorPayloadStatus>], observing: b
 }
 
 /// The sell and buy tokens of a swap record: from its terms once an order exists, otherwise
-/// from the assets its setup reserved, in sell-then-buy order.
+/// the pair approved with its setup.
 pub(in crate::root) fn swap_tokens(record: &ExecutorRecord) -> Option<(Address, Address)> {
     if let Some(swap) = record.swap() {
         return Some((swap.terms().sell_token(), swap.terms().buy_token()));
     }
-    let mut tokens = record.assets().iter().filter_map(|asset| match asset {
-        ExecutorAsset::Erc20(token) => Some(*token),
-        _ => None,
-    });
-    Some((tokens.next()?, tokens.next()?))
+    record.swap_approval_tokens()
 }
 
 /// The latest order's private spend, or before any order exists, the spend approved with the
@@ -387,6 +390,17 @@ pub(in crate::root) fn swap_private_minimum(record: &ExecutorRecord) -> Option<U
                 .swap_approval()
                 .map(|approval| approval.bounds.private_minimum)
         })
+}
+
+/// Where the latest order delivers, or before any order exists, the delivery approved with the
+/// setup. A retry keeps it, as it keeps the pair.
+pub(in crate::root) fn swap_delivery(record: &ExecutorRecord) -> SwapDelivery {
+    record
+        .swap()
+        .and_then(|swap| swap.orders().last())
+        .map(SwapOrderRecord::delivery)
+        .or_else(|| record.swap_approval().map(|approval| approval.delivery))
+        .unwrap_or_default()
 }
 
 /// The latest order's expiry in Unix seconds.
@@ -434,8 +448,14 @@ pub(in crate::root) struct SwapLabels {
     pub(in crate::root) lapsed: bool,
     /// The orderbook reports the open order filled; canonical observation doesn't show it yet.
     pub(in crate::root) fill_hint: Option<SwapFillHint>,
-    /// "49.28 DAI", the amount the post-hook credited privately once the swap is done.
+    /// "49.28 DAI", the amount the post-hook credited privately once the swap is done, or for
+    /// a Public address swap, the amount its receiver got.
     pub(in crate::root) received: Option<String>,
+    /// A Public address swap's receiver: its Public account or address-book label, or its
+    /// short address. `None` for a swap back to the private balance.
+    pub(in crate::root) receiver: Option<String>,
+    /// "0.3787 ETH", the least the receiver gets while the order can fill.
+    pub(in crate::root) minimum: Option<String>,
 }
 
 /// The orderbook reports an open order filled before canonical observation records the trade.
@@ -541,10 +561,12 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::Order(SwapOrderState::Done) => line(
             format!("Swapped {pair}"),
-            labels.received.as_ref().map_or_else(
-                || "Back in your private balance".into(),
-                |received| format!("Received {received} privately"),
-            ),
+            match (&labels.receiver, &labels.received) {
+                (Some(receiver), Some(received)) => format!("Delivered {received} to {receiver}"),
+                (Some(receiver), None) => format!("Delivered to {receiver}"),
+                (None, Some(received)) => format!("Received {received} privately"),
+                (None, None) => "Back in your private balance".into(),
+            },
         ),
         SwapStage::Order(SwapOrderState::AttemptEnded(cause)) => line(
             match cause {
@@ -607,25 +629,37 @@ pub(in crate::root) fn swaps_card_line(swaps: &[(SwapStage, SwapLabels)]) -> Opt
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::root) struct SwapStep {
-    pub(in crate::root) label: &'static str,
+    pub(in crate::root) label: String,
     pub(in crate::root) detail: String,
     pub(in crate::root) status: PublicActionStepStatus,
 }
 
+const TRADED: &str = "Traded";
+const BACK_IN_PRIVATE_BALANCE: &str = "Back in private balance";
+
 /// The progress steps of decision 8: set up, order open, traded, back in private balance. An
 /// attempt that ended, or stranded funds before a trade, ends the list at the order step. A
-/// fill the orderbook reports shows the trade confirming until observation records it.
+/// fill the orderbook reports shows the trade confirming until observation records it. A Public
+/// address swap has no private-balance step, as [`external_steps`] describes.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
+    let steps = reshield_steps(stage, labels);
+    match &labels.receiver {
+        Some(receiver) => external_steps(steps, receiver, labels),
+        None => steps,
+    }
+}
+
+fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
-    let step = |label, detail: String, status| SwapStep {
-        label,
+    let step = |label: &str, detail: String, status| SwapStep {
+        label: label.to_owned(),
         detail,
         status,
     };
     let setup = |status, detail: &str| step("Stealth account set up", detail.to_owned(), status);
     let open = |status, detail: String| step("Order open", detail, status);
-    let traded = |status| step("Traded", String::new(), status);
-    let delivered = |status, detail: String| step("Back in private balance", detail, status);
+    let traded = |status| step(TRADED, String::new(), status);
+    let delivered = |status, detail: String| step(BACK_IN_PRIVATE_BALANCE, detail, status);
     let expiry = || {
         labels.expires.as_ref().map_or_else(String::new, |at| {
             if labels.lapsed {
@@ -643,7 +677,7 @@ pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<
                 setup(Done, ""),
                 open(Done, String::new()),
                 step(
-                    "Traded",
+                    TRADED,
                     labels
                         .fill_hint
                         .map_or_else(String::new, SwapFillHint::progress),
@@ -822,6 +856,45 @@ pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<
             ),
         ],
     }
+}
+
+/// A Public address swap's steps. The settlement that trades also pays the receiver, so one
+/// step, delivered to the receiver, replaces Traded and Back in private balance: the least the
+/// receiver gets while the order can fill, then what it got.
+fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> Vec<SwapStep> {
+    use PublicActionStepStatus::{Done, NotStarted};
+    let traded = steps
+        .iter()
+        .find(|step| step.label == TRADED)
+        .map(|step| (step.status, step.detail.clone()));
+    steps
+        .into_iter()
+        .filter(|step| step.label != TRADED)
+        .map(|mut step| {
+            if step.label != BACK_IN_PRIVATE_BALANCE {
+                return step;
+            }
+            step.label = format!("Delivered to {receiver}");
+            // A reported fill confirms here, since no separate trade step shows it.
+            if let Some((status, detail)) = traded
+                .clone()
+                .filter(|(status, _)| step.status == NotStarted && *status != NotStarted)
+            {
+                step.status = status;
+                step.detail = detail;
+            }
+            step.detail = match (&labels.received, &labels.minimum) {
+                (Some(received), _) if step.status == Done => {
+                    format!("{} → {received} · Finalized", labels.sell)
+                }
+                (_, Some(minimum)) if step.status != Done && step.detail.is_empty() => {
+                    format!("At least {minimum}")
+                }
+                _ => step.detail,
+            };
+            step
+        })
+        .collect()
 }
 
 /// A traded order's outcome, from its approved bounds and canonical observations. Amounts are
@@ -1050,6 +1123,8 @@ pub(in crate::root) fn swap_order_status(
         SwapStage::SubmissionPending => "Submission unconfirmed".into(),
         SwapStage::SubmissionRejected => "Rejected".into(),
         SwapStage::Order(SwapOrderState::Traded) => "Traded".into(),
+        // Filled means back in the private balance; a Public address swap was delivered.
+        SwapStage::Order(SwapOrderState::Done) if labels.receiver.is_some() => "Delivered".into(),
         SwapStage::Order(SwapOrderState::Done) => "Filled".into(),
         SwapStage::Order(
             SwapOrderState::PreHookOnly { expired: true } | SwapOrderState::NotDelivered,
@@ -1066,13 +1141,19 @@ pub(in crate::root) fn swap_order_status(
 }
 
 /// The asset a swap's recovery starts with: the sell token before a trade, the buy token after.
+/// A Public address swap's stealth account never holds the buy token, so it's always the sell
+/// token.
 pub(in crate::root) const fn swap_recovery_token(
     stage: SwapStage,
+    delivery: SwapDelivery,
     sell: Address,
     buy: Address,
 ) -> Address {
-    match stage {
-        SwapStage::Order(SwapOrderState::Traded | SwapOrderState::NotDelivered) => buy,
+    match (stage, delivery) {
+        (
+            SwapStage::Order(SwapOrderState::Traded | SwapOrderState::NotDelivered),
+            SwapDelivery::Reshield,
+        ) => buy,
         _ => sell,
     }
 }
@@ -1155,6 +1236,8 @@ mod tests {
             lapsed: false,
             fill_hint: None,
             received: None,
+            receiver: None,
+            minimum: None,
         }
     }
 
@@ -1296,19 +1379,25 @@ mod tests {
             Address::repeat_byte(2),
             Address::repeat_byte(3),
         );
+        let reshield = SwapDelivery::Reshield;
+        let external = SwapDelivery::External {
+            receiver: Address::repeat_byte(4),
+        };
         // An order-less record has no ranges; it is one swap without orders.
         assert!(swap_order_ranges(std::iter::empty()).is_empty());
         assert_eq!(
             swap_order_ranges([
                 // Expired, then retried with the same pair: one swap.
-                (weth, usdc, false),
-                (weth, usdc, true),
+                (weth, usdc, reshield, false),
+                (weth, usdc, reshield, true),
                 // After the trade, the same pair on the reused account is a new swap.
-                (weth, usdc, false),
+                (weth, usdc, reshield, false),
                 // A different pair is a new swap even after an attempt without a trade.
-                (dai, usdc, false),
+                (dai, usdc, reshield, false),
+                // So is another delivery for the same pair.
+                (dai, usdc, external, false),
             ]),
-            [0..2, 2..3, 3..4]
+            [0..2, 2..3, 3..4, 4..5]
         );
     }
 
@@ -1481,7 +1570,7 @@ mod tests {
                     "the reported fill stays pending until canonical verification: {stage:?}"
                 );
                 assert_eq!(
-                    (steps[2].label, steps[2].detail.as_str()),
+                    (steps[2].label.as_str(), steps[2].detail.as_str()),
                     ("Traded", detail)
                 );
             }
@@ -1504,7 +1593,7 @@ mod tests {
             shield_fee_bps: U256::from(25u8),
             slippage_bps: 50,
             pre_hook_gas_limit: 900_000,
-            post_hook_gas_limit: 300_000,
+            post_hook_gas_limit: Some(300_000),
             hook_cost: None,
             anchors: Vec::new(),
         };

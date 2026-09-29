@@ -673,6 +673,26 @@ impl SpendAuthorizationSummary {
     pub(in crate::root) fn warnings_for_test(&self) -> Vec<String> {
         self.warnings.iter().map(ToString::to_string).collect()
     }
+
+    #[cfg(test)]
+    pub(in crate::root) fn details_for_test(&self) -> Vec<(String, String)> {
+        self.details.as_ref().map_or_else(Vec::new, |details| {
+            details
+                .rows
+                .iter()
+                .map(|(label, value)| (label.to_string(), value.to_string()))
+                .collect()
+        })
+    }
+
+    /// The context's message, under its title when it has one.
+    #[cfg(test)]
+    pub(in crate::root) fn context_for_test(&self) -> Option<String> {
+        self.context.as_ref().map(|context| match context {
+            SpendAuthorizationContext::Text(message)
+            | SpendAuthorizationContext::Info { message, .. } => message.to_string(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -786,6 +806,9 @@ pub(super) struct SpendAuthorizationSummaryRow {
     value: Arc<str>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
+    /// The value is an address shown in full, with `address_label` above it when known.
+    full_address: bool,
+    address_label: Option<Arc<str>>,
     delta: Option<SpendAuthorizationAmountDelta>,
     note: Option<Arc<str>>,
 }
@@ -803,6 +826,8 @@ impl SpendAuthorizationSummaryRow {
             value: value.into(),
             icon_path: None,
             shortened_copyable: false,
+            full_address: false,
+            address_label: None,
             delta: None,
             note: None,
         }
@@ -821,6 +846,14 @@ impl SpendAuthorizationSummaryRow {
 
     pub(super) const fn with_shortened_copyable(mut self) -> Self {
         self.shortened_copyable = true;
+        self
+    }
+
+    /// Show the value, an address, in full with a copy button, so every character can be
+    /// checked before signing. `label` names it above the address when known.
+    pub(super) fn with_full_address(mut self, label: Option<String>) -> Self {
+        self.full_address = true;
+        self.address_label = label.map(Arc::from);
         self
     }
 
@@ -849,6 +882,19 @@ impl SpendAuthorizationSummaryRow {
     #[cfg(test)]
     pub(in crate::root) fn values_for_test(&self) -> (String, String) {
         (self.label.to_string(), self.value.to_string())
+    }
+
+    /// A full-address row's address label and note.
+    #[cfg(test)]
+    pub(in crate::root) fn full_address_for_test(
+        &self,
+    ) -> Option<(Option<String>, Option<String>)> {
+        self.full_address.then(|| {
+            (
+                self.address_label.as_deref().map(str::to_owned),
+                self.note.as_deref().map(str::to_owned),
+            )
+        })
     }
 }
 
@@ -1875,6 +1921,56 @@ fn spend_authorization_summary_value(
                 ),
             row.note.as_deref(),
         );
+    }
+
+    if row.full_address {
+        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .py(px(2.0))
+            .children(row.address_label.as_ref().map(|label| {
+                app_text(label.to_string())
+                    .min_w(px(0.0))
+                    .text_color(rgb(theme::TEXT))
+                    .whitespace_normal()
+            }))
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        app_text(row.value.to_string())
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_color(rgb(theme::TEXT))
+                            .font_family(APP_MONO_FONT_FAMILY)
+                            .whitespace_normal(),
+                    )
+                    .child(
+                        div()
+                            .id(("wallet-spend-auth-copy-action", row_index))
+                            .flex_none()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(copy_tooltip.clone()).build(window, cx)
+                            })
+                            .child(clipboard_with_toast(
+                                ("wallet-spend-auth-copy", row_index),
+                                row.value.to_string(),
+                            )),
+                    ),
+            )
+            .children(row.note.as_ref().map(|note| {
+                app_muted_text(note.to_string())
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+            }))
+            .into_any_element();
     }
 
     if row.shortened_copyable {

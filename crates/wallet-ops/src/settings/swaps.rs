@@ -5,6 +5,7 @@ use alloy::primitives::{Address, address};
 
 use super::{EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry};
 use crate::FreshAnchorParams;
+use crate::vault::SwapDelivery;
 
 /// Built-in private swap parameters for one chain. Not user-editable and not persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,32 @@ pub enum SwapIneligibility {
 pub enum SwapTokenEligibility {
     Eligible,
     Ineligible(SwapIneligibility),
+}
+
+/// A token's side in a swap. The Buy side depends on delivery: only an External order pays
+/// its receiver directly, so only it can buy the native asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapTokenRole {
+    Sell,
+    Buy(SwapDelivery),
+}
+
+/// Why an External swap can't pay its proceeds to a receiver: they would be lost or stranded
+/// in a contract of the swap itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SwapReceiverRejection {
+    #[error("the zero address can't receive the swap; the proceeds would be lost")]
+    ZeroAddress,
+    #[error("the swap's own stealth account can't be the receiver")]
+    Executor,
+    #[error("the Railgun contract can't be the receiver; use Private balance instead")]
+    Railgun,
+    #[error("CoW's settlement contract can't be the receiver; the proceeds would be stranded")]
+    Settlement,
+    #[error("CoW's vault relayer can't be the receiver; the proceeds would be stranded")]
+    VaultRelayer,
+    #[error("CoW's hooks trampoline can't be the receiver; the proceeds would be stranded")]
+    HooksTrampoline,
 }
 
 const MAINNET_SWAP_PROFILE: SwapProfile = SwapProfile {
@@ -144,9 +171,12 @@ impl SwapProfile {
     }
 
     /// ERC-20 compatibility is the user's responsibility; there is no swap-specific allowlist.
+    /// The native asset, `Address::ZERO`, is eligible only as the Buy asset of External delivery.
     #[must_use]
-    pub fn token_eligibility(&self, token: Address) -> SwapTokenEligibility {
-        if token == Address::ZERO {
+    pub fn token_eligibility(&self, token: Address, role: SwapTokenRole) -> SwapTokenEligibility {
+        if token == Address::ZERO
+            && !matches!(role, SwapTokenRole::Buy(SwapDelivery::External { .. }))
+        {
             SwapTokenEligibility::Ineligible(SwapIneligibility::NativeAsset)
         } else {
             SwapTokenEligibility::Eligible
@@ -154,9 +184,17 @@ impl SwapProfile {
     }
 
     #[must_use]
-    pub fn pair_eligibility(&self, sell: Address, buy: Address) -> SwapTokenEligibility {
-        for token in [sell, buy] {
-            let eligibility = self.token_eligibility(token);
+    pub fn pair_eligibility(
+        &self,
+        sell: Address,
+        buy: Address,
+        delivery: SwapDelivery,
+    ) -> SwapTokenEligibility {
+        for (token, role) in [
+            (sell, SwapTokenRole::Sell),
+            (buy, SwapTokenRole::Buy(delivery)),
+        ] {
+            let eligibility = self.token_eligibility(token, role);
             if eligibility != SwapTokenEligibility::Eligible {
                 return eligibility;
             }
@@ -165,6 +203,33 @@ impl SwapProfile {
             return SwapTokenEligibility::Ineligible(SwapIneligibility::SameToken);
         }
         SwapTokenEligibility::Eligible
+    }
+
+    /// Check an External delivery receiver against the swap's own addresses: its `executor`,
+    /// the chain's Railgun proxy `railgun`, and this profile's `CoW` contracts. Any other address,
+    /// including another of the wallet's accounts, is accepted.
+    pub fn check_receiver(
+        &self,
+        railgun: Address,
+        executor: Address,
+        receiver: Address,
+    ) -> Result<(), SwapReceiverRejection> {
+        let rejection = if receiver == Address::ZERO {
+            SwapReceiverRejection::ZeroAddress
+        } else if receiver == executor {
+            SwapReceiverRejection::Executor
+        } else if receiver == railgun {
+            SwapReceiverRejection::Railgun
+        } else if receiver == self.settlement {
+            SwapReceiverRejection::Settlement
+        } else if receiver == self.vault_relayer {
+            SwapReceiverRejection::VaultRelayer
+        } else if receiver == self.hooks_trampoline {
+            SwapReceiverRejection::HooksTrampoline
+        } else {
+            return Ok(());
+        };
+        Err(rejection)
     }
 }
 
@@ -186,6 +251,8 @@ impl EffectiveChainConfig {
 }
 
 /// v1 destination-token source: configured tokens on the profile's chain filtered by eligibility.
+/// The list is ERC-20 only for both delivery kinds; a native payout is an output choice on the
+/// wrapped native token, not a list entry.
 #[must_use]
 pub fn swap_destination_tokens<'a>(
     registry: &'a EffectiveTokenRegistry,
@@ -197,7 +264,8 @@ pub fn swap_destination_tokens<'a>(
         .filter(|token| token.chain_id == profile.chain_id)
         .filter(|token| {
             Address::from_str(&token.token_address).is_ok_and(|address| {
-                profile.token_eligibility(address) == SwapTokenEligibility::Eligible
+                profile.token_eligibility(address, SwapTokenRole::Buy(SwapDelivery::Reshield))
+                    == SwapTokenEligibility::Eligible
             })
         })
         .collect()
@@ -297,6 +365,10 @@ mod tests {
             token_address: usdc.to_string(),
         });
         let registry = build_effective_token_registry(&settings).unwrap();
+        let reshield = SwapDelivery::Reshield;
+        let external = SwapDelivery::External {
+            receiver: Address::repeat_byte(9),
+        };
         let offered = swap_destination_tokens(&registry, &profile)
             .into_iter()
             .map(|token| token.token_address.parse::<Address>().unwrap())
@@ -309,22 +381,58 @@ mod tests {
         // The backend admits the same tokens in either direction, without a second list.
         for (sell, buy) in [(weth, custom), (custom, weth), (steth, weth)] {
             assert_eq!(
-                profile.pair_eligibility(sell, buy),
+                profile.pair_eligibility(sell, buy, reshield),
                 SwapTokenEligibility::Eligible
             );
         }
         let ineligible = SwapTokenEligibility::Ineligible;
         assert_eq!(
-            profile.token_eligibility(Address::ZERO),
-            ineligible(SwapIneligibility::NativeAsset)
+            profile.pair_eligibility(usdc, Address::ZERO, external),
+            SwapTokenEligibility::Eligible
         );
+        for (sell, buy, delivery) in [
+            (usdc, Address::ZERO, reshield),
+            (Address::ZERO, usdc, reshield),
+            (Address::ZERO, usdc, external),
+        ] {
+            assert_eq!(
+                profile.pair_eligibility(sell, buy, delivery),
+                ineligible(SwapIneligibility::NativeAsset)
+            );
+        }
         assert_eq!(
-            profile.pair_eligibility(usdc, Address::ZERO),
-            ineligible(SwapIneligibility::NativeAsset)
-        );
-        assert_eq!(
-            profile.pair_eligibility(weth, weth),
+            profile.pair_eligibility(weth, weth, reshield),
             ineligible(SwapIneligibility::SameToken)
+        );
+    }
+
+    #[test]
+    fn external_receivers_exclude_the_swaps_own_addresses() {
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let chain = chains.get(1).unwrap();
+        let profile = chain.swap_profile().unwrap();
+        let railgun = chain.require_railgun().unwrap().deployment.contract;
+        let executor = Address::repeat_byte(2);
+        for (receiver, rejection) in [
+            (Address::ZERO, SwapReceiverRejection::ZeroAddress),
+            (executor, SwapReceiverRejection::Executor),
+            (railgun, SwapReceiverRejection::Railgun),
+            (profile.settlement(), SwapReceiverRejection::Settlement),
+            (profile.vault_relayer(), SwapReceiverRejection::VaultRelayer),
+            (
+                profile.hooks_trampoline(),
+                SwapReceiverRejection::HooksTrampoline,
+            ),
+        ] {
+            assert_eq!(
+                profile.check_receiver(railgun, executor, receiver),
+                Err(rejection)
+            );
+        }
+        // Another of the wallet's stealth accounts may receive.
+        assert_eq!(
+            profile.check_receiver(railgun, executor, Address::repeat_byte(3)),
+            Ok(())
         );
     }
 }

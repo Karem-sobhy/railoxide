@@ -38,6 +38,30 @@ pub(super) fn password() -> DesktopPrivateSpendAuthorization {
     DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()))
 }
 
+/// Terms approved with a new swap's setup. Only the pair and delivery bind its first order; a
+/// fresh review sets the order's bounds.
+pub(super) fn setup_approval(sell: Address, buy: Address, delivery: SwapDelivery) -> SwapApproval {
+    SwapApproval {
+        bounds: SwapApprovedBounds {
+            sell_amount: U256::from(997_500),
+            unshield_amount: Some(U256::from(1_000_000)),
+            unshield_fee_bps: U256::from(25),
+            buy_amount: U256::ONE,
+            private_minimum: U256::ONE,
+            shield_fee_bps: U256::from(25),
+            slippage_bps: 50,
+            pre_hook_gas_limit: 1,
+            post_hook_gas_limit: Some(1),
+            hook_cost: Some(U256::ZERO),
+            anchors: Vec::new(),
+        },
+        price_verified: Some(false),
+        price_acknowledged: true,
+        delivery,
+        tokens: Some(crate::vault::SwapApprovalTokens { sell, buy }),
+    }
+}
+
 #[tokio::test]
 async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor() {
     let rpc = Rpc::start().await;
@@ -59,15 +83,19 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     .unwrap();
     let operation = ExecutorOperationId::random().unwrap();
     let first = owner
-        .prepare_swap_setup(operation, broadcaster(delegate), WETH, USDC, &password())
+        .prepare_swap_setup(
+            operation,
+            broadcaster(delegate),
+            setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            &password(),
+        )
         .await
         .unwrap();
     let second = owner
         .prepare_swap_setup(
             ExecutorOperationId::random().unwrap(),
             broadcaster(delegate),
-            WETH,
-            USDC,
+            setup_approval(WETH, USDC, SwapDelivery::Reshield),
             &password(),
         )
         .await
@@ -75,7 +103,12 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     assert_ne!(first.context().executor, second.context().executor);
     assert!(
         owner
-            .prepare_swap_setup(operation, broadcaster(delegate), WETH, USDC, &password())
+            .prepare_swap_setup(
+                operation,
+                broadcaster(delegate),
+                setup_approval(WETH, USDC, SwapDelivery::Reshield),
+                &password(),
+            )
             .await
             .is_err(),
         "a new swap never takes over a recorded swap's executor"

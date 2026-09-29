@@ -331,6 +331,28 @@ impl ExecutorOwner {
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
     ) -> Result<PreparedExecutorOperation> {
+        self.prepare_operation_with_swap_approval(
+            operation,
+            delivery,
+            authorization,
+            assets,
+            purpose_summary,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::prepare_operation`] for a new swap, whose record is created holding
+    /// `swap_approval`. A reservation that already exists keeps its own approval.
+    pub(super) async fn prepare_operation_with_swap_approval(
+        &self,
+        operation: ExecutorOperationId,
+        delivery: ExecutorDelivery,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
+        assets: &[ExecutorAsset],
+        purpose_summary: Option<&str>,
+        swap_approval: Option<crate::vault::SwapApproval>,
+    ) -> Result<PreparedExecutorOperation> {
         self.require_executor_authorization(
             authorization,
             &super::HardwareExecutorAction::Execute(operation),
@@ -373,9 +395,13 @@ impl ExecutorOwner {
         }
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "reserve_and_derive", "started");
-        let record = self
-            .store
-            .reserve(operation, profile.delegate(), purpose_summary, assets)?;
+        let record = self.store.reserve_with_swap_approval(
+            operation,
+            profile.delegate(),
+            purpose_summary,
+            assets,
+            swap_approval.clone(),
+        )?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(
@@ -447,9 +473,13 @@ impl ExecutorOwner {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let record = self
-            .store
-            .reserve(operation, profile.delegate(), purpose_summary, assets)?;
+        let record = self.store.reserve_with_swap_approval(
+            operation,
+            profile.delegate(),
+            purpose_summary,
+            assets,
+            swap_approval,
+        )?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(

@@ -11,7 +11,7 @@
 //! `VERIFICATION_BYPASS` address, and a settlement can run the swap's pre-hook.
 
 use super::swap_order::{OutputPois, spawn_orderbook, submitted_order};
-use super::swap_setup::{USDC, WETH, broadcaster, password};
+use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
 use crate::tests::cow_fork::{
@@ -23,7 +23,9 @@ use crate::{
     PreparedExecutorRecovery, SwapAmountPlan, SwapAmountRequest, SwapOrderOutcome, SwapOrderState,
     SwapPrice, SwapSetupStatus, WalletNetworkMode, swap_order_state,
 };
-use broadcaster_core::contracts::cow::{AppData, AppDataHooks, GPv2Settlement, Order, OrderUid};
+use broadcaster_core::contracts::cow::{
+    AppData, AppDataHooks, BUY_NATIVE_TOKEN, GPv2Settlement, Order, OrderUid,
+};
 use broadcaster_core::contracts::railgun::Call;
 
 alloy::sol! {
@@ -58,6 +60,8 @@ struct Wallet {
     chain: crate::settings::EffectiveChainConfig,
     owner: ExecutorOwner,
     positions: AtomicU64,
+    /// The buy token and delivery of new swaps. The sell token is WETH.
+    pair: (Address, SwapDelivery),
 }
 
 impl Wallet {
@@ -91,6 +95,7 @@ impl Wallet {
             owner,
             // Leaf positions past a tree's capacity have never been nullified on chain.
             positions: AtomicU64::new(1 << 20),
+            pair: (USDC, SwapDelivery::Reshield),
         }
     }
 
@@ -143,7 +148,12 @@ impl Wallet {
         let operation = ExecutorOperationId::random().unwrap();
         let prepared = self
             .owner
-            .prepare_swap_setup(operation, broadcaster(delegate), WETH, USDC, &authorization)
+            .prepare_swap_setup(
+                operation,
+                broadcaster(delegate),
+                setup_approval(WETH, self.pair.0, self.pair.1),
+                &authorization,
+            )
             .await
             .unwrap();
         let executor = prepared.context().executor;
@@ -245,8 +255,9 @@ impl Wallet {
             std::slice::from_ref(&note),
             &SwapAmountRequest {
                 sell_token: WETH,
-                buy_token: USDC,
+                buy_token: self.pair.0,
                 amount: U256::from(SELL_AMOUNT),
+                delivery: self.pair.1,
                 byte_budget: None,
             },
             swap_profile.app_data_byte_budget(),
@@ -256,9 +267,14 @@ impl Wallet {
             panic!("one note fits one order");
         };
         let quote_fee = SELL_AMOUNT / 1_000;
+        let buy_token = if self.pair.0 == Address::ZERO {
+            BUY_NATIVE_TOKEN
+        } else {
+            self.pair.0
+        };
         let quote: CowQuote = serde_json::from_value(json!({
             "quote": {
-                "sellToken": WETH, "buyToken": USDC,
+                "sellToken": WETH, "buyToken": buy_token,
                 "sellAmount": (SELL_AMOUNT - quote_fee).to_string(), "buyAmount": "20000000",
                 "validTo": 1, "feeAmount": quote_fee.to_string(), "gasAmount": "0",
                 "gasPrice": "0", "sellTokenPrice": "1000000000000", "kind": "sell",
@@ -531,6 +547,66 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
     );
     assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
     assert!(record.reserved_inputs().contains(&swap.input));
+    wallet.finish().await;
+}
+
+/// `holder`'s balance of `token`, or of ETH for the native marker `Address::ZERO`.
+async fn balance_of(fork: &ForkChain, token: Address, holder: Address) -> U256 {
+    if token == Address::ZERO {
+        fork.native_balance(holder).await
+    } else {
+        fork.erc20_balance(token, holder).await
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_external_settlement_pays_the_receiver_and_completes_on_the_trade() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let receiver = Address::repeat_byte(0x77);
+    // An ERC-20 buy, then a native buy that the settlement pays from its ETH balance.
+    for buy in [USDC, Address::ZERO] {
+        wallet.pair = (buy, SwapDelivery::External { receiver });
+        let swap = wallet.swap(&fork).await;
+        assert_eq!(swap.order.receiver, receiver);
+        assert!(swap.hooks.post.is_empty());
+        let before = balance_of(&fork, buy, receiver).await;
+
+        let receipt = fork
+            .settle(&swap.order, swap.signature.clone(), &swap.hooks.pre, &[])
+            .await;
+        assert!(
+            receipt.status(),
+            "the solver settles with the pre-hook alone"
+        );
+        assert!(balance_of(&fork, buy, receiver).await >= before + swap.order.buyAmount);
+        assert_eq!(balance_of(&fork, buy, swap.executor).await, U256::ZERO);
+        let settled = receipt.block_number.unwrap();
+        fork.mine(wallet.chain.finality_depth).await;
+
+        // The deployed settlement's Trade event alone completes the order.
+        wallet
+            .owner
+            .observe_swap_settlement(swap.operation, swap.uid, settled)
+            .await
+            .unwrap();
+        let record = wallet
+            .owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == swap.operation)
+            .unwrap();
+        assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
+        assert_eq!(
+            first_order(&record)
+                .observations()
+                .delivered
+                .and_then(|observation| observation.transaction_hash),
+            Some(receipt.transaction_hash)
+        );
+    }
     wallet.finish().await;
 }
 

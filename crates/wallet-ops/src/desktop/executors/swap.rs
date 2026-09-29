@@ -47,7 +47,8 @@ pub(super) use recovery::swap_recovery_call_bound;
 #[cfg(test)]
 pub(crate) use recovery::{swap_cancellation_admitted, swap_recovery_calls};
 
-/// Neutral purpose recorded for swap executors; the tokens stay in the record's assets.
+/// Neutral purpose recorded for swap executors; the tokens stay in the setup approval and
+/// the order terms.
 const SWAP_PURPOSE_SUMMARY: &str = "Private swap";
 
 /// Whether `record` belongs to a private swap, during setup or with orders.
@@ -356,8 +357,9 @@ impl ExecutorOwner {
         })
     }
 
-    /// Persist the terms the user approved with a reserved swap's setup, so its order can be
-    /// placed once the setup is confirmed, also after a restart.
+    /// Persist terms the user authorized for a reserved swap's setup, replacing the approval
+    /// saved with it. Call this only after the user approved a new review. The order is placed
+    /// with them once the setup is confirmed, also after a restart.
     pub fn record_swap_approval(
         &self,
         operation: ExecutorOperationId,
@@ -381,15 +383,15 @@ impl ExecutorOwner {
         Ok(())
     }
 
-    /// Reserve a fresh executor for a new swap. The operation must be unused, so
-    /// no swap ever takes over another operation's executor. Setup delivery is
-    /// broadcaster-only.
+    /// Reserve a fresh executor for a new swap, with the terms the user approved for it. The
+    /// record is created holding `approval`, whose pair and delivery bind the first order. The
+    /// operation must be unused, so no swap ever takes over another operation's executor.
+    /// Setup delivery is broadcaster-only.
     pub async fn prepare_swap_setup(
         &self,
         operation: ExecutorOperationId,
         candidate: PublicBroadcasterCandidate,
-        sell: Address,
-        buy: Address,
+        approval: SwapApproval,
         authorization: &DesktopPrivateSpendAuthorization,
     ) -> Result<PreparedExecutorOperation> {
         self.ensure_active()?;
@@ -397,7 +399,12 @@ impl ExecutorOwner {
             .chain
             .swap_profile()
             .ok_or_else(|| eyre!("private swaps are unavailable on this chain"))?;
-        if swap.pair_eligibility(sell, buy) != SwapTokenEligibility::Eligible {
+        let tokens = approval
+            .tokens
+            .ok_or_else(|| eyre!("the swap's approval has no token pair"))?;
+        if swap.pair_eligibility(tokens.sell, tokens.buy, approval.delivery)
+            != SwapTokenEligibility::Eligible
+        {
             return Err(eyre!("this token pair is not eligible for private swaps"));
         }
         if self.swap_record(operation)?.is_some() {
@@ -405,12 +412,15 @@ impl ExecutorOwner {
                 "this swap already has an executor; resume it instead"
             ));
         }
-        self.prepare_operation(
+        // Recovery inspects the sell token. `record_swap_attempt` adds the buy token for a
+        // Reshield order, the only kind that pays it to the executor.
+        self.prepare_operation_with_swap_approval(
             operation,
             ExecutorDelivery::PublicBroadcaster(Box::new(candidate)),
             authorization,
-            &[ExecutorAsset::Erc20(sell), ExecutorAsset::Erc20(buy)],
+            &[ExecutorAsset::Erc20(tokens.sell)],
             Some(SWAP_PURPOSE_SUMMARY),
+            Some(approval),
         )
         .await
     }

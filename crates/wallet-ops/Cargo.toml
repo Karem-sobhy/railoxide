@@ -12,6 +12,8 @@ hardware = [
     "dep:protobuf",
     "dep:trezor-client",
 ]
+# Seams for the desktop wallet's UI tests. Only its dev-dependencies enable this.
+test-support = []
 
 [[example]]
 name = "hardware_derivation_probe"

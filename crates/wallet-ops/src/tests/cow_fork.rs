@@ -16,7 +16,7 @@ use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
-use broadcaster_core::contracts::cow::{AppDataHook, Order};
+use broadcaster_core::contracts::cow::{AppDataHook, BUY_NATIVE_TOKEN, Order};
 use broadcaster_core::contracts::railgun::{
     BoundParams, CommitmentCiphertext, CommitmentPreimage, G1Point, G2Point, SnarkProof, TokenData,
     Transaction,
@@ -202,6 +202,10 @@ impl ForkChain {
             .await
     }
 
+    pub(crate) async fn native_balance(&self, holder: Address) -> U256 {
+        self.provider.get_balance(holder).await.unwrap()
+    }
+
     pub(crate) async fn mine(&self, blocks: u64) {
         self.raw("anvil_mine", (U256::from(blocks),)).await;
     }
@@ -265,9 +269,9 @@ impl ForkChain {
     }
 
     /// Settle one fill-or-kill sell order at exactly its limit price as the bypass
-    /// solver. The settlement contract is funded with the buy amount first, then
-    /// runs `pre_hooks` and `post_hooks` through the deployed trampoline, as a solver
-    /// does with the order's app-data hooks.
+    /// solver. The settlement contract is funded with the buy amount first, in ETH for
+    /// `GPv2`'s native buy token, then runs `pre_hooks` and `post_hooks` through the
+    /// deployed trampoline, as a solver does with the order's app-data hooks.
     pub(crate) async fn settle(
         &self,
         order: &Order,
@@ -290,8 +294,14 @@ impl ForkChain {
         intra_hooks: &[AppDataHook],
         post_hooks: &[AppDataHook],
     ) -> TransactionReceipt {
-        self.add_erc20(order.buyToken, SETTLEMENT, order.buyAmount)
-            .await;
+        if order.buyToken == BUY_NATIVE_TOKEN {
+            let balance = self.native_balance(SETTLEMENT).await;
+            self.raw("anvil_setBalance", (SETTLEMENT, balance + order.buyAmount))
+                .await;
+        } else {
+            self.add_erc20(order.buyToken, SETTLEMENT, order.buyAmount)
+                .await;
+        }
         let trampoline = |hooks: &[AppDataHook]| {
             if hooks.is_empty() {
                 return Vec::new();

@@ -5,7 +5,8 @@
 //! confirmed block, never from the orderbook's order status. Logs locate events
 //! inside the requested page. State read at the confirmed block decides what can
 //! no longer happen: spent nullifiers, the execution nonce, the order's filled
-//! amount, and the executor's buy-token balance. It also decides whether the page
+//! amount, and, for Reshield delivery, the executor's buy-token balance. External
+//! delivery is established by the trade alone. State also decides whether the page
 //! can hold anything new, and its logs are read only when it can. Each recorded
 //! observation keeps its block and is dropped once that block is no longer canonical.
 
@@ -34,7 +35,7 @@ use crate::public_wallet::PublicErc20;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     ExecutorOperationId, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
-    IssuedExecutorPayload, SwapObservation, SwapOrderObservations, SwapOrderRecord,
+    IssuedExecutorPayload, SwapDelivery, SwapObservation, SwapOrderObservations, SwapOrderRecord,
     SwapPreHookDeath, SwapPreHookDeathCause, SwapShieldObservation, SwapTradeAmounts,
 };
 
@@ -61,18 +62,18 @@ pub enum SwapOrderState {
     /// The pre-hook ran and no trade is observed. Retries stay blocked. Once
     /// `expired`, the order can no longer fill and the sell token can be recovered.
     PreHookOnly { expired: bool },
-    /// Traded, and the reshield isn't established yet.
+    /// Traded, and the reshield isn't established yet. External delivery never stays here.
     Traded,
-    /// Traded and reshielded.
+    /// Traded and delivered: reshielded, or paid to the External receiver.
     Done,
     /// Traded, and the executor still held buy tokens at a finalized block.
-    /// Recovery of the buy token is offered.
+    /// Recovery of the buy token is offered. Only Reshield delivery reaches this.
     NotDelivered,
     /// The pre-hook can never run. Its inputs are released and a retry may start.
     AttemptEnded(SwapPreHookDeathCause),
 }
 
-/// Completion needs both the trade and the reshield. Observations are the last
+/// Completion needs both the trade and delivery. Observations are the last
 /// recorded ones; current decisions need a reconciled record.
 #[must_use]
 pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
@@ -297,7 +298,7 @@ struct OrderFacts {
     nullifiers_spent: Option<bool>,
     /// The settlement's `filledAmount` at the confirmed block, when read.
     filled: Option<U256>,
-    /// This order's buy-token balance at the confirmed block.
+    /// This order's buy-token balance at the confirmed block. Read only for Reshield delivery.
     buy_balance: Option<U256>,
 }
 
@@ -520,27 +521,30 @@ async fn read_swap_facts(
                 .calldata(),
         )?
         ._transactions;
-        let post_hook_shields = expected_shields(
-            executor,
-            railgun,
-            &RelayAdapt7702::multicallCall::abi_decode(
-                issued(record, order.post_hook().payload())?
-                    .context()
-                    .calldata(),
-            )?
-            ._calls,
-        )?;
+        // An order without a post-hook has no post-hook shield to find.
+        let post_hook_shields = match order.post_hook() {
+            Some(post_hook) => expected_shields(
+                executor,
+                railgun,
+                &RelayAdapt7702::multicallCall::abi_decode(
+                    issued(record, post_hook.payload())?.context().calldata(),
+                )?
+                ._calls,
+            )?,
+            None => Vec::new(),
+        };
         // Receipt confirmation established delivery without identifying RPC reads. During
         // explicit account reuse/recovery, establish the post-hook nonce at that known block.
         if facts.retained.shielded.is_none()
             && let Some(credit) = facts.retained.settlement_credit
+            && let Some(post_hook) = order.post_hook()
             && nonce_passed_in(
                 provider,
                 chain,
                 executor,
                 &mut headers,
                 credit.observation.block,
-                order.post_hook().nonce(),
+                post_hook.nonce(),
             )
             .await?
         {
@@ -570,10 +574,11 @@ async fn read_swap_facts(
             // Anyone can shield with the post-hook's public request, but only the
             // post-hook itself also moves the nonce past its own in that block.
             // The largest credit is chosen by amount alone; its fee only rides along.
-            if let Some((private_amount, fee)) = logs
-                .iter()
-                .filter_map(|log| shielded_amount(railgun, log, &post_hook_shields))
-                .max_by_key(|(private_amount, _)| *private_amount)
+            if let Some(post_hook) = order.post_hook()
+                && let Some((private_amount, fee)) = logs
+                    .iter()
+                    .filter_map(|log| shielded_amount(railgun, log, &post_hook_shields))
+                    .max_by_key(|(private_amount, _)| *private_amount)
             {
                 let evidence = headers.evidence(*block, *transaction).await?;
                 if nonce_passed_in(
@@ -582,7 +587,7 @@ async fn read_swap_facts(
                     executor,
                     &mut headers,
                     *block,
-                    order.post_hook().nonce(),
+                    post_hook.nonce(),
                 )
                 .await?
                 {
@@ -631,7 +636,11 @@ async fn read_swap_facts(
             facts.filled =
                 Some(filled_amount(provider, settlement, order.uid(), at_confirmed).await?);
         }
-        if facts.retained.traded.or(facts.traded).is_some() && facts.retained.delivered.is_none() {
+        // An External order pays its receiver, so the executor's buy balance proves nothing.
+        if facts.retained.traded.or(facts.traded).is_some()
+            && facts.retained.delivered.is_none()
+            && matches!(order.delivery(), SwapDelivery::Reshield)
+        {
             facts.buy_balance = Some(
                 call_at(
                     provider,
@@ -680,18 +689,20 @@ fn page_may_hold_hook_evidence(
                 && record.payload_status(payload.hash()) == Some(ExecutorPayloadStatus::Executed)
         }) || orders.iter().zip(facts).any(|(order, facts)| {
             (order.pre_hook().nonce() == used && facts.retained.pre_hook_executed.is_some())
-                || (order.post_hook().nonce() == used && facts.retained.shielded.is_some())
+                || (order.post_hook().is_some_and(|hook| hook.nonce() == used)
+                    && facts.retained.shielded.is_some())
         })
     };
     orders.iter().zip(facts).any(|(order, facts)| {
         let retained = &facts.retained;
-        let post_hook = order.post_hook().nonce();
         let awaiting_delivery = retained.traded.is_some() && retained.delivered.is_none();
         awaiting_delivery
             || (retained.pre_hook_executed.is_none()
                 && retained.pre_hook_dead.is_none()
                 && nonce > order.pre_hook().nonce())
-            || (retained.shielded.is_none() && nonce > post_hook && !explained(post_hook))
+            || order.post_hook().is_some_and(|hook| {
+                retained.shielded.is_none() && nonce > hook.nonce() && !explained(hook.nonce())
+            })
             || (retained.traded.is_none()
                 && retained.pre_hook_dead.is_none()
                 && retained.expired.is_none()
@@ -818,11 +829,16 @@ fn derive_swap_observations(
             if let Some(traded) = next.traded
                 && next.delivered.is_none()
             {
-                // A skipped or early funded post-hook leaves at least buyAmount from
-                // the fill. A smaller remainder may be a later gift. Require a matching
-                // shield that actually credited the approved private minimum as well.
-                match observed.buy_balance {
-                    Some(balance) if balance < order.bounds().buy_amount => {
+                match (order.delivery(), observed.buy_balance) {
+                    // The order UID commits to the receiver, and the settlement pays it in the
+                    // transaction that emits the matching Trade.
+                    (SwapDelivery::External { .. }, _) => next.delivered = Some(traded),
+                    // A skipped or early funded post-hook leaves at least buyAmount from
+                    // the fill. A smaller remainder may be a later gift. Require a matching
+                    // shield that actually credited the approved private minimum as well.
+                    (SwapDelivery::Reshield, Some(balance))
+                        if balance < order.bounds().buy_amount =>
+                    {
                         next.delivered = shields
                             .iter()
                             .find(|(terms, shield)| {
@@ -836,8 +852,10 @@ fn derive_swap_observations(
                                 transaction_hash: shield.observation.transaction_hash,
                             });
                     }
-                    Some(_) => next.undelivered = next.undelivered.or(Some(finalized)),
-                    None => {}
+                    (SwapDelivery::Reshield, Some(_)) => {
+                        next.undelivered = next.undelivered.or(Some(finalized));
+                    }
+                    (SwapDelivery::Reshield, None) => {}
                 }
             }
             if next.traded.is_none()
@@ -902,7 +920,8 @@ fn death_cause(
             .iter()
             .zip(&facts.orders)
             .any(|(order, observed)| {
-                order.post_hook().nonce() == nonce && observed.shielded.is_some()
+                order.post_hook().is_some_and(|hook| hook.nonce() == nonce)
+                    && observed.shielded.is_some()
             })
     });
     if older_post_hook {

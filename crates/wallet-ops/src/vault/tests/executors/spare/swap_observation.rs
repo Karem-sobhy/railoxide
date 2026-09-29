@@ -13,7 +13,7 @@ use alloy::primitives::aliases::U120;
 use alloy::primitives::{LogData, Signature, TxKind, address, keccak256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
-use broadcaster_core::contracts::cow::{GPv2Settlement, OrderUid};
+use broadcaster_core::contracts::cow::{BUY_NATIVE_TOKEN, GPv2Settlement, OrderUid};
 use broadcaster_core::contracts::railgun::{
     Call, CommitmentCiphertext, Nullified, Shield, ShieldCiphertext, ShieldRequest, TokenData,
     Transact, shieldCall,
@@ -442,10 +442,15 @@ fn uid(attempt: u8, valid_to_block: u64) -> OrderUid {
 }
 
 fn trade_log(uid: OrderUid) -> LogData {
+    trade_log_for(uid, BUY)
+}
+
+/// The settlement's Trade event, which reports the order's `CoW` buy token.
+fn trade_log_for(uid: OrderUid, buy_token: Address) -> LogData {
     Trade {
         owner: EXECUTOR,
         sellToken: SELL,
-        buyToken: BUY,
+        buyToken: buy_token,
         sellAmount: U256::from(SELL_AMOUNT),
         buyAmount: U256::from(BUY_AMOUNT),
         feeAmount: U256::ZERO,
@@ -619,6 +624,18 @@ impl Fixture {
     }
 
     fn record_pair_attempt(&self, attempt: u8, valid_to_block: u64, buy: Address) {
+        self.record_delivery_attempt(attempt, valid_to_block, buy, SwapDelivery::Reshield);
+    }
+
+    /// An External attempt signs no post-hook.
+    fn record_delivery_attempt(
+        &self,
+        attempt: u8,
+        valid_to_block: u64,
+        buy: Address,
+        delivery: SwapDelivery,
+    ) {
+        let reshield = matches!(delivery, SwapDelivery::Reshield);
         let mut shield = post_hook_shield(attempt);
         shield.preimage.token = TokenData::erc20(buy);
         let observed = self.record().nonce_observation().unwrap();
@@ -637,7 +654,7 @@ impl Fixture {
                     ),
                     proof: SwapProof::new(B256::repeat_byte(0x20), inputs.clone()),
                     uid: uid(attempt, valid_to_block),
-                    delivery: SwapDelivery::Reshield,
+                    delivery,
                     bounds: SwapApprovedBounds {
                         sell_amount: U256::from(SELL_AMOUNT),
                         unshield_amount: None,
@@ -647,7 +664,7 @@ impl Fixture {
                         shield_fee_bps: U256::from(25),
                         slippage_bps: 50,
                         pre_hook_gas_limit: 1,
-                        post_hook_gas_limit: 1,
+                        post_hook_gas_limit: reshield.then_some(1),
                         hook_cost: Some(U256::ZERO),
                         anchors: Vec::new(),
                     },
@@ -667,32 +684,34 @@ impl Fixture {
                             inputs,
                         ),
                     ),
-                    post_hook: IssuedExecutorPayload::new(
-                        U256::from(nonce + 1),
-                        self.delegate,
-                        B256::repeat_byte(0x40 + attempt),
-                        ExecutorPayloadPurpose::SwapPostHook,
-                        ExecutorPayloadContext::new(
-                            RelayAdapt7702::multicallCall {
-                                _requireSuccess: true,
-                                _calls: vec![Call {
-                                    to: EXECUTOR,
-                                    value: U256::ZERO,
-                                    data: shieldCall {
-                                        _shieldRequests: vec![shield],
-                                    }
-                                    .abi_encode()
-                                    .into(),
-                                }],
-                                _nonce: U256::from(nonce + 1),
-                                _signature: Bytes::new(),
-                            }
-                            .abi_encode()
-                            .into(),
-                            observed,
-                            Vec::new(),
-                        ),
-                    ),
+                    post_hook: reshield.then(|| {
+                        IssuedExecutorPayload::new(
+                            U256::from(nonce + 1),
+                            self.delegate,
+                            B256::repeat_byte(0x40 + attempt),
+                            ExecutorPayloadPurpose::SwapPostHook,
+                            ExecutorPayloadContext::new(
+                                RelayAdapt7702::multicallCall {
+                                    _requireSuccess: true,
+                                    _calls: vec![Call {
+                                        to: EXECUTOR,
+                                        value: U256::ZERO,
+                                        data: shieldCall {
+                                            _shieldRequests: vec![shield],
+                                        }
+                                        .abi_encode()
+                                        .into(),
+                                    }],
+                                    _nonce: U256::from(nonce + 1),
+                                    _signature: Bytes::new(),
+                                }
+                                .abi_encode()
+                                .into(),
+                                observed,
+                                Vec::new(),
+                            ),
+                        )
+                    }),
                 },
             )
             .unwrap();
@@ -810,6 +829,7 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
             sell_token: SELL,
             buy_token: BUY,
             amount,
+            delivery: SwapDelivery::Reshield,
             byte_budget: None,
         },
         profile.app_data_byte_budget(),
@@ -1030,12 +1050,14 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
                     shield_fee_bps: U256::from(25),
                     slippage_bps: 50,
                     pre_hook_gas_limit: 1,
-                    post_hook_gas_limit: 1,
+                    post_hook_gas_limit: Some(1),
                     hook_cost: Some(U256::ZERO),
                     anchors: Vec::new(),
                 },
                 price_verified: Some(false),
                 price_acknowledged: true,
+                delivery: SwapDelivery::Reshield,
+                tokens: None,
             },
         )
         .unwrap();
@@ -1197,6 +1219,96 @@ async fn a_shield_below_the_approved_private_minimum_does_not_complete_the_swap(
             .observations()
             .delivered
             .is_none()
+    );
+    fixture.finish().await;
+}
+
+/// Whether any request read an ERC-20 balance.
+fn reads_a_balance(requests: &[Value]) -> bool {
+    let selector =
+        alloy::hex::encode_prefixed(crate::public_wallet::PublicErc20::balanceOfCall::SELECTOR);
+    requests.iter().any(|request| {
+        request["method"] == "eth_call"
+            && request["params"][0]
+                .get("input")
+                .or_else(|| request["params"][0].get("data"))
+                .and_then(Value::as_str)
+                .is_some_and(|input| input.starts_with(&selector))
+    })
+}
+
+#[tokio::test]
+async fn reconciling_an_external_swap_delivers_on_its_trade_without_reading_balances() {
+    let fixture = Fixture::start().await;
+    let receiver = Address::repeat_byte(0x77);
+    fixture.record_delivery_attempt(0, 100, BUY, SwapDelivery::External { receiver });
+    // One settlement runs the pre-hook and pays the receiver. Only the pre-hook takes a nonce.
+    let settlement_tx = B256::repeat_byte(0x40);
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        let mut logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
+            .into_iter()
+            .map(|data| (fixture.railgun, data))
+            .collect::<Vec<_>>();
+        logs.push((fixture.settlement, trade_log(uid(0, 100))));
+        chain.add_logs(40, settlement_tx, logs);
+        chain.nonces.push((40, 2));
+        chain.rpc_requests.clear();
+    }
+    let record = fixture.observe(46, 35).await;
+    let settled = Some(SwapObservation {
+        block: fixture.chain.lock().unwrap().block(40),
+        transaction_hash: Some(settlement_tx),
+    });
+    let observed = record.swap().unwrap().orders()[0].observations();
+    assert_eq!(state(&record, 0), SwapOrderState::Done);
+    assert_eq!(
+        (observed.traded, observed.delivered, observed.undelivered),
+        (settled, settled, None)
+    );
+    assert!(record.swap().unwrap().admits_attempt());
+    assert!(!reads_a_balance(
+        &fixture.chain.lock().unwrap().rpc_requests
+    ));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn an_external_pre_hook_without_a_trade_recovers_only_the_sell_token() {
+    let fixture = Fixture::start().await;
+    let receiver = Address::repeat_byte(0x77);
+    fixture.record_delivery_attempt(0, 35, Address::ZERO, SwapDelivery::External { receiver });
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        let logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
+            .into_iter()
+            .map(|data| (fixture.railgun, data))
+            .collect();
+        chain.add_logs(30, B256::repeat_byte(0x30), logs);
+        chain.nonces.push((30, 2));
+    }
+    let record = fixture.observe(41, 25).await;
+    assert_eq!(
+        state(&record, 0),
+        SwapOrderState::PreHookOnly { expired: true }
+    );
+    // The expired order can't fill, so recovery only resets the sell token's approval.
+    let calls = crate::swap_recovery_calls(
+        &record,
+        &swap_profile(),
+        EXECUTOR,
+        &[(SELL, U256::from(SELL_AMOUNT))],
+        at_block(41),
+    )
+    .unwrap();
+    let [reset] = calls.as_slice() else {
+        panic!("recovery resets only the sell token's approval");
+    };
+    let approval =
+        broadcaster_core::contracts::railgun::approveCall::abi_decode(&reset.data).unwrap();
+    assert_eq!(
+        (reset.to, approval.spender, approval.amount),
+        (SELL, swap_profile().vault_relayer(), U256::ZERO)
     );
     fixture.finish().await;
 }
@@ -2114,6 +2226,70 @@ async fn settlement_receipts_do_not_complete_an_early_or_copied_or_small_shield(
             let chain = fixture.chain.lock().unwrap();
             let block =
                 BlockNumHash::new(15, chain.transactions.last().unwrap().1.block_hash.unwrap());
+            assert_block_only_requests(&chain.rpc_requests, block);
+        }
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn settlement_receipts_deliver_external_orders_from_the_trade_alone() {
+    let receiver = Address::repeat_byte(0x77);
+    let order = uid(1, 20);
+    // An ERC-20 buy pays the receiver with a Transfer. A native buy's Trade reports `GPv2`'s
+    // native buy address and emits no Transfer. Another order's trade settles nothing.
+    for (buy, trade, matching) in [
+        (BUY, trade_log_for(order, BUY), true),
+        (Address::ZERO, trade_log_for(order, BUY_NATIVE_TOKEN), true),
+        (BUY, trade_log_for(uid(2, 20), BUY), false),
+    ] {
+        let fixture = Fixture::start().await;
+        fixture.record_delivery_attempt(1, 20, buy, SwapDelivery::External { receiver });
+        let mut logs = vec![(fixture.settlement, trade)];
+        if buy == BUY {
+            logs.push((
+                BUY,
+                Transfer {
+                    from: fixture.settlement,
+                    to: receiver,
+                    value: U256::from(BUY_AMOUNT),
+                }
+                .encode_log_data(),
+            ));
+        }
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head = 16;
+            chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
+            chain.rpc_requests.clear();
+        }
+        fixture
+            .owner
+            .observe_swap_settlement(fixture.operation, order, 15)
+            .await
+            .unwrap();
+        let record = fixture.record();
+        let observed = record.swap().unwrap().orders()[0].observations();
+        {
+            let chain = fixture.chain.lock().unwrap();
+            let block = chain.block(15);
+            let traded = SwapObservation {
+                block,
+                transaction_hash: Some(chain.transactions.last().unwrap().0),
+            };
+            if matching {
+                assert_eq!(
+                    swap_order_state(&record.swap().unwrap().orders()[0]),
+                    SwapOrderState::Done
+                );
+                assert_eq!(
+                    (observed.traded, observed.delivered),
+                    (Some(traded), Some(traded))
+                );
+                assert!(observed.settlement_credit.is_none());
+            } else {
+                assert_eq!(observed, SwapOrderObservations::default());
+            }
             assert_block_only_requests(&chain.rpc_requests, block);
         }
         fixture.finish().await;

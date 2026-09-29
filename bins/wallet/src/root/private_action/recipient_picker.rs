@@ -1,7 +1,7 @@
 use crate::root::ui_helpers::dialog_footer;
 
 use super::*;
-use gpui::FontWeight;
+use gpui::{ElementId, FontWeight};
 use ui::recipient_picker::{RecipientPicker, RecipientPickerEvent, RecipientSuggestion};
 pub(in crate::root) use ui::recipient_picker::{
     RecipientSuggestionDirection,
@@ -131,6 +131,89 @@ fn first_recipient_suggestion_index(len: usize) -> Option<usize> {
     (len > 0).then_some(0)
 }
 
+// Suggestion list transitions: whether the list is open and which row is highlighted. They
+// follow `kind`'s address rules, so every form that owns a picker behaves the same.
+
+/// The list after the user opens or closes it. An open list highlights its first row.
+pub(in crate::root) fn recipient_suggestions_toggled(
+    kind: DeliveryFormKind,
+    options: &[RecipientOption],
+    query: &str,
+    open: bool,
+) -> (bool, Option<usize>) {
+    let open = open && !options.is_empty();
+    let filter_query = recipient_suggestion_filter_query(kind, query);
+    let selected_index = if open {
+        first_recipient_suggestion_index(filtered_recipient_options(options, &filter_query).len())
+    } else {
+        None
+    };
+    (open, selected_index)
+}
+
+/// The list after the input changed: open while a partial entry searches the options.
+pub(in crate::root) fn recipient_suggestions_for_input(
+    kind: DeliveryFormKind,
+    options: &[RecipientOption],
+    query: &str,
+) -> (bool, Option<usize>) {
+    let open =
+        !query.trim().is_empty() && !recipient_query_is_valid(kind, query) && !options.is_empty();
+    let selected_index = if open {
+        first_recipient_suggestion_index(filtered_recipient_options(options, query).len())
+    } else {
+        None
+    };
+    (open, selected_index)
+}
+
+/// The open list after an arrow key moved its highlight, or `None` when the key doesn't move
+/// it: there is nothing to suggest, or the input holds a new recipient to save.
+pub(in crate::root) fn recipient_suggestion_moved(
+    kind: DeliveryFormKind,
+    options: &[RecipientOption],
+    query: &str,
+    current: Option<usize>,
+    direction: RecipientSuggestionDirection,
+) -> Option<(bool, Option<usize>)> {
+    if options.is_empty() || can_save_recipient(kind, query, options) {
+        return None;
+    }
+    let filter_query = recipient_suggestion_filter_query(kind, query);
+    let filtered_len = filtered_recipient_options(options, &filter_query).len();
+    Some((
+        true,
+        recipient_suggestion_index_after_move(current, filtered_len, direction),
+    ))
+}
+
+/// The address Enter selects: the highlighted row, or the only one.
+pub(in crate::root) fn recipient_suggestion_to_confirm(
+    kind: DeliveryFormKind,
+    options: &[RecipientOption],
+    query: &str,
+    current: Option<usize>,
+) -> Option<String> {
+    let filter_query = recipient_suggestion_filter_query(kind, query);
+    let filtered = filtered_recipient_options(options, &filter_query);
+    let selected_index = current.or_else(|| (filtered.len() == 1).then_some(0));
+    selected_index
+        .and_then(|index| filtered.get(index))
+        .map(|option| selected_recipient_address(option).to_owned())
+}
+
+/// Whether the input holds a valid recipient that no option already names.
+pub(in crate::root) fn can_save_recipient(
+    kind: DeliveryFormKind,
+    recipient: &str,
+    options: &[RecipientOption],
+) -> bool {
+    match kind {
+        DeliveryFormKind::Send => can_save_private_recipient(recipient, options),
+        DeliveryFormKind::Unshield => can_save_public_recipient(recipient, options),
+    }
+}
+
 pub(in crate::root) fn selected_recipient_address(option: &RecipientOption) -> &str {
     &option.address
 }
@@ -197,11 +280,57 @@ pub(in crate::root) fn render_recipient_picker(
     options: &[RecipientOption],
     generating: bool,
 ) -> impl IntoElement {
-    let save_visible = match kind {
-        DeliveryFormKind::Send => can_save_private_recipient(current_value, options),
-        DeliveryFormKind::Unshield => can_save_public_recipient(current_value, options),
-    };
     let save_root = root.clone();
+    form_recipient_picker(
+        delivery_element_id(key, kind, "recipient-picker"),
+        delivery_element_id(key, kind, "save-recipient"),
+        kind,
+        input,
+        current_value,
+        suggestions_open,
+        selected_index,
+        suggestions_scroll,
+        options,
+        generating,
+        move |event, window, cx| {
+            root.update(cx, |root, cx| match event {
+                RecipientPickerEvent::Toggle => root.toggle_recipient_suggestions(kind, key, cx),
+                RecipientPickerEvent::Dismiss => root.dismiss_recipient_suggestions(kind, key, cx),
+                RecipientPickerEvent::Move(direction) => {
+                    root.move_recipient_suggestion_selection(kind, key, *direction, cx);
+                }
+                RecipientPickerEvent::Select(address) => {
+                    root.select_recipient_suggestion(kind, key, address, window, cx);
+                }
+            });
+        },
+        move |recipient, window, cx| {
+            save_root.update(cx, |root, cx| {
+                root.open_save_recipient_dialog(kind, recipient, window, cx);
+            });
+        },
+    )
+}
+
+/// The recipient picker of a form that owns its suggestion state, such as a Private Unshield
+/// or a swap's receiver. `kind` decides the address rules and the options, and Save offers a
+/// valid recipient that no option names. The form handles `on_event`; `on_save` gets the
+/// recipient to add to `kind`'s address book.
+pub(in crate::root) fn form_recipient_picker(
+    id: impl Into<ElementId>,
+    save_id: SharedString,
+    kind: DeliveryFormKind,
+    input: &Entity<InputState>,
+    current_value: &str,
+    suggestions_open: bool,
+    selected_index: Option<usize>,
+    suggestions_scroll: &ScrollHandle,
+    options: &[RecipientOption],
+    disabled: bool,
+    on_event: impl Fn(&RecipientPickerEvent, &mut Window, &mut App) + 'static,
+    on_save: impl Fn(String, &mut Window, &mut App) + 'static,
+) -> RecipientPicker {
+    let save_visible = can_save_recipient(kind, current_value, options);
     let options = options
         .iter()
         .map(|option| {
@@ -217,44 +346,26 @@ pub(in crate::root) fn render_recipient_picker(
             ))
         })
         .collect();
-    RecipientPicker::new(
-        delivery_element_id(key, kind, "recipient-picker"),
-        input,
-        options,
-        move |event, window, cx| {
-            root.update(cx, |root, cx| match event {
-                RecipientPickerEvent::Toggle => root.toggle_recipient_suggestions(kind, key, cx),
-                RecipientPickerEvent::Dismiss => root.dismiss_recipient_suggestions(kind, key, cx),
-                RecipientPickerEvent::Move(direction) => {
-                    root.move_recipient_suggestion_selection(kind, key, *direction, cx);
-                }
-                RecipientPickerEvent::Select(address) => {
-                    root.select_recipient_suggestion(kind, key, address, window, cx);
-                }
-            });
-        },
-    )
-    .query(recipient_suggestion_filter_query(kind, current_value))
-    .suggestions(suggestions_open, selected_index, suggestions_scroll)
-    .disabled(generating)
-    .when(save_visible, |picker| {
-        let recipient = current_value.trim().to_owned();
-        picker.action(
-            app_button_base(delivery_element_id(key, kind, "save-recipient"))
-                .icon(Icon::new(RailgunActionIcon::Save))
-                .outline()
-                .small()
-                .compact()
-                .accessibility_label("Save recipient")
-                .tooltip("Save recipient")
-                .disabled(generating)
-                .on_click(move |_, window, cx| {
-                    save_root.update(cx, |root, cx| {
-                        root.open_save_recipient_dialog(kind, key, recipient.clone(), window, cx);
-                    });
-                }),
-        )
-    })
+    RecipientPicker::new(id, input, options, on_event)
+        .query(recipient_suggestion_filter_query(kind, current_value))
+        .suggestions(suggestions_open, selected_index, suggestions_scroll)
+        .disabled(disabled)
+        .when(save_visible, |picker| {
+            let recipient = current_value.trim().to_owned();
+            let selector = save_id.clone();
+            picker.action(
+                app_button_base(save_id)
+                    .debug_selector(move || selector.to_string())
+                    .icon(Icon::new(RailgunActionIcon::Save))
+                    .outline()
+                    .small()
+                    .compact()
+                    .accessibility_label("Save recipient")
+                    .tooltip("Save recipient")
+                    .disabled(disabled)
+                    .on_click(move |_, window, cx| on_save(recipient.clone(), window, cx)),
+            )
+        })
 }
 
 impl WalletRoot {
@@ -415,15 +526,7 @@ impl WalletRoot {
             return;
         };
         let options = self.recipient_options_for_kind(kind);
-        let open = open && !options.is_empty();
-        let filter_query = recipient_suggestion_filter_query(kind, &query);
-        let selected_index = if open {
-            first_recipient_suggestion_index(
-                filtered_recipient_options(&options, &filter_query).len(),
-            )
-        } else {
-            None
-        };
+        let (open, selected_index) = recipient_suggestions_toggled(kind, &options, &query, open);
         let changed = self.set_recipient_suggestions_state(kind, key, open, selected_index);
         if changed {
             cx.notify();
@@ -462,14 +565,7 @@ impl WalletRoot {
             return;
         };
         let options = self.recipient_options_for_kind(kind);
-        let open = !query.trim().is_empty()
-            && !recipient_query_is_valid(kind, &query)
-            && !options.is_empty();
-        let selected_index = if open {
-            first_recipient_suggestion_index(filtered_recipient_options(&options, &query).len())
-        } else {
-            None
-        };
+        let (open, selected_index) = recipient_suggestions_for_input(kind, &options, &query);
         let changed = self.set_recipient_suggestions_state(kind, key, open, selected_index);
         if changed {
             cx.notify();
@@ -487,19 +583,13 @@ impl WalletRoot {
             return;
         };
         let options = self.recipient_options_for_kind(kind);
-        let save_visible = match kind {
-            DeliveryFormKind::Send => can_save_private_recipient(&query, &options),
-            DeliveryFormKind::Unshield => can_save_public_recipient(&query, &options),
-        };
-        if options.is_empty() || save_visible {
-            return;
-        }
-        let filter_query = recipient_suggestion_filter_query(kind, &query);
-        let filtered_len = filtered_recipient_options(&options, &filter_query).len();
         let current = self.recipient_suggestion_index(kind, key);
-        let selected_index =
-            recipient_suggestion_index_after_move(current, filtered_len, direction);
-        let changed = self.set_recipient_suggestions_state(kind, key, true, selected_index);
+        let Some((open, selected_index)) =
+            recipient_suggestion_moved(kind, &options, &query, current, direction)
+        else {
+            return;
+        };
+        let changed = self.set_recipient_suggestions_state(kind, key, open, selected_index);
         if changed {
             cx.notify();
         }
@@ -519,16 +609,14 @@ impl WalletRoot {
         let Some(query) = query else {
             return;
         };
-        let filter_query = recipient_suggestion_filter_query(kind, &query);
-        let filtered =
-            filtered_recipient_options(&self.recipient_options_for_kind(kind), &filter_query);
-        let selected_index = self
-            .recipient_suggestion_index(kind, key)
-            .or_else(|| (filtered.len() == 1).then_some(0));
-        let Some(option) = selected_index.and_then(|index| filtered.get(index)) else {
+        let Some(recipient) = recipient_suggestion_to_confirm(
+            kind,
+            &self.recipient_options_for_kind(kind),
+            &query,
+            self.recipient_suggestion_index(kind, key),
+        ) else {
             return;
         };
-        let recipient = selected_recipient_address(option).to_owned();
         self.select_recipient_suggestion(kind, key, &recipient, window, cx);
     }
 
@@ -660,7 +748,6 @@ impl WalletRoot {
     pub(in crate::root) fn open_save_recipient_dialog(
         &mut self,
         kind: DeliveryFormKind,
-        key: UnshieldAssetKey,
         recipient: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -698,9 +785,7 @@ impl WalletRoot {
                     let label = save_label_input.read(cx).value().to_string();
                     let recipient = save_recipient.clone();
                     save_root.update(cx, |root, cx| {
-                        root.save_recipient_to_address_book(
-                            kind, key, &label, &recipient, window, cx,
-                        )
+                        root.save_recipient_to_address_book(kind, &label, &recipient, window, cx)
                     })
                 })
                 .child(content_root.read(cx).render_save_recipient_dialog_content(
@@ -752,7 +837,6 @@ impl WalletRoot {
     fn save_recipient_to_address_book(
         &mut self,
         kind: DeliveryFormKind,
-        _key: UnshieldAssetKey,
         label: &str,
         recipient: &str,
         _window: &mut Window,

@@ -113,7 +113,8 @@ pub struct OrderLimitParams<'a> {
     /// `sellAmount + feeAmount`, `buyAmount` is the expected output after `CoW`'s network and
     /// protocol fees.
     pub quote: &'a CowQuoteParameters,
-    /// Sum of the pre-hook and post-hook gas estimates, without the declared limits' margin.
+    /// Sum of the gas estimates of the order's hooks, without the declared limits' margin: the
+    /// pre-hook, and the post-hook when the order reshields.
     pub hook_gas: u64,
     /// Buffered RPC gas price in wei. The quote's gas price is a floor, rounded up to whole wei.
     pub gas_price_wei: u128,
@@ -121,6 +122,7 @@ pub struct OrderLimitParams<'a> {
     pub hook_data_cost_wei: U256,
     pub native_rate: NativeBuyRate,
     pub slippage_bps: u32,
+    /// Zero for an order that pays an External receiver and so carries no shield.
     pub shield_fee_bps: U256,
 }
 

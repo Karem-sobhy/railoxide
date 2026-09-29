@@ -602,7 +602,10 @@ fn range_scan_can_find_executions(
             swap.orders().iter().any(|order| {
                 let observed = order.observations();
                 (order.pre_hook().nonce() == consumed && observed.pre_hook_executed.is_some())
-                    || (order.post_hook().nonce() == consumed && observed.shielded.is_some())
+                    || (order
+                        .post_hook()
+                        .is_some_and(|hook| hook.nonce() == consumed)
+                        && observed.shielded.is_some())
             })
         })
     };

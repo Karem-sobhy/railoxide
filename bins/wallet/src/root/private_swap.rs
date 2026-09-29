@@ -24,7 +24,9 @@ use wallet_ops::{
     is_swap_record,
     settings::{ExecutorProfile, SwapProfile, SwapTokenEligibility},
     swap_setup_recorded_executed,
-    vault::{ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload, SwapOrderRecord},
+    vault::{
+        ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload, SwapDelivery, SwapOrderRecord,
+    },
 };
 
 use super::WalletRoot;
@@ -38,8 +40,8 @@ mod progress;
 use form::SwapForm;
 use model::{SwapFillHint, SwapLabels, swap_history_start, swap_observation_range};
 pub(super) use model::{
-    SwapStage, swap_account_status, swap_pair_label, swap_recovery_token, swap_sell_amount,
-    swap_stage, swap_tokens,
+    SwapStage, swap_account_status, swap_delivery, swap_pair_label, swap_recovery_token,
+    swap_sell_amount, swap_stage, swap_tokens,
 };
 
 /// Delay between caught-up observation passes, and before retrying failed reads.
@@ -108,6 +110,7 @@ struct PendingSwapOrder {
     previous_order: Option<OrderUid>,
     sell: Address,
     buy: Address,
+    delivery: SwapDelivery,
     amount: U256,
     private_minimum: U256,
     slippage_bps: u32,
@@ -125,7 +128,8 @@ impl PendingSwapOrder {
         };
         let terms = swap.order_terms(order);
         order.observations().traded.is_some()
-            || (self.sell, self.buy) != (terms.sell_token(), terms.buy_token())
+            || (self.sell, self.buy, self.delivery)
+                != (terms.sell_token(), terms.buy_token(), order.delivery())
     }
 }
 
@@ -309,10 +313,10 @@ pub(super) fn swap_entry_availability(
     spendable: bool,
     actions_available: bool,
 ) -> Option<Result<(), &'static str>> {
-    use wallet_ops::settings::SwapIneligibility;
+    use wallet_ops::settings::{SwapIneligibility, SwapTokenRole};
     let profile = profile?;
     Some(if actions_available {
-        match token.map(|token| profile.token_eligibility(token)) {
+        match token.map(|token| profile.token_eligibility(token, SwapTokenRole::Sell)) {
             None | Some(SwapTokenEligibility::Ineligible(SwapIneligibility::NativeAsset)) => {
                 Err("Native assets can't be swapped privately")
             }
@@ -624,20 +628,43 @@ impl PrivateSwapsView {
             .confirmed_block(self.session.chain_id)
     }
 
+    /// A token's symbol, decimals and icon. The native asset, which a Public address swap can
+    /// buy as `Address::ZERO`, isn't in the token registry, so it comes from the chain.
+    fn token_metadata(
+        &self,
+        token: Address,
+        cx: &gpui::App,
+    ) -> Option<super::tokens::TokenDisplayMetadata> {
+        let root = self.root.upgrade()?;
+        let root = root.read(cx);
+        let chain_id = self.session.chain_id;
+        if token == Address::ZERO {
+            let native = &root.effective_chain_configs.get(chain_id)?.native_currency;
+            return Some(super::tokens::TokenDisplayMetadata {
+                symbol: native.symbol.clone(),
+                decimals: native.decimals,
+                icon_path: railgun_ui::chain_icon_asset_path(chain_id)
+                    .map(crate::assets::WalletIconSource::embedded),
+            });
+        }
+        super::token_display_metadata(Some(&root.effective_token_registry), chain_id, &token)
+    }
+
     fn token_symbol(&self, token: Address, cx: &gpui::App) -> String {
-        self.root
-            .upgrade()
-            .and_then(|root| {
-                super::token_display_metadata(
-                    Some(&root.read(cx).effective_token_registry),
-                    self.session.chain_id,
-                    &token,
-                )
-            })
+        self.token_metadata(token, cx)
             .map_or_else(|| railgun_ui::short_address(&token), |info| info.symbol)
     }
 
     fn token_amount(&self, token: Address, amount: U256, cx: &gpui::App) -> String {
+        if token == Address::ZERO
+            && let Some(native) = self.token_metadata(token, cx)
+        {
+            return format!(
+                "{} {}",
+                railgun_ui::format_token_amount(amount, native.decimals),
+                native.symbol
+            );
+        }
         self.root.upgrade().map_or_else(
             || amount.to_string(),
             |root| {
@@ -653,13 +680,17 @@ impl PrivateSwapsView {
 
     fn labels(&self, record: &ExecutorRecord, cx: &gpui::App) -> SwapLabels {
         if let Some(pending) = self.pending_order(record) {
-            return self.order_labels(
-                (pending.sell, pending.buy),
-                Some(pending.amount),
-                None,
-                None,
-                cx,
-            );
+            return SwapLabels {
+                receiver: self.receiver_name(pending.delivery, cx),
+                minimum: Some(self.token_amount(pending.buy, pending.private_minimum, cx)),
+                ..self.order_labels(
+                    (pending.sell, pending.buy),
+                    Some(pending.amount),
+                    None,
+                    None,
+                    cx,
+                )
+            };
         }
         let Some((sell, buy)) = swap_tokens(record) else {
             return SwapLabels {
@@ -670,6 +701,8 @@ impl PrivateSwapsView {
                 lapsed: false,
                 fill_hint: None,
                 received: None,
+                receiver: None,
+                minimum: None,
             };
         };
         let amount = swap_sell_amount(record).or_else(|| {
@@ -678,7 +711,17 @@ impl PrivateSwapsView {
                 .and_then(|tracking| tracking.amount)
         });
         let order = record.swap().and_then(|swap| swap.orders().last());
-        self.order_labels((sell, buy), amount, order, self.fill_hint(record, cx), cx)
+        let labels = self.order_labels((sell, buy), amount, order, self.fill_hint(record, cx), cx);
+        if order.is_some() {
+            return labels;
+        }
+        // Before its first order, the swap delivers as approved with its setup.
+        SwapLabels {
+            receiver: self.receiver_name(swap_delivery(record), cx),
+            minimum: model::swap_private_minimum(record)
+                .map(|minimum| self.token_amount(buy, minimum, cx)),
+            ..labels
+        }
     }
 
     fn setup_confirmation(&self, record: &ExecutorRecord) -> Option<model::SwapSetupConfirmation> {
@@ -723,8 +766,18 @@ impl PrivateSwapsView {
         let buy_symbol = self.token_symbol(buy, cx);
         let sell_label = amount.map_or(sell_symbol, |amount| self.token_amount(sell, amount, cx));
         let received = order
-            .and_then(|order| order.observations().shielded)
-            .map(|shield| self.token_amount(buy, shield.private_amount, cx));
+            .and_then(|order| {
+                let observed = order.observations();
+                match order.delivery() {
+                    SwapDelivery::Reshield => observed.shielded.map(|shield| shield.private_amount),
+                    // The trade paid the receiver directly.
+                    SwapDelivery::External { .. } => observed
+                        .delivered
+                        .and(observed.trade_amounts)
+                        .map(|trade| trade.buy_amount),
+                }
+            })
+            .map(|amount| self.token_amount(buy, amount, cx));
         let valid_to = order.map(|order| u64::from(order.valid_to()));
         SwapLabels {
             pair: swap_pair_label(&sell_label, &buy_symbol),
@@ -734,7 +787,21 @@ impl PrivateSwapsView {
             lapsed: valid_to.is_some_and(|valid_to| valid_to < now_unix()),
             fill_hint,
             received,
+            receiver: order.and_then(|order| self.receiver_name(order.delivery(), cx)),
+            minimum: order.map(|order| self.token_amount(buy, order.bounds().private_minimum, cx)),
         }
+    }
+
+    /// How swaps name a Public address receiver: the wallet's label for it, or its short
+    /// address. `None` for a swap back to the private balance.
+    fn receiver_name(&self, delivery: SwapDelivery, cx: &gpui::App) -> Option<String> {
+        let SwapDelivery::External { receiver } = delivery else {
+            return None;
+        };
+        Some(
+            self.receiver_label(receiver, cx)
+                .map_or_else(|| short_receiver(receiver), |(label, _)| label),
+        )
     }
 
     /// The orderbook's report that the latest order filled, while canonical observation still
@@ -1404,6 +1471,12 @@ async fn observe_pages(
         });
     }
     results
+}
+
+/// "0x7b2E…91F4": a receiver's address, shortened, in its checksummed case.
+pub(super) fn short_receiver(receiver: Address) -> String {
+    let checksummed = receiver.to_checksum(None);
+    format!("{}…{}", &checksummed[..6], &checksummed[38..])
 }
 
 /// Local wall-clock time of a Unix timestamp, such as "14:32".

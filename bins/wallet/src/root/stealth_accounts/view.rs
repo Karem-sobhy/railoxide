@@ -177,7 +177,15 @@ impl StealthAccountsView {
             return None;
         }
         let (sell, buy) = swap_tokens(record)?;
-        let (sell, buy) = (ExecutorAsset::Erc20(sell), ExecutorAsset::Erc20(buy));
+        // A native Buy asset of an External swap is the zero address.
+        let asset = |token| {
+            if token == alloy::primitives::Address::ZERO {
+                ExecutorAsset::Native
+            } else {
+                ExecutorAsset::Erc20(token)
+            }
+        };
+        let (sell, buy) = (asset(sell), asset(buy));
         let (sell_name, buy_name) = (self.asset_name(sell, cx), self.asset_name(buy, cx));
         Some(match swap_sell_amount(record) {
             Some(amount) => format!(
