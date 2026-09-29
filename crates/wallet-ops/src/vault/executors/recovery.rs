@@ -196,10 +196,11 @@ impl ExecutorStore {
             // An ordinary transaction cannot invalidate an outstanding execution signature.
             if !record.issued.is_empty()
                 && record.nonce_observation.is_none_or(|observation| {
-                    record
-                        .issued
-                        .iter()
-                        .any(|payload| payload.nonce >= observation.nonce)
+                    record.records_future_nonce(observation.nonce)
+                        || record
+                            .issued
+                            .iter()
+                            .any(|payload| record.is_outstanding_at(payload, observation.nonce))
                 })
             {
                 return Err(ExecutorStoreError::OutstandingNonce);

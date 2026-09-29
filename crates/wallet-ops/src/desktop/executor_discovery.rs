@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::time::Duration;
 
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
@@ -12,8 +13,10 @@ use broadcaster_core::contracts::executor::EXECUTION_NONCE_STORAGE_SLOT;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
+use futures_util::future::{join, join_all, join3};
 
 use crate::HttpContext;
+use crate::desktop::executor_observation::trace_step;
 use crate::public_wallet::PublicErc20;
 use crate::settings::{EffectiveChainConfig, ExecutorProfile};
 
@@ -176,64 +179,108 @@ pub(super) async fn inspect_at(
     block: BlockNumHash,
     recovery: bool,
 ) -> ExecutorInspection {
-    let block_id = BlockId::hash_canonical(block.hash);
-    let account_nonce = provider
-        .get_transaction_count(address)
-        .block_id(block_id)
-        .await
-        .ok();
-    let code = provider.get_code_at(address).block_id(block_id).await.ok();
-    let mut balances = BTreeMap::new();
-    balances.insert(
-        ExecutorAsset::Native,
-        provider.get_balance(address).block_id(block_id).await.ok(),
-    );
-    for asset in assets {
-        if balances.contains_key(asset) {
-            continue;
-        }
-        let balance = match asset {
-            ExecutorAsset::Native => continue,
-            ExecutorAsset::Erc20(token) => {
-                call(
-                    provider,
-                    *token,
-                    PublicErc20::balanceOfCall { account: address },
-                    block_id,
-                )
-                .await
-            }
-            ExecutorAsset::Erc721 {
-                collection,
-                token_id,
-            } => call(
-                provider,
-                *collection,
-                ExecutorErc721::ownerOfCall { tokenId: *token_id },
-                block_id,
-            )
-            .await
-            .map(|owner| U256::from(u8::from(owner == address))),
-        };
-        balances.insert(*asset, balance);
-    }
-    let execution_nonce = execution_nonce_with_code(
+    inspect_at_with(
         provider,
         chain,
         address,
-        block_id,
-        code.as_ref().map(AsRef::as_ref),
+        assets,
+        block,
         recovery,
+        std::future::ready(()),
+    )
+    .await
+    .0
+}
+
+/// Runs `alongside` with the execution nonce read, after the account, code and
+/// balance reads. The lazy future sends none of its requests before then.
+async fn inspect_at_with<T>(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    address: Address,
+    assets: &[ExecutorAsset],
+    block: BlockNumHash,
+    recovery: bool,
+    alongside: impl Future<Output = T>,
+) -> (ExecutorInspection, T) {
+    let block_id = BlockId::hash_canonical(block.hash);
+    // Native first, each asset once: requests keep the sequential read order.
+    let mut seen = BTreeSet::new();
+    let assets: Vec<_> = std::iter::once(ExecutorAsset::Native)
+        .chain(assets.iter().copied())
+        .filter(|asset| seen.insert(*asset))
+        .collect();
+    let (account_nonce, code, asset_balances) = join3(
+        async {
+            provider
+                .get_transaction_count(address)
+                .block_id(block_id)
+                .await
+                .ok()
+        },
+        async { provider.get_code_at(address).block_id(block_id).await.ok() },
+        join_all(
+            assets
+                .iter()
+                .map(|asset| asset_balance(provider, address, *asset, block_id)),
+        ),
     )
     .await;
-    ExecutorInspection {
-        chain_id: chain.chain_id,
-        address,
-        block,
-        account_nonce,
-        code,
-        execution_nonce,
-        balances,
+    let balances = assets.into_iter().zip(asset_balances).collect();
+    let (execution_nonce, alongside) = join(
+        execution_nonce_with_code(
+            provider,
+            chain,
+            address,
+            block_id,
+            code.as_ref().map(AsRef::as_ref),
+            recovery,
+        ),
+        alongside,
+    )
+    .await;
+    (
+        ExecutorInspection {
+            chain_id: chain.chain_id,
+            address,
+            block,
+            account_nonce,
+            code,
+            execution_nonce,
+            balances,
+        },
+        alongside,
+    )
+}
+
+async fn asset_balance(
+    provider: &DynProvider,
+    address: Address,
+    asset: ExecutorAsset,
+    block_id: BlockId,
+) -> Option<U256> {
+    match asset {
+        ExecutorAsset::Native => provider.get_balance(address).block_id(block_id).await.ok(),
+        ExecutorAsset::Erc20(token) => {
+            call(
+                provider,
+                token,
+                PublicErc20::balanceOfCall { account: address },
+                block_id,
+            )
+            .await
+        }
+        ExecutorAsset::Erc721 {
+            collection,
+            token_id,
+        } => call(
+            provider,
+            collection,
+            ExecutorErc721::ownerOfCall { tokenId: token_id },
+            block_id,
+        )
+        .await
+        .map(|owner| U256::from(u8::from(owner == address))),
     }
 }
 
@@ -254,7 +301,7 @@ pub(super) async fn execution_nonce_at(
     execution_nonce_with_code(provider, chain, address, block_id, Some(&code), false).await
 }
 
-async fn execution_nonce_with_code(
+pub(super) async fn execution_nonce_with_code(
     provider: &DynProvider,
     chain: &EffectiveChainConfig,
     address: Address,
@@ -361,20 +408,66 @@ async fn inspect_signing_state(
     );
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;
-        if provider.get_chain_id().await.ok() != Some(chain.chain_id) {
-            continue;
-        }
-        let Ok(Some(head)) = provider.get_block_by_number(BlockNumberOrTag::Latest).await else {
+        // The head read carries no address. Address reads wait for the chain check.
+        let Ok(head) = trace_step("inspection_chain_head", async {
+            match join(provider.get_chain_id(), async {
+                provider.get_block_by_number(BlockNumberOrTag::Latest).await
+            })
+            .await
+            {
+                (Ok(chain_id), Ok(Some(head))) if chain_id == chain.chain_id => {
+                    Ok(head.header.num_hash())
+                }
+                _ => Err(()),
+            }
+        })
+        .await
+        else {
             continue;
         };
-        let head = head.header.num_hash();
         let confirmed_number = head.number.saturating_sub(chain.finality_depth);
-        let Ok(Some(confirmed)) = provider.get_block_by_number(confirmed_number.into()).await
+        let Ok(Some(confirmed)) = trace_step("inspection_confirmed_block", async {
+            provider.get_block_by_number(confirmed_number.into()).await
+        })
+        .await
         else {
             continue;
         };
         let confirmed = confirmed.header.num_hash();
-        let current = inspect_at(provider, chain, address, assets, head, recovery).await;
+        let confirmed_nonce = async {
+            if confirmed == head {
+                None
+            } else if recovery {
+                // The reviewed target layout persists across delegation changes, including
+                // at the older block. Its runtime need not be installed at that block.
+                Some(
+                    provider
+                        .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
+                        .block_id(BlockId::hash_canonical(confirmed.hash))
+                        .await
+                        .ok(),
+                )
+            } else {
+                Some(execution_nonce_at(provider, chain, address, confirmed).await)
+            }
+        };
+        // The confirmed nonce read starts after the tip account reads, so a stalled
+        // tip code read never issues a second code read.
+        let Ok((current, confirmed_nonce)) = trace_step("inspection_state", async {
+            Ok::<_, Infallible>(
+                inspect_at_with(
+                    provider,
+                    chain,
+                    address,
+                    assets,
+                    head,
+                    recovery,
+                    confirmed_nonce,
+                )
+                .await,
+            )
+        })
+        .await;
         if current.account_nonce().is_none()
             || current.code().is_none()
             || current.balances().values().any(Option::is_none)
@@ -382,25 +475,15 @@ async fn inspect_signing_state(
         {
             continue;
         }
-        let nonce = if confirmed == head {
-            current.execution_nonce()
-        } else if recovery {
-            // The reviewed target layout persists across delegation changes, including
-            // at the older block. Its runtime need not be installed at that block.
-            provider
-                .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
-                .block_id(BlockId::hash_canonical(confirmed.hash))
-                .await
-                .ok()
-        } else {
-            execution_nonce_at(provider, chain, address, confirmed).await
-        };
+        let nonce = confirmed_nonce.unwrap_or_else(|| current.execution_nonce());
         if require_execution_nonce && nonce.is_none() {
             continue;
         }
         if current.execution_nonce() != nonce {
             return Err(eyre!("executor execution nonce is awaiting confirmation"));
         }
+        // After every state read, so a transaction sent meanwhile still blocks signing, and
+        // before the head recheck, which must be the last read.
         let Ok(pending_nonce) = provider.get_transaction_count(address).pending().await else {
             continue;
         };
@@ -411,7 +494,11 @@ async fn inspect_signing_state(
                 "executor account has an unconfirmed transaction or authorization"
             ));
         }
-        let Ok(Some(canonical)) = provider.get_block_by_number(head.number.into()).await else {
+        let Ok(Some(canonical)) = trace_step("inspection_canonical_recheck", async {
+            provider.get_block_by_number(head.number.into()).await
+        })
+        .await
+        else {
             continue;
         };
         if canonical.header.num_hash() != head {

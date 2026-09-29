@@ -81,7 +81,7 @@ impl StealthAccountsView {
                             .disabled(recovery_disabled.is_some())
                             .when_some(recovery_disabled, gpui_component::button::Button::tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_recovery(operation, None, window, cx);
+                                this.open_recovery(operation, None, None, window, cx);
                             })),
                     ),
                 )
@@ -439,10 +439,7 @@ impl StealthAccountsView {
                     .w(gpui::rems(9.))
                     .min_w_0()
                     .flex_none()
-                    .child(payload_result(
-                        record.recorded_payload_status(payload.hash()),
-                        cx,
-                    )),
+                    .child(payload_result(issued_payload_status(record, payload), cx)),
             )
     }
 }
@@ -526,6 +523,28 @@ fn payload_header(first: &'static str, purpose: bool) -> TableHeader {
                     .child(account_caption("Result")),
             ),
     )
+}
+
+/// Swap hooks run inside settlements and never get a direct-call inclusion. Once recorded
+/// swap observations show a hook took the nonce, that hook executed and every other
+/// payload at the nonce, such as an early cancellation, lost.
+fn issued_payload_status(
+    record: &ExecutorRecord,
+    payload: &IssuedExecutorPayload,
+) -> Option<ExecutorPayloadStatus> {
+    let status = record.recorded_payload_status(payload.hash());
+    if !matches!(status, Some(ExecutorPayloadStatus::Uncertain) | None) {
+        return status;
+    }
+    record
+        .swap_hook_winner(payload.nonce())
+        .map_or(status, |winner| {
+            Some(if winner == payload.hash() {
+                ExecutorPayloadStatus::Executed
+            } else {
+                ExecutorPayloadStatus::Invalidated { winner }
+            })
+        })
 }
 
 fn payload_result(status: Option<ExecutorPayloadStatus>, cx: &gpui::App) -> gpui::Div {

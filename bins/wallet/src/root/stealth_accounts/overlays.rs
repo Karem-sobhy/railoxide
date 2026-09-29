@@ -194,7 +194,10 @@ impl StealthAccountsView {
                 .unwrap_or(ExecutorPayloadStatus::Uncertain)
                 == ExecutorPayloadStatus::Uncertain
         });
-        if self.holding(record.operation()) || pending_retry {
+        if self.holding(record.operation())
+            || pending_retry
+            || super::view::swap_holds_funds(record)
+        {
             return None;
         }
         let checked = self
@@ -213,10 +216,13 @@ impl StealthAccountsView {
         })
     }
 
+    /// Open recovery for `operation`. `return_focus` is the caller's dialog under it, which
+    /// gets focus back when recovery closes; without it, the account's actions do.
     pub(super) fn open_recovery(
         &mut self,
         operation: ExecutorOperationId,
         asset: Option<ExecutorAsset>,
+        return_focus: Option<gpui::FocusHandle>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -265,6 +271,10 @@ impl StealthAccountsView {
         self.start_recovery_updates(window, cx);
         let view = cx.entity().downgrade();
         let return_view = view.clone();
+        // The dialog returns focus to what was focused when it opened.
+        if let Some(focus) = &return_focus {
+            focus.focus(window, cx);
+        }
         window.open_dialog(cx, move |dialog, window, cx| {
             let content = view
                 .update(cx, |view, cx| {
@@ -299,6 +309,7 @@ impl StealthAccountsView {
                         .into_any_element()
                 });
             let return_view = return_view.clone();
+            let return_focus = return_focus.clone();
             dialog
                 .title(app_strong_text(format!("Recover from account #{index}")))
                 .w((window.viewport_size().width * 0.92)
@@ -310,7 +321,10 @@ impl StealthAccountsView {
                 .on_close(move |_, window, cx| {
                     let _ = return_view.update(cx, |view, cx| {
                         view.close_recovery();
-                        view.recover_focus.focus(window, cx);
+                        return_focus
+                            .as_ref()
+                            .unwrap_or(&view.recover_focus)
+                            .focus(window, cx);
                         cx.notify();
                     });
                 })

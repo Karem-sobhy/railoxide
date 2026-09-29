@@ -1,12 +1,13 @@
 use alloy::primitives::{Address, U256};
 use eyre::{Result, eyre};
+use railgun_wallet::tx::RailgunGasModel;
 
 use super::{
     ExecutorAsset, ExecutorOperationId, ExecutorOwner, ExecutorRecord, ExecutorRecoveryExecution,
     ExecutorRecoveryFunding, PreparedExecutorRecovery, PublicActionGasFeeSelection,
     maximum_recovery_gas_limit,
 };
-use crate::vault::ExecutorPayloadStatus;
+use crate::desktop::executors::swap::swap_recovery_call_bound;
 
 /// Terms shown before recovery preparation. Possessing these terms does not authorize signing.
 #[derive(Clone)]
@@ -44,7 +45,9 @@ impl ExecutorOwner {
                     },
             } if *max_fee_per_gas > 0 && max_priority_fee_per_gas <= max_fee_per_gas => {
                 U256::from(maximum_recovery_gas_limit(
+                    RailgunGasModel::for_chain(self.chain.chain_id),
                     asset,
+                    swap_recovery_call_bound(&record),
                     self.chain.gas.gas_limit_buffer,
                 )) * U256::from(*max_fee_per_gas)
             }
@@ -61,14 +64,7 @@ impl ExecutorOwner {
             amount,
             funding,
             maximum_native_fee,
-            competing_payloads: record.issued().iter().any(|issued| {
-                !matches!(
-                    record.payload_status(issued.hash()),
-                    Some(
-                        ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. }
-                    )
-                )
-            }),
+            competing_payloads: record.has_competing_payloads(),
         })
     }
 }
@@ -114,9 +110,10 @@ impl ExecutorRecoveryApproval {
         let competing = match prepared.execution {
             ExecutorRecoveryExecution::Ordinary => return false,
             ExecutorRecoveryExecution::SignedMulticall { nonce }
-            | ExecutorRecoveryExecution::PaidExecute { nonce } => {
-                record.issued().iter().any(|issued| issued.nonce() == nonce)
-            }
+            | ExecutorRecoveryExecution::PaidExecute { nonce } => record
+                .issued()
+                .iter()
+                .any(|issued| record.is_outstanding_at(issued, nonce)),
         };
         record.operation() == self.operation
             && self.covers_terms(prepared)
@@ -256,7 +253,7 @@ mod tests {
             steps: Vec::new(),
             gas_limits: Vec::new(),
             maximum_native_fee: approval.maximum_native_fee,
-            shield: ShieldRequest {
+            shield: Some(ShieldRequest {
                 preimage: CommitmentPreimage {
                     npk: B256::ZERO,
                     token: TokenData::erc20(Address::repeat_byte(2)),
@@ -266,7 +263,7 @@ mod tests {
                     encryptedBundle: [B256::ZERO; 3],
                     shieldKey: B256::ZERO,
                 },
-            },
+            }),
         };
         let record = serde_json::from_value(serde_json::json!({
             "version": 1,

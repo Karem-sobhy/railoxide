@@ -1,4 +1,5 @@
 //! Shared broadcaster grouping and display records. Native owners supply eligibility and estimates.
+use crate::hint::hint_card;
 use crate::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 use gpui::{
     App, Entity, Focusable, InteractiveElement, InteractiveText, IntoElement, ParentElement,
@@ -1235,24 +1236,7 @@ fn render_fee_status_info_icon(tooltip_enabled: bool) -> impl IntoElement {
 }
 
 fn render_fee_status_popover(window: &Window) -> gpui::Div {
-    div()
-        .w(rems(22.5))
-        .when_some(
-            broadcaster_picker_status_tooltip_width(window.viewport_size().width, window.rem_size()),
-            Styled::max_w,
-        )
-        .p(rems(0.75))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_size(rems(0.75))
-        .text_color(rgb(theme::TEXT))
-        .child(
-            div()
-                .text_color(rgb(theme::WARNING))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child("Fee status"),
-        )
+    hint_card("Fee status", theme::WARNING, window)
         .child(div().child(
             "Est. tx fee includes gas cost and the broadcaster's fee.",
         ))

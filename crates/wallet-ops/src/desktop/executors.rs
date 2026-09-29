@@ -1,17 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
+use std::panic::Location;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
-use alloy::primitives::B256;
+use alloy::eips::BlockNumHash;
+use alloy::primitives::{B256, Bytes};
 use eyre::{Result, eyre};
+use sync_service::WalletHandle;
 use tokio::sync::{Mutex, MutexGuard, watch};
 
+use super::executor_observation::trace_step;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     DesktopVaultStore, DesktopViewSession, ExecutorOperationId, ExecutorRecord, ExecutorStore,
 };
-use crate::{ExecutorAsset, ExecutorInspection, HttpContext, inspect_executor};
+use crate::{ExecutorAsset, ExecutorInspection, HttpContext, WalletSyncTip, inspect_executor};
 
 mod authorization;
 pub use authorization::{
@@ -20,20 +25,38 @@ pub use authorization::{
 mod confirmations;
 mod discovery;
 mod execution;
+mod locks;
 mod observation;
 mod public_account;
 mod recovery;
 mod spare;
 mod status;
+mod swap;
 pub use discovery::ExecutorDiscoveryReport;
 pub use execution::*;
+pub use locks::{
+    ExecutorInputLock, ExecutorInputLockKind, ExecutorInputLockReason, LockedNotes, WalletNoteLocks,
+};
 pub use observation::ExecutorTransactionIdentity;
 pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;
 pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
+pub use swap::{
+    DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapExecutor,
+    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice, SwapReview,
+    SwapReviewChange, SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, is_swap_record,
+    swap_order_state, swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
+};
+#[cfg(test)]
+pub(crate) use swap::{
+    SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs, price_swap_review, reusable_swap_proof,
+    swap_cancellation_admitted, swap_invalidation, swap_recovery_calls,
+};
 
 pub struct ExecutorReconciliationReport {
     record: ExecutorRecord,
+    /// The executor's code and the canonical block it was read at, if the history read it.
+    code: Option<(BlockNumHash, Bytes)>,
 }
 
 impl ExecutorReconciliationReport {
@@ -52,15 +75,36 @@ pub struct ExecutorOwner {
     store: ExecutorStore,
     chain: EffectiveChainConfig,
     http: HttpContext,
+    endpoints: super::executor_observation::ObservationEndpoints,
     closed: watch::Sender<bool>,
     activity: Arc<Mutex<()>>,
-    reconciled: StdMutex<BTreeSet<ExecutorOperationId>>,
     history_coverage: StdMutex<BTreeMap<ExecutorOperationId, status::HistoryCoverage>>,
     submission_blocks: StdMutex<BTreeMap<ExecutorOperationId, BTreeMap<B256, Option<u64>>>>,
     tip_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     confirmation_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Confirmation observer inputs, reused by foreground history reads until close.
+    synced_observation: StdMutex<Option<(WalletHandle, watch::Receiver<WalletSyncTip>)>>,
     unused: StdMutex<spare::UnusedInspections>,
     changes: watch::Sender<u64>,
+}
+
+struct ExecutorActivityGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+    acquired: Instant,
+    caller: &'static Location<'static>,
+    span: tracing::Span,
+}
+
+impl Drop for ExecutorActivityGuard<'_> {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        if held >= Duration::from_millis(250) {
+            self.span.in_scope(|| {
+                tracing::debug!(target: "executor_observation", step = "activity_hold",
+                    elapsed_ms = held.as_millis(), caller = %self.caller, "finished");
+            });
+        }
+    }
 }
 
 impl ExecutorOwner {
@@ -77,15 +121,16 @@ impl ExecutorOwner {
             view,
             vault: DesktopVaultStore::from_db(db),
             store,
+            endpoints: super::executor_observation::ObservationEndpoints::new(&chain, &http),
             chain,
             http,
             closed: watch::channel(false).0,
             activity: Arc::new(Mutex::new(())),
-            reconciled: StdMutex::new(BTreeSet::new()),
             history_coverage: StdMutex::new(BTreeMap::new()),
             submission_blocks: StdMutex::new(BTreeMap::new()),
             tip_observation_join: StdMutex::new(None),
             confirmation_observation_join: StdMutex::new(None),
+            synced_observation: StdMutex::new(None),
             unused: StdMutex::new(spare::UnusedInspections::default()),
             changes: watch::channel(0).0,
         })
@@ -95,8 +140,14 @@ impl ExecutorOwner {
         self.generation
     }
 
+    /// Also releases the observation endpoints, so their background admission stops.
     pub(crate) fn close(&self) {
         self.closed.send_replace(true);
+        self.endpoints.release();
+        self.synced_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -124,23 +175,37 @@ impl ExecutorOwner {
         let _guard = self.activity.lock().await;
     }
 
-    async fn lock_activity(&self) -> MutexGuard<'_, ()> {
-        self.activity.lock().await
-    }
-
-    pub fn records(&self) -> Result<Vec<ExecutorRecord>> {
-        self.ensure_active()?;
-        let reconciled = self
-            .reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?;
-        let mut records = self.store.records()?;
-        for record in &mut records {
-            if !reconciled.contains(&record.operation()) {
-                record.require_reconciliation();
+    #[track_caller]
+    fn lock_activity(&self) -> impl Future<Output = ExecutorActivityGuard<'_>> {
+        let caller = Location::caller();
+        async move {
+            // Routine polling stays quiet unless it waits or holds the lock for a while.
+            let guard = if let Ok(guard) = self.activity.try_lock() {
+                guard
+            } else {
+                let started = Instant::now();
+                tracing::debug!(target: "executor_observation", step = "activity_lock",
+                    caller = %caller, "started");
+                let guard = self.activity.lock().await;
+                tracing::debug!(target: "executor_observation", step = "activity_lock",
+                    elapsed_ms = started.elapsed().as_millis(), caller = %caller, "finished");
+                guard
+            };
+            ExecutorActivityGuard {
+                _guard: guard,
+                acquired: Instant::now(),
+                caller,
+                span: tracing::Span::current(),
             }
         }
-        Ok(records)
+    }
+
+    /// Read durable history, including observations at head minus the configured finality
+    /// depth. Restart does not invalidate these facts or their input-reservation decisions.
+    /// Signing and recovery admission still inspect and reconcile the selected account.
+    pub fn records(&self) -> Result<Vec<ExecutorRecord>> {
+        self.ensure_active()?;
+        Ok(self.store.records()?)
     }
 
     pub fn set_hidden(&self, operation: ExecutorOperationId, hidden: bool) -> Result<()> {
@@ -163,13 +228,47 @@ impl ExecutorOwner {
         prepared: &PreparedExecutorOperation,
     ) -> Result<Vec<railgun_wallet::Utxo>> {
         let record = self.validate_preparation(prepared)?;
-        let mut inputs = inputs;
+        if prepared.is_recovery() {
+            self.inputs_for_recovery(inputs, &record)
+        } else {
+            self.inputs_for_record(inputs, &record)
+        }
+    }
+
+    /// Fee inputs of a recovery, including a swap's early cancellation. It competes with the
+    /// swap's own pre-hook for its nonce, so it never spends the notes that pre-hook reserves.
+    pub(crate) fn inputs_for_recovery(
+        &self,
+        inputs: Vec<railgun_wallet::Utxo>,
+        record: &ExecutorRecord,
+    ) -> Result<Vec<railgun_wallet::Utxo>> {
+        let mut inputs = self.inputs_for_record(inputs, record)?;
+        let reserved = record.swap_reserved_inputs();
+        inputs.retain(|input| !reserved.iter().any(|reserved| reserved.matches(input)));
+        Ok(inputs)
+    }
+
+    /// Inputs this operation may spend: its own reservation stays available.
+    pub(crate) fn inputs_for_record(
+        &self,
+        mut inputs: Vec<railgun_wallet::Utxo>,
+        record: &ExecutorRecord,
+    ) -> Result<Vec<railgun_wallet::Utxo>> {
         // A later preparation must not reuse inputs spent by an earlier winner
         // during the interval before private sync publishes its nullifiers.
         inputs.retain(|input| {
             !record.issued().iter().any(|payload| {
-                record.payload_status(payload.hash())
+                let executed = record.payload_status(payload.hash())
                     == Some(crate::vault::ExecutorPayloadStatus::Executed)
+                    // Hooks inside settlements have no direct-call receipt.
+                    || record.swap().is_some_and(|swap| {
+                        swap.orders().iter().any(|order| {
+                            order.pre_hook().payload() == payload.hash()
+                                && (order.observations().pre_hook_executed.is_some()
+                                    || order.observations().delivered.is_some())
+                        })
+                    });
+                executed
                     && payload
                         .context()
                         .inputs()
@@ -177,7 +276,7 @@ impl ExecutorOwner {
                         .any(|spent| spent.matches(input))
             })
         });
-        self.filter_reserved_inputs(inputs, Some(prepared.operation()))
+        self.filter_reserved_inputs(inputs, Some(record.operation()))
     }
 
     fn filter_reserved_inputs(
@@ -203,8 +302,56 @@ impl ExecutorOwner {
         range: Range<u64>,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
+        // A synced location can record an inclusion from one block before the page
+        // read below. Only owner closure is fatal; the page read reloads the record.
+        if trace_step(
+            "history_synced_location",
+            self.confirm_synced_operation(operation),
+        )
+        .await
+        .is_err()
+        {
+            self.ensure_active()?;
+        }
+        let guard = self.lock_activity().await;
+        self.ensure_active()?;
+        let (previous, pending) = trace_step("history_load", async {
+            let previous = self.begin_history_reconciliation(operation)?;
+            let pending = self
+                .store
+                .records()?
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .ok_or_else(|| eyre!("executor operation is unavailable"))?;
+            Ok::<_, eyre::Report>((previous, pending))
+        })
+        .await?;
+        drop(guard);
+        let observed =
+            trace_step("history_read", self.read_history(&previous, range.clone())).await?;
         let _guard = self.lock_activity().await;
-        self.reconcile_history_admitted(operation, range).await
+        self.require_record_unchanged(&pending)?;
+        trace_step("history_apply", async {
+            self.apply_history_reconciliation(operation, range, &observed)
+        })
+        .await
+    }
+
+    /// Network/proof work uses a snapshot. Call under activity before applying its result.
+    fn require_record_unchanged(&self, previous: &ExecutorRecord) -> Result<()> {
+        self.ensure_active()?;
+        if self
+            .store
+            .records()?
+            .iter()
+            .find(|record| record.operation() == previous.operation())
+            != Some(previous)
+        {
+            return Err(eyre!(
+                "The stealth account changed during preparation. Review the operation again."
+            ));
+        }
+        Ok(())
     }
 
     async fn reconcile_history_admitted(
@@ -213,9 +360,16 @@ impl ExecutorOwner {
         range: Range<u64>,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
-        let previous = self.begin_history_reconciliation(operation)?;
-        let observed = self.read_history(&previous, range.clone()).await?;
-        self.apply_history_reconciliation(operation, range, &observed)
+        let previous = trace_step("history_load", async {
+            self.begin_history_reconciliation(operation)
+        })
+        .await?;
+        let observed =
+            trace_step("history_read", self.read_history(&previous, range.clone())).await?;
+        trace_step("history_apply", async {
+            self.apply_history_reconciliation(operation, range, &observed)
+        })
+        .await
     }
 
     // Callers hold activity while invalidating or applying local projections.
@@ -223,10 +377,6 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
     ) -> Result<ExecutorRecord> {
-        self.reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?
-            .remove(&operation);
         let previous = self
             .store
             .records()?
@@ -251,8 +401,8 @@ impl ExecutorOwner {
             .relay_adapt_7702_contract = previous.delegate();
         historical_chain.enabled = true;
         self.while_active(super::executor_observation::observe_executor_history(
+            &self.endpoints,
             &historical_chain,
-            &self.http,
             previous,
             range,
             None,
@@ -275,10 +425,6 @@ impl ExecutorOwner {
             observed.block,
             &observed.recovery_inclusions,
         )?;
-        self.reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?
-            .insert(operation);
         // Date an observed submission from the first canonical head read after
         // handoff. Prefetch and stale session-tip heights cannot make it overdue.
         if let Some(submissions) = self
@@ -317,7 +463,10 @@ impl ExecutorOwner {
         );
         drop(coverage);
         self.notify_change();
-        Ok(ExecutorReconciliationReport { record })
+        Ok(ExecutorReconciliationReport {
+            record,
+            code: observed.code.clone().map(|code| (observed.block, code)),
+        })
     }
 
     /// Persisted addresses can be inspected with view access, without another key derivation.

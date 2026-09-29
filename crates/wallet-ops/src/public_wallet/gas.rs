@@ -6,6 +6,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use alloy::sol_types::{Panic, Revert, SolError, decode_revert_reason};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
+use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 
 use super::actions::{public_send_transaction_request, validate_public_transaction_intent};
 use super::runtime::{public_chain_runtime_config, verified_public_chain_runtime_config};
@@ -21,8 +22,8 @@ use crate::walletconnect::WalletConnectDecodedCallKind;
 use crate::{
     Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
     SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
-    expected_eip1559_fee_per_gas, query_rpc_pool_with_http_client, railgun_protocol_fee_amount,
-    resolve_self_broadcast_gas_fee,
+    TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas, query_rpc_pool_with_http_client,
+    railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
 };
 use railgun_ui::native_usd_micro_value;
 
@@ -31,26 +32,46 @@ pub(super) const PUBLIC_ERC20_SEND_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 pub const PUBLIC_NATIVE_UNWRAP_GAS_UNITS: u64 = 40_000;
 pub(super) const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
-pub(super) const PUBLIC_NATIVE_SHIELD_GAS_UNITS: u64 = 650_000;
-pub(super) const PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS: u64 = 900_000;
 pub(super) const PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS: u64 = 6_000_000;
 const PUBLIC_ACTION_BNB_CHAIN_ID: u64 = 56;
 const RAILWAY_FEE_HISTORY_BLOCKS: u64 = 10;
 const RAILWAY_FEE_HISTORY_REWARD_PERCENTILES: [f64; 4] = [40.0, 60.0, 80.0, 95.0];
 const RAILWAY_BNB_GAS_PRICE_CAP: u128 = 50_000_000;
 
+/// A standalone direct Railgun shield of one request.
+pub(super) const fn public_shield_gas_units(model: &RailgunGasModel, mode: GasEstimateMode) -> u64 {
+    TRANSACTION_INTRINSIC_GAS.saturating_add(model.shield(mode, 1))
+}
+
+/// A native shield through `RelayAdapt`: its wrap and shield actions, the wrap, and the shield.
+/// The wrap's gas units are a standalone transaction's, so they also cover the intrinsic gas.
+pub(super) const fn public_native_relay_adapt_shield_gas_units(
+    model: &RailgunGasModel,
+    mode: GasEstimateMode,
+) -> u64 {
+    model
+        .relay(2)
+        .saturating_add(PUBLIC_NATIVE_WRAP_GAS_UNITS)
+        .saturating_add(model.shield(mode, 1))
+}
+
 #[must_use]
-pub fn public_native_action_gas_units(steps: &[PublicActionProgressStep]) -> u64 {
-    public_native_action_gas_units_with_buffer(steps, GAS_LIMIT_BUFFER)
+pub fn public_native_action_gas_units(chain_id: u64, steps: &[PublicActionProgressStep]) -> u64 {
+    public_native_action_gas_units_with_buffer(
+        RailgunGasModel::for_chain(chain_id),
+        steps,
+        GAS_LIMIT_BUFFER,
+    )
 }
 
 #[must_use]
 pub(crate) fn public_native_action_gas_units_with_buffer(
+    model: &RailgunGasModel,
     steps: &[PublicActionProgressStep],
     gas_limit_buffer: u64,
 ) -> u64 {
     steps.iter().fold(0_u64, |total, step| {
-        let gas_units = public_native_step_gas_units(*step);
+        let gas_units = public_native_step_gas_units(model, *step);
         if gas_units == 0 {
             total
         } else {
@@ -61,10 +82,16 @@ pub(crate) fn public_native_action_gas_units_with_buffer(
 
 #[must_use]
 pub fn public_native_action_gas_reserve(
+    chain_id: u64,
     max_fee_per_gas: u128,
     steps: &[PublicActionProgressStep],
 ) -> U256 {
-    public_native_action_gas_reserve_with_buffer(max_fee_per_gas, steps, GAS_LIMIT_BUFFER)
+    public_native_action_gas_reserve_with_buffer(
+        RailgunGasModel::for_chain(chain_id),
+        max_fee_per_gas,
+        steps,
+        GAS_LIMIT_BUFFER,
+    )
 }
 
 pub fn estimate_public_action_gas_cost(
@@ -122,8 +149,10 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
     let maximum_resolved = authorization_ceiling.map_or(Ok(resolved), |ceiling| {
         resolve_public_action_gas_fee(chain_id, profile, ceiling, None)
     })?;
-    let expected_gas_units = public_action_estimated_gas_usage_units(kind, asset);
+    let model = RailgunGasModel::for_chain(chain_id);
+    let expected_gas_units = public_action_estimated_gas_usage_units(model, kind, asset);
     let maximum_gas_units = public_action_estimated_gas_units_with_buffer(
+        model,
         kind,
         asset,
         profile,
@@ -330,6 +359,7 @@ pub fn public_shield_protocol_fee_amount(amount: U256) -> U256 {
 }
 
 fn public_action_estimated_gas_units_with_buffer(
+    model: &RailgunGasModel,
     kind: PublicActionKind,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
@@ -347,17 +377,21 @@ fn public_action_estimated_gas_units_with_buffer(
             PublicAssetId::Native => match profile {
                 PublicShieldTransactionProfile::Railway => PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS,
                 PublicShieldTransactionProfile::Railoxide => {
-                    PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS.saturating_add(gas_limit_buffer)
+                    public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
+                        .saturating_add(gas_limit_buffer)
                 }
             },
             PublicAssetId::Erc20(_) => match profile {
-                PublicShieldTransactionProfile::Railway => {
-                    railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS)
-                        .saturating_add(railway_gas_limit(PUBLIC_NATIVE_SHIELD_GAS_UNITS))
-                }
+                PublicShieldTransactionProfile::Railway => railway_gas_limit(
+                    PUBLIC_NATIVE_APPROVE_GAS_UNITS,
+                )
+                .saturating_add(railway_gas_limit(public_shield_gas_units(
+                    model,
+                    GasEstimateMode::UpperBound,
+                ))),
                 PublicShieldTransactionProfile::Railoxide => PUBLIC_NATIVE_APPROVE_GAS_UNITS
                     .saturating_add(gas_limit_buffer)
-                    .saturating_add(PUBLIC_NATIVE_SHIELD_GAS_UNITS)
+                    .saturating_add(public_shield_gas_units(model, GasEstimateMode::UpperBound))
                     .saturating_add(gas_limit_buffer),
             },
         },
@@ -365,6 +399,7 @@ fn public_action_estimated_gas_units_with_buffer(
 }
 
 pub(super) const fn public_action_estimated_gas_usage_units(
+    model: &RailgunGasModel,
     kind: PublicActionKind,
     asset: PublicAssetId,
 ) -> u64 {
@@ -374,21 +409,24 @@ pub(super) const fn public_action_estimated_gas_usage_units(
             PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
         },
         PublicActionKind::Shield => match asset {
-            PublicAssetId::Native => PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS,
-            PublicAssetId::Erc20(_) => {
-                PUBLIC_NATIVE_APPROVE_GAS_UNITS + PUBLIC_NATIVE_SHIELD_GAS_UNITS
+            PublicAssetId::Native => {
+                public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::Expected)
             }
+            PublicAssetId::Erc20(_) => PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                .saturating_add(public_shield_gas_units(model, GasEstimateMode::Expected)),
         },
     }
 }
 
 #[must_use]
 fn public_native_action_gas_reserve_with_buffer(
+    model: &RailgunGasModel,
     max_fee_per_gas: u128,
     steps: &[PublicActionProgressStep],
     gas_limit_buffer: u64,
 ) -> U256 {
     public_native_action_gas_reserve_with_profile(
+        model,
         max_fee_per_gas,
         steps,
         PublicShieldTransactionProfile::Railoxide,
@@ -398,12 +436,14 @@ fn public_native_action_gas_reserve_with_buffer(
 
 #[must_use]
 pub(super) fn public_native_action_gas_reserve_with_profile(
+    model: &RailgunGasModel,
     max_fee_per_gas: u128,
     steps: &[PublicActionProgressStep],
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
 ) -> U256 {
     U256::from(public_native_action_gas_units_with_profile(
+        model,
         steps,
         profile,
         gas_limit_buffer,
@@ -412,6 +452,7 @@ pub(super) fn public_native_action_gas_reserve_with_profile(
 
 #[must_use]
 fn public_native_action_gas_units_with_profile(
+    model: &RailgunGasModel,
     steps: &[PublicActionProgressStep],
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
@@ -422,7 +463,7 @@ fn public_native_action_gas_units_with_profile(
         {
             PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS
         } else {
-            public_native_step_gas_units(*step)
+            public_native_step_gas_units(model, *step)
         };
         if gas_units == 0 {
             total
@@ -981,6 +1022,7 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
         resolve_public_action_gas_fee(chain_id, profile, ceiling, None)
     })?;
     Ok(public_native_action_gas_reserve_with_profile(
+        RailgunGasModel::for_chain(chain_id),
         maximum_gas.max_fee_per_gas,
         steps,
         profile,
@@ -1286,12 +1328,17 @@ pub(super) const fn public_action_tip_fallback(chain_id: u64) -> SelfBroadcastTi
     }
 }
 
-const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
+const fn public_native_step_gas_units(
+    model: &RailgunGasModel,
+    step: PublicActionProgressStep,
+) -> u64 {
     match step {
         PublicActionProgressStep::Send => PUBLIC_NATIVE_SEND_GAS_UNITS,
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
-        PublicActionProgressStep::Shield => PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS,
+        PublicActionProgressStep::Shield => {
+            public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
+        }
         PublicActionProgressStep::ShieldKey
         | PublicActionProgressStep::Sponsor
         | PublicActionProgressStep::Unsponsor

@@ -4,6 +4,7 @@ use super::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin,
     RpcRead, RpcResult, RpcRoute, RpcSubmission,
 };
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes};
 use alloy::sol_types::SolCall;
 use std::fmt;
@@ -107,9 +108,21 @@ impl RpcBroker {
         calls: Vec<(Address, Bytes)>,
         origin: RpcOrigin,
     ) -> Result<Vec<Result<Bytes, RpcBrokerError>>, RpcBrokerError> {
+        self.submit_eth_calls_at(route, calls, BlockId::latest(), origin)
+            .await
+    }
+
+    /// Like [`Self::submit_eth_calls`], with every call executed at `block`.
+    pub(crate) async fn submit_eth_calls_at(
+        &self,
+        route: RpcRoute,
+        calls: Vec<(Address, Bytes)>,
+        block: BlockId,
+        origin: RpcOrigin,
+    ) -> Result<Vec<Result<Bytes, RpcBrokerError>>, RpcBrokerError> {
         let reads = calls
             .into_iter()
-            .map(|(target, calldata)| RpcRead::eth_call(target, calldata))
+            .map(|(target, calldata)| RpcRead::eth_call_at(target, calldata, block))
             .collect();
         self.submit(RpcSubmission::new(route, reads, origin))
             .await
@@ -134,7 +147,19 @@ impl RpcBroker {
         calls: Vec<(Address, Bytes)>,
         origin: RpcOrigin,
     ) -> Result<Vec<Result<C::Return, RpcBrokerError>>, RpcBrokerError> {
-        self.submit_eth_calls(route, calls, origin)
+        self.submit_calls_decoded_at::<C>(route, calls, BlockId::latest(), origin)
+            .await
+    }
+
+    /// Like [`Self::submit_calls_decoded_as`], with every call executed at `block`.
+    pub(crate) async fn submit_calls_decoded_at<C: SolCall + 'static>(
+        &self,
+        route: RpcRoute,
+        calls: Vec<(Address, Bytes)>,
+        block: BlockId,
+        origin: RpcOrigin,
+    ) -> Result<Vec<Result<C::Return, RpcBrokerError>>, RpcBrokerError> {
+        self.submit_eth_calls_at(route, calls, block, origin)
             .await
             .map(|results| {
                 results

@@ -220,6 +220,15 @@ impl ExecutorOwner {
                 .reconcile_recovery_before_signing(&record, &chain, &inspection, nonce)
                 .await?;
             require_resolved_public_work(&current)?;
+            if current.swap().is_some()
+                && !self
+                    .while_active(self.swap_orders_closed(&chain, &current))
+                    .await?
+            {
+                return Err(eyre!(
+                    "A swap order from this account can still fill. Wait for it to fill or expire, or use Recover in Stealth accounts before spending in Public."
+                ));
+            }
         }
         let signer = derive(source)?;
         if signer.address() != account.address {

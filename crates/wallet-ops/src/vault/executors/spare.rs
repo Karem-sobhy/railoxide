@@ -127,6 +127,10 @@ impl ExecutorStore {
             recovery_transactions: Vec::new(),
             recovery_observation: None,
             public_account_uuid: None,
+            swap: None,
+            swap_approval: None,
+            swap_setup_stopped: false,
+            released_payloads: Vec::new(),
         };
         updates.push(self.seal(
             RecordKind::ExecutorOperation,

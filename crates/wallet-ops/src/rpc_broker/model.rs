@@ -160,6 +160,13 @@ impl RpcRead {
     /// Defaults to `latest` with no sender, value, gas limit, or state overrides.
     #[must_use]
     pub fn eth_call(target: Address, calldata: Bytes) -> Self {
+        Self::eth_call_at(target, calldata, BlockId::latest())
+    }
+
+    /// Creates an `eth_call` read at `block`, with no sender, value, gas limit, or state
+    /// overrides.
+    #[must_use]
+    pub(crate) fn eth_call_at(target: Address, calldata: Bytes, block: BlockId) -> Self {
         let request = TransactionRequest {
             to: Some(target.into()),
             input: TransactionInput::maybe_both(Some(calldata)),
@@ -167,7 +174,7 @@ impl RpcRead {
         };
         Self {
             operation: RpcOperation::EthCall {
-                block: BlockId::latest(),
+                block,
                 request: Arc::new(WithOtherFields::new(request)),
                 state_overrides: None,
             },
@@ -678,6 +685,7 @@ pub enum WalletRpcOrigin {
     GovernorRewards,
     PublicWallet,
     Staking,
+    Swaps,
 }
 
 /// An authenticated source of broker work.

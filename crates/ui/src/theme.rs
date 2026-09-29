@@ -16,6 +16,8 @@ pub const ACCOUNT_LABEL_TEXT_SIZE: Pixels = px(20.0);
 pub const ACCOUNT_ADDRESS_TEXT_SIZE: Pixels = px(13.0);
 pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);
 pub const BALANCE_TEXT_SIZE: Pixels = px(18.0);
+/// The leading amount of an amount panel, such as a swap's Sell and Buy amounts.
+pub const AMOUNT_PANEL_TEXT_SIZE: Pixels = px(28.0);
 pub const APP_TEXT_COLOR: u32 = TEXT;
 
 pub const BACKGROUND: u32 = 0x3f3f3f;

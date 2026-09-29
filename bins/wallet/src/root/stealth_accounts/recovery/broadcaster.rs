@@ -38,7 +38,7 @@ enum RecoveryEstimate {
     Broadcaster(Box<ExecutorRecoveryFeeEstimate>),
 }
 
-pub(super) fn same_offer(
+pub(in crate::root) fn same_offer(
     left: &PublicBroadcasterCandidate,
     right: &PublicBroadcasterCandidate,
 ) -> bool {

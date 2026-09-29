@@ -3,7 +3,8 @@ use std::time::Instant;
 use wallet_ops::{
     DesktopUnshieldPublicBroadcasterEstimateRequest, ExecutorAsset, ExecutorDelivery,
     PreparedExecutorOperation, PublicBroadcasterApprovalBounds, PublicBroadcasterSelection,
-    estimate_desktop_unshield_public_broadcaster_cost, vault::ExecutorOperationId,
+    default_public_broadcaster_fee_limit, estimate_desktop_unshield_public_broadcaster_cost,
+    vault::ExecutorOperationId,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -91,11 +92,8 @@ impl ExecutorUnshieldQuote {
     ) -> eyre::Result<Option<PublicBroadcasterApprovalBounds>> {
         match self {
             Self::Broadcaster(quote) => {
-                let maximum = custom_fee.unwrap_or_else(|| {
-                    quote
-                        .fee_amount
-                        .saturating_add(quote.fee_amount / U256::from(4))
-                });
+                let maximum = custom_fee
+                    .unwrap_or_else(|| default_public_broadcaster_fee_limit(quote.fee_amount));
                 quote.approval_bounds(maximum).map(Some)
             }
             Self::SelfBroadcast { .. } => Ok(None),
@@ -481,7 +479,9 @@ impl WalletRoot {
                             )
                             .ok_or_else(|| eyre::eyre!("Gas fee quote is unavailable"))?;
                         let cost = estimate_desktop_unshield_self_broadcast_cost(
-                            Some(&chain.gas),
+                            key.chain_id,
+                            chain.gas.gas_limit_buffer,
+                            true,
                             &draft.session.unspent_utxos_for_executor(&prepared)?,
                             draft.asset.token,
                             draft.amount,

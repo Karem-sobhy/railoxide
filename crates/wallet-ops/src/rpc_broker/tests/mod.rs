@@ -173,9 +173,9 @@ pub(super) fn aggregate_response(request: &Value, results: Vec<(bool, Bytes)>) -
 pub(crate) type RpcResponder = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
 #[derive(Clone)]
-pub(super) struct RpcMockGate {
-    pub(super) request_started: Arc<tokio::sync::Notify>,
-    pub(super) release_response: Arc<tokio::sync::Notify>,
+pub(crate) struct RpcMockGate {
+    pub(crate) request_started: Arc<tokio::sync::Notify>,
+    pub(crate) release_response: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) async fn spawn_rpc_mock(
@@ -186,7 +186,7 @@ pub(crate) async fn spawn_rpc_mock(
     spawn_rpc_mock_with_gate(responder, active, maximum, None).await
 }
 
-pub(super) async fn spawn_gated_rpc_mock(
+pub(crate) async fn spawn_gated_rpc_mock(
     responder: RpcResponder,
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,

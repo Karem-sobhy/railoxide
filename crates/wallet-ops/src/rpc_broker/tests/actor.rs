@@ -660,7 +660,13 @@ async fn individual_ready_work_is_bounded_by_top_level_concurrency() {
                 .await
         }
     });
-    time::sleep(Duration::from_millis(20)).await;
+    time::timeout(Duration::from_secs(5), async {
+        while started.load(Ordering::SeqCst) < 4 {
+            time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("four individual jobs start up to the concurrency bound");
     assert_eq!(started.load(Ordering::SeqCst), 4);
 
     gate.add_permits(64);
@@ -938,15 +944,16 @@ async fn duplicate_submissions_attach_to_an_in_flight_execution() {
 #[tokio::test]
 async fn unknown_block_latest_reads_do_not_deduplicate_in_flight() {
     let executions = Arc::new(AtomicUsize::new(0));
-    let gate = Arc::new(tokio::sync::Notify::new());
+    // A flag rather than a notification, so a job that parks after the release still runs.
+    let (release, gate) = tokio::sync::watch::channel(false);
     let executor: JobExecutor = {
         let executions = executions.clone();
         let gate = gate.clone();
         Arc::new(move |_client, _semaphore, group, _endpoints| {
             executions.fetch_add(execution_job_len(&group), Ordering::SeqCst);
-            let gate = gate.clone();
+            let mut gate = gate.clone();
             Box::pin(async move {
-                gate.notified().await;
+                gate.wait_for(|released| *released).await.unwrap();
                 JobOutput {
                     completions: group
                         .into_iter()
@@ -972,9 +979,17 @@ async fn unknown_block_latest_reads_do_not_deduplicate_in_flight() {
         let broker = broker.clone();
         async move { broker.submit(submission).await }
     });
-    time::sleep(Duration::from_millis(10)).await;
+    // Both reads must start while the first is still held. A fixed sleep raced the broker's
+    // dispatch; merging them would keep the count at one and time out here.
+    time::timeout(Duration::from_secs(5), async {
+        while executions.load(Ordering::SeqCst) < 2 {
+            time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both latest reads execute without deduplication");
     assert_eq!(executions.load(Ordering::SeqCst), 2);
-    gate.notify_waiters();
+    release.send_replace(true);
     assert!(first.await.unwrap().is_ok());
     assert!(second.await.unwrap().is_ok());
     drop(broker);

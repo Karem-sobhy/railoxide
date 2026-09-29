@@ -57,6 +57,7 @@ mod gateway_public_view;
 mod governance;
 mod governance_action;
 mod key_export;
+mod locked_notes;
 mod maintenance;
 mod manage_wallets;
 mod network;
@@ -65,6 +66,7 @@ mod platform_attention;
 mod private_action;
 mod private_assets;
 mod private_broadcaster;
+mod private_swap;
 mod proposals;
 mod public_account;
 mod public_action;
@@ -489,6 +491,7 @@ pub(crate) struct WalletRoot {
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
     stealth_accounts: Option<stealth_accounts::StealthAccountsPanel>,
+    private_swaps: Option<private_swap::PrivateSwapsPanel>,
     public_balance_cache: PublicBalanceCache,
     public_transaction_tracker: wallet_ops::PublicTransactionTracker,
     public_transaction_submissions: public_transactions::PublicTransactionSubmissions,
@@ -520,6 +523,9 @@ pub(crate) struct WalletRoot {
     blocked_shield_rescue_lookup_generation: u64,
     blocked_shield_rescue_rows: BTreeMap<BlockedShieldRescueUtxoId, BlockedShieldRescueRowState>,
     blocked_shield_refunds_in_flight: BTreeSet<BlockedShieldRescueUtxoId>,
+    /// Notes stealth-account operations lock on the selected chain, as of the last UTXO
+    /// table sync. Rendering reads this instead of decrypting executor records.
+    executor_locked_note_count: usize,
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_vault_input_on_render: bool,
     focus_utxo_table_on_render: bool,
@@ -1505,6 +1511,7 @@ impl WalletRoot {
             address_book_save_error: None,
             public_form,
             stealth_accounts: None,
+            private_swaps: None,
             public_balance_cache: PublicBalanceCache::default(),
             public_transaction_tracker,
             public_transaction_submissions:
@@ -1537,6 +1544,7 @@ impl WalletRoot {
             blocked_shield_rescue_lookup_generation: 0,
             blocked_shield_rescue_rows: BTreeMap::new(),
             blocked_shield_refunds_in_flight: BTreeSet::new(),
+            executor_locked_note_count: 0,
             utxo_table,
             focus_vault_input_on_render,
             focus_utxo_table_on_render: false,

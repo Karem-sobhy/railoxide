@@ -664,7 +664,17 @@ pub(super) async fn buffered_gas_price_with_policy(
         ));
     }
     let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
-    Ok(gas_price * numerator / denominator)
+    let buffered_gas_price = gas_price * numerator / denominator;
+    tracing::debug!(
+        target: "gas_price",
+        method = "eth_gasPrice",
+        rpc_gas_price_wei = gas_price,
+        buffer_numerator = numerator,
+        buffer_denominator = denominator,
+        buffered_gas_price_wei = buffered_gas_price,
+        "sampled RPC gas price"
+    );
+    Ok(buffered_gas_price)
 }
 
 #[cfg(test)]

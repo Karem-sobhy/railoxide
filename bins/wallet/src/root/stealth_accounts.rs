@@ -34,6 +34,7 @@ mod token_picker;
 mod view;
 use observations::AccountObservations;
 use recovery::{RecoveryAuthorization, RecoveryForm};
+pub(super) use recovery::{RecoveryPickerContext, same_offer};
 use view::AccountFilter;
 
 pub(super) struct StealthAccountsPanel {
@@ -150,7 +151,7 @@ impl Drop for StealthAccountsView {
 }
 
 impl WalletRoot {
-    fn stealth_session(&self) -> Option<Arc<WalletSession>> {
+    pub(super) fn stealth_session(&self) -> Option<Arc<WalletSession>> {
         match self.chain_states.get(&self.selected_chain) {
             Some(
                 ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. },
@@ -206,6 +207,39 @@ impl WalletRoot {
             });
         }
         cx.notify();
+    }
+
+    /// Reveal `target` and open its recovery for `asset`, as the account menu's Recover… does.
+    /// With `return_focus`, the caller's dialog keeps focus if recovery doesn't open and gets it
+    /// back when recovery closes.
+    pub(super) fn open_stealth_account_recovery(
+        &mut self,
+        target: &StealthAccountTarget,
+        asset: ExecutorAsset,
+        return_focus: Option<gpui::FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.can_open_stealth_account(target, cx) {
+            return;
+        }
+        self.open_stealth_account(target, window, cx);
+        if let Some(panel) = &self.stealth_accounts {
+            let view = panel.view.clone();
+            let operation = target.operation;
+            // Runs after the reveal that open_stealth_account deferred.
+            window.defer(cx, move |window, cx| {
+                // The reveal focused the account. Give focus back before recovery can decline.
+                if let Some(focus) = &return_focus {
+                    focus.focus(window, cx);
+                }
+                view.update(cx, |view, cx| {
+                    if view.session_is_current(cx) {
+                        view.open_recovery(operation, Some(asset), return_focus, window, cx);
+                    }
+                });
+            });
+        }
     }
 
     pub(super) fn render_stealth_accounts_button(

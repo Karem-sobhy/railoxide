@@ -92,8 +92,12 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
     );
-    let seeded_fee_amount =
-        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+    let seeded_fee_amount = initial_public_broadcaster_fee_amount(
+        &broadcaster,
+        chain.gas.gas_limit_buffer,
+        min_gas_price,
+        same_token_fee,
+        || {
             if let Some(native_top_up) = &initial_native_top_up {
                 return native_top_up_approximate_shape(
                     &utxos,
@@ -125,9 +129,11 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
                     .with_executor(request.executor.is_some()),
             )
-        })?;
+        },
+    )?;
     let initial_fee_estimate = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
+        chain.gas.gas_limit_buffer,
         request.token,
         request.fee_token,
         request.amount,
@@ -572,8 +578,12 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
     );
-    let seeded_fee_amount =
-        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+    let seeded_fee_amount = initial_public_broadcaster_fee_amount(
+        &broadcaster,
+        chain.gas.gas_limit_buffer,
+        min_gas_price,
+        same_token_fee,
+        || {
             let selection = send_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
@@ -591,9 +601,11 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
-        })?;
+        },
+    )?;
     let initial_fee_estimate = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
+        chain.gas.gas_limit_buffer,
         request.token,
         request.fee_token,
         request.amount,

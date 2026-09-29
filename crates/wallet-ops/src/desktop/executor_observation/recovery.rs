@@ -7,7 +7,7 @@ use broadcaster_core::contracts::railgun::approveCall;
 
 pub(super) fn matches_transaction(
     issued: &IssuedExecutorRecoveryTransaction,
-    transaction: &alloy::rpc::types::Transaction,
+    transaction: &impl alloy::network::TransactionResponse,
 ) -> bool {
     let expected = issued.transaction();
     transaction.tx_hash() == issued.hash()
@@ -21,9 +21,9 @@ pub(super) fn matches_transaction(
 pub(super) fn effects(
     railgun: Address,
     issued: &IssuedExecutorRecoveryTransaction,
-    receipt: &TransactionReceipt,
+    receipt: &TransactionReceipt<impl TxReceipt<Log = Log>>,
 ) -> Result<ExecutorExecutionResult> {
-    if !receipt.status() {
+    if !receipt.inner.status() {
         return Ok(ExecutorExecutionResult::Reverted);
     }
     let transaction = issued.transaction();

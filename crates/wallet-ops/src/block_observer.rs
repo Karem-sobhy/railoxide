@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use alloy::consensus::BlockHeader as _;
 use alloy::eips::BlockNumHash;
+use alloy::network::AnyTransactionReceipt;
 use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
 use alloy::network::{BlockResponse as _, ReceiptResponse as _, TransactionResponse as _};
 use alloy::primitives::{Address, B256, FixedBytes};
 use alloy::providers::{DynProvider, Provider as _};
-use alloy::rpc::types::TransactionReceipt;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
 
@@ -495,8 +495,17 @@ pub(crate) async fn fetch_checked_block_receipts(
     provider: &DynProvider,
     block: BlockNumHash,
     transactions: &[B256],
-) -> std::result::Result<Vec<TransactionReceipt>, BlockReceiptsError> {
-    let receipts = match provider.get_block_receipts(block.hash.into()).await {
+) -> std::result::Result<Vec<AnyTransactionReceipt>, BlockReceiptsError> {
+    // Whole-block responses include chain-specific receipts, even when the
+    // transaction we observe uses a standard Ethereum envelope.
+    let result = provider
+        .client()
+        .request::<_, Option<Vec<AnyTransactionReceipt>>>(
+            "eth_getBlockReceipts",
+            (alloy::eips::BlockId::from(block.hash),),
+        )
+        .await;
+    let receipts = match result {
         Ok(Some(receipts)) => receipts,
         Ok(None) => return Err(BlockReceiptsError::Invalid),
         Err(error)

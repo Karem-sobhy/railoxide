@@ -1,0 +1,285 @@
+//! Routine settlement confirmation sends only block identifiers to RPC. Private sync's
+//! spend location of the pre-hook inputs and the orderbook's trade block are hints; the
+//! receipt's trade and private credit establish the outcome.
+
+use alloy::network::{AnyRpcBlock, ReceiptResponse as _, primitives::HeaderResponse as _};
+use alloy::primitives::{Address, U256};
+use alloy::providers::{DynProvider, EthGetBlock, Provider as _};
+use alloy::rpc::types::Log;
+use alloy::sol_types::{SolCall as _, SolEvent as _};
+use broadcaster_core::contracts::cow::OrderUid;
+use broadcaster_core::contracts::railgun::{RelayAdapt7702, Shield};
+use eyre::{Result, eyre};
+use tracing::Instrument as _;
+
+use super::observation::{SwapSettlement, issued, shielded_amount};
+use crate::ExecutorOwner;
+use crate::block_observer::fetch_checked_block_receipts;
+use crate::desktop::executor_observation::{expected_shields, trace_step};
+use crate::settings::EffectiveChainConfig;
+use crate::vault::{
+    ExecutorOperationId, ExecutorRecord, SwapObservation, SwapOrderRecord, SwapShieldObservation,
+    SwapTradeAmounts,
+};
+
+// The pinned shared ERC20 bindings do not expose the Transfer event.
+alloy::sol! {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+}
+
+impl ExecutorOwner {
+    /// Verify a CoW-reported settlement block without sending an order, transaction,
+    /// account or nullifier identifier to RPC. Unavailable or inconclusive receipts leave
+    /// the order unresolved. Execution nonce admission is checked separately on user action.
+    pub async fn observe_swap_settlement(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        number: u64,
+    ) -> Result<()> {
+        let record = self
+            .swap_record(operation)?
+            .ok_or_else(|| eyre!("swap is unavailable"))?;
+        let order = record
+            .swap()
+            .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
+            .ok_or_else(|| eyre!("swap order is unavailable"))?;
+        if order.observations().delivered.is_some() {
+            return Ok(());
+        }
+        for endpoint in self.endpoints.providers().await {
+            let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
+            let result = trace_step(
+                "swap_settlement_receipts",
+                self.while_active(Box::pin(read_settlement(
+                    &endpoint.provider,
+                    &self.chain,
+                    &record,
+                    order,
+                    number,
+                ))),
+            )
+            .instrument(span)
+            .await;
+            match result {
+                Ok(Some(settlement)) => {
+                    self.endpoints.succeeded(&endpoint);
+                    let _guard = self.lock_activity().await;
+                    self.require_record_unchanged(&record)?;
+                    self.store.record_swap_settlement(
+                        operation,
+                        uid,
+                        settlement.trade,
+                        settlement.amounts,
+                        settlement.credit,
+                    )?;
+                    self.notify_change();
+                    return Ok(());
+                }
+                Ok(None) => {
+                    self.endpoints.succeeded(&endpoint);
+                    return Ok(());
+                }
+                Err(error) => self.endpoints.failed(&endpoint, &error),
+            }
+        }
+        Err(eyre!(
+            "Settlement verification is unavailable. The swap will be checked again."
+        ))
+    }
+}
+
+struct Settlement {
+    trade: SwapObservation,
+    amounts: SwapTradeAmounts,
+    credit: Option<SwapShieldObservation>,
+}
+
+async fn read_settlement(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    record: &ExecutorRecord,
+    order: &SwapOrderRecord,
+    number: u64,
+) -> Result<Option<Settlement>> {
+    let head = trace_step("settlement_head", provider.get_block_number()).await?;
+    if head
+        .checked_sub(chain.finality_depth)
+        .is_none_or(|safe| number > safe)
+    {
+        return Ok(None);
+    }
+    let block = trace_step("settlement_block", async {
+        EthGetBlock::<AnyRpcBlock>::by_number(number.into(), provider.client()).await
+    })
+    .await?
+    .ok_or_else(|| eyre!("settlement block is unavailable"))?;
+    let identity = block.header.num_hash();
+    if identity.number != number {
+        return Err(eyre!("settlement block has the wrong number"));
+    }
+    let hashes = block.transactions.hashes().collect::<Vec<_>>();
+    let receipts = trace_step(
+        "settlement_receipts",
+        fetch_checked_block_receipts(provider, identity, &hashes),
+    )
+    .await
+    .map_err(|_| eyre!("whole-block settlement receipts are incomplete or unavailable"))?;
+    let settlement = chain
+        .swap_profile()
+        .ok_or_else(|| eyre!("swaps are unavailable"))?
+        .settlement();
+    let railgun = chain.require_railgun()?.deployment.contract;
+    let executor = record
+        .address()
+        .ok_or_else(|| eyre!("swap account is unavailable"))?;
+    let swap = record.swap().ok_or_else(|| eyre!("swap is unavailable"))?;
+    let terms = swap.order_terms(order);
+    let shields = expected_shields(
+        executor,
+        railgun,
+        &RelayAdapt7702::multicallCall::abi_decode(
+            issued(record, order.post_hook().payload())?
+                .context()
+                .calldata(),
+        )?
+        ._calls,
+    )?;
+    let mut found = None;
+    for receipt in receipts {
+        if !receipt.status() {
+            continue;
+        }
+        let logs = receipt.inner.logs();
+        // The enclosing receipt supplies inclusion; inconsistent log metadata is not evidence.
+        if logs.iter().any(|log| {
+            log.removed
+                || log.block_hash != Some(identity.hash)
+                || log.block_number != Some(number)
+                || log.transaction_hash != Some(receipt.transaction_hash())
+        }) {
+            return Err(eyre!("settlement receipt logs have inconsistent inclusion"));
+        }
+        for (trade_index, log) in logs.iter().enumerate() {
+            if log.address() != settlement {
+                continue;
+            }
+            let Ok(trade) = log.log_decode::<SwapSettlement::Trade>() else {
+                continue;
+            };
+            let trade = trade.inner.data;
+            if trade.owner != executor
+                || trade.orderUid != order.uid().0[..]
+                || trade.sellToken != terms.sell_token()
+                || trade.buyToken != terms.buy_token()
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(eyre!("settlement contains ambiguous trade evidence"));
+            }
+            let observation = SwapObservation {
+                block: identity,
+                transaction_hash: Some(receipt.transaction_hash()),
+            };
+            // A second matching payout could mean a funded post-hook ran before the
+            // actual fill's payout. Do not attribute that earlier credit to this trade.
+            let payouts = logs
+                .iter()
+                .filter(|log| log.address() == terms.buy_token())
+                .filter_map(|log| log.log_decode::<Transfer>().ok())
+                .filter(|log| {
+                    log.inner.data.from == settlement
+                        && log.inner.data.to == executor
+                        && log.inner.data.value == trade.buyAmount
+                })
+                .take(2)
+                .count();
+            let credit = logs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, log)| {
+                    if payouts != 1 || index <= trade_index {
+                        return None;
+                    }
+                    let (private_amount, fee) = shielded_amount(railgun, log, &shields)?;
+                    let amount = private_amount.checked_add(fee?)?;
+                    (private_amount >= order.bounds().private_minimum
+                        && amount >= trade.buyAmount
+                        && paid_then_shielded(
+                            &logs[trade_index + 1..index],
+                            terms.buy_token(),
+                            executor,
+                            railgun,
+                            settlement,
+                            trade.buyAmount,
+                            private_amount,
+                        ))
+                    .then_some(SwapShieldObservation {
+                        observation,
+                        private_amount,
+                        fee,
+                    })
+                })
+                .max_by_key(|credit| credit.private_amount);
+            found = Some(Settlement {
+                trade: observation,
+                amounts: SwapTradeAmounts {
+                    sell_amount: trade.sellAmount,
+                    buy_amount: trade.buyAmount,
+                    fee_amount: trade.feeAmount,
+                },
+                credit,
+            });
+        }
+    }
+    if trace_step("settlement_canonical_recheck", async {
+        provider.get_block_by_number(number.into()).await
+    })
+    .await?
+    .is_none_or(|block| block.header.num_hash() != identity)
+    {
+        return Err(eyre!("settlement block changed during verification"));
+    }
+    Ok(found)
+}
+
+/// An early funded post-hook or a copied public Shield request must not complete the
+/// order. Require its buy-token payout followed by a matching debit from this executor
+/// to Railgun, in this receipt, before the matching private credit. Railgun receives
+/// the net private amount; the shield fee is transferred separately to its treasury.
+fn paid_then_shielded(
+    logs: &[Log],
+    token: Address,
+    executor: Address,
+    railgun: Address,
+    settlement: Address,
+    buy_amount: U256,
+    private_amount: U256,
+) -> bool {
+    if buy_amount.is_zero() {
+        return false;
+    }
+    let mut paid = false;
+    let mut shield_debit = false;
+    for log in logs {
+        if log.address() == railgun && log.topic0() == Some(&Shield::SIGNATURE_HASH) {
+            // A debit belonging to an earlier shield cannot establish this credit.
+            shield_debit = false;
+        }
+        if log.address() != token {
+            continue;
+        }
+        let Ok(transfer) = log.log_decode::<Transfer>() else {
+            continue;
+        };
+        let transfer = transfer.inner.data;
+        if transfer.to == railgun {
+            shield_debit = paid && transfer.from == executor && transfer.value == private_amount;
+        }
+        if transfer.to == executor && transfer.from == settlement && transfer.value == buy_amount {
+            paid = true;
+        }
+    }
+    shield_debit
+}

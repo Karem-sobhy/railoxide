@@ -1,5 +1,6 @@
 use super::helpers::*;
 use alloy::rpc::types::TransactionRequest;
+use railgun_wallet::tx::{ETHEREUM_GAS_MODEL, GasEstimateMode, POLYGON_GAS_MODEL};
 
 #[test]
 fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_required() {
@@ -911,6 +912,7 @@ fn executor_quote_refresh_keeps_payment_separate_from_approval_allowance() {
         let estimate = |gas_price, starting_fee| {
             approximate_public_broadcaster_cost(
                 broadcaster.clone(),
+                crate::GAS_LIMIT_BUFFER,
                 token,
                 fee_token,
                 entered,
@@ -928,7 +930,7 @@ fn executor_quote_refresh_keeps_payment_separate_from_approval_allowance() {
             .unwrap()
         };
         let approved = estimate(100_000, U256::ZERO);
-        let maximum = approved.fee_amount + approved.fee_amount / U256::from(4);
+        let maximum = crate::default_public_broadcaster_fee_limit(approved.fee_amount);
         let bounds = approved.approval_bounds(maximum).unwrap();
         for price in [90_000, 100_000, 112_500, 125_000] {
             let refreshed = estimate(price, U256::ZERO);
@@ -1006,6 +1008,7 @@ fn custom_broadcaster_fee_drives_note_selection_and_recipient_amounts() {
         .remove(0);
         let estimate = approximate_public_broadcaster_cost(
             broadcaster.clone(),
+            crate::GAS_LIMIT_BUFFER,
             token,
             fee_token,
             entered,
@@ -1045,6 +1048,7 @@ fn custom_broadcaster_fee_drives_note_selection_and_recipient_amounts() {
         assert!(
             approximate_public_broadcaster_cost(
                 broadcaster,
+                crate::GAS_LIMIT_BUFFER,
                 token,
                 fee_token,
                 entered,
@@ -1210,6 +1214,7 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
 
     let deducted = approximate_public_broadcaster_cost(
         broadcaster.clone(),
+        crate::GAS_LIMIT_BUFFER,
         token,
         token,
         entered,
@@ -1236,6 +1241,7 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
 
     let added = approximate_public_broadcaster_cost(
         broadcaster,
+        crate::GAS_LIMIT_BUFFER,
         token,
         token,
         entered,
@@ -1290,14 +1296,18 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         uses_relay_adapt: false,
         unwrap_count: 0,
         executor: false,
-        send: true,
     };
-    let initial_fee_amount =
-        initial_separate_token_public_broadcaster_fee(&broadcaster, 100, seed_shape);
+    let initial_fee_amount = initial_separate_token_public_broadcaster_fee(
+        &broadcaster,
+        crate::GAS_LIMIT_BUFFER,
+        100,
+        seed_shape,
+    );
     let mut observed_fee_amounts = Vec::new();
 
     let estimate = approximate_public_broadcaster_cost(
         broadcaster,
+        crate::GAS_LIMIT_BUFFER,
         action_token,
         fee_token,
         entered,
@@ -1353,6 +1363,7 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
 
     let estimate = approximate_public_broadcaster_cost(
         broadcaster,
+        crate::GAS_LIMIT_BUFFER,
         token,
         token,
         entered,
@@ -1385,52 +1396,90 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
 
 #[test]
 fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
-    let base = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+    let base = ApproximateTransactionShape {
         transaction_count: 1,
         input_count: 1,
         private_output_count: 2,
-        public_output_count: 0,
-        max_receiver_amount: U256::ZERO,
-        relay_call_count: 0,
-        uses_relay_adapt: false,
-        unwrap_count: 0,
-        executor: false,
-        send: true,
-    });
-    let larger_shape = ApproximateTransactionShape {
-        transaction_count: 2,
-        input_count: 2,
-        private_output_count: 3,
         public_output_count: 1,
         max_receiver_amount: U256::ZERO,
         relay_call_count: 1,
         uses_relay_adapt: true,
         unwrap_count: 1,
         executor: false,
-        send: false,
     };
-    let larger = approximate_public_broadcaster_gas(larger_shape);
-    assert!(approximate_public_broadcaster_gas(larger_shape.with_executor(true)) > larger);
-
-    assert!(larger > base);
+    let gas = |shape| {
+        approximate_public_broadcaster_gas(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected, shape)
+    };
+    for larger in [
+        ApproximateTransactionShape {
+            transaction_count: 2,
+            ..base
+        },
+        ApproximateTransactionShape {
+            input_count: 2,
+            ..base
+        },
+        ApproximateTransactionShape {
+            private_output_count: 3,
+            ..base
+        },
+        ApproximateTransactionShape {
+            unwrap_count: 2,
+            ..base
+        },
+        base.with_executor(true),
+    ] {
+        assert!(gas(larger) > gas(base), "{larger:?}");
+    }
+    // Polygon's repriced precompiles make the same transaction cost more.
+    assert!(
+        approximate_public_broadcaster_gas(&POLYGON_GAS_MODEL, GasEstimateMode::Expected, base)
+            > gas(base)
+    );
 }
 
 #[test]
-fn approximate_public_broadcaster_gas_applies_safety_uplift() {
-    let gas = approximate_public_broadcaster_gas(ApproximateTransactionShape {
-        transaction_count: 2,
-        input_count: 2,
-        private_output_count: 4,
-        public_output_count: 0,
-        max_receiver_amount: U256::ZERO,
-        relay_call_count: 0,
-        uses_relay_adapt: false,
-        unwrap_count: 0,
-        executor: false,
-        send: true,
-    });
-
-    assert_eq!(gas, 1_803_200);
+fn public_broadcaster_fee_quote_includes_the_gas_limit_buffer_once() {
+    let token = address(0x27);
+    let broadcaster = eligible_public_broadcasters(
+        &[fee_row(1, token, 1_000_000_000_000_000_000, 0.9, "buffer")],
+        1,
+        token,
+        None,
+        SystemTime::now(),
+    )
+    .remove(0);
+    let selected_total = uint!(2_000_000_000_U256);
+    let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
+    let shape = send_approximate_shape(&selection, selected_total);
+    let buffer = 123_456;
+    // The live check adds the buffer to the RPC estimate, so the quote must add it exactly once.
+    let gas_limit =
+        approximate_public_broadcaster_gas(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected, shape)
+            + buffer;
+    let estimate = approximate_public_broadcaster_cost(
+        broadcaster.clone(),
+        buffer,
+        token,
+        token,
+        uint!(1_000_000_000_U256),
+        FeeHandlingMode::DeductFromAmount,
+        U256::ZERO,
+        100,
+        U256::ZERO,
+        None,
+        |_split| Ok(shape),
+    )
+    .expect("estimate");
+    assert_eq!(estimate.gas_limit, gas_limit);
+    assert_eq!(
+        initial_separate_token_public_broadcaster_fee(&broadcaster, buffer, 100, shape),
+        buffered_public_broadcaster_fee(broadcaster_fee_amount(
+            broadcaster.fee,
+            gas_limit,
+            crate::public_broadcaster_service_gas_price(100),
+        ))
+    );
 }
 
 #[test]
@@ -1475,29 +1524,6 @@ fn approximate_shapes_include_broadcaster_fee_output_and_change() {
     assert_eq!(unshield.relay_call_count, 1);
     assert!(unshield.uses_relay_adapt);
     assert_eq!(unshield.unwrap_count, 1);
-}
-
-#[test]
-fn approximate_public_broadcaster_gas_counts_each_unwrap_workflow() {
-    let shape = ApproximateTransactionShape {
-        transaction_count: 2,
-        input_count: 2,
-        private_output_count: 2,
-        public_output_count: 2,
-        max_receiver_amount: U256::ZERO,
-        relay_call_count: 4,
-        uses_relay_adapt: true,
-        unwrap_count: 1,
-        executor: false,
-        send: false,
-    };
-    let one_unwrap = approximate_public_broadcaster_gas(shape);
-    let two_unwraps = approximate_public_broadcaster_gas(ApproximateTransactionShape {
-        unwrap_count: 2,
-        ..shape
-    });
-
-    assert!(two_unwraps > one_unwrap);
 }
 
 #[test]

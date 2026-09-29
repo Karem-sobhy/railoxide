@@ -95,6 +95,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 mod amounts;
 mod anchors;
 mod block_observer;
+pub mod cow;
 pub mod dapp_request;
 mod desktop;
 pub mod gateway;
@@ -125,10 +126,12 @@ pub use amounts::{
     is_wrapped_native_token, parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
 };
 pub use anchors::{
-    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, TokenAnchorRateCache,
-    TokenAnchorRefreshHandle, average_non_outlier_anchor_rates, fixed_token_anchor_rate,
+    AnchorBlock, AnchorBlocked, AnchorObservation, AnchorReadFailure, BroadcasterFeePolicy,
+    BroadcasterFeePolicyStatus, FreshAnchorParams, FreshPairAnchor, PairAnchorRate,
+    QuoteDeviationError, TokenAnchorRateCache, TokenAnchorRefreshHandle,
+    average_non_outlier_anchor_rates, check_quote_against_anchor, fixed_token_anchor_rate,
     known_token_anchor_sources, oracle_answer_to_anchor_rate, probe_native_usd_quote,
-    refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
+    read_fresh_pair_anchor, refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
 };
 pub use desktop::*;
 pub use governance::{
@@ -183,11 +186,12 @@ pub use governor_rewards::{
     validate_reward_batch_authorization_state, validate_reward_batch_claimed_intervals,
 };
 pub use http::{
-    HttpContext, TorBridgeActivitySnapshot, TorRuntimeHealth, WalletNetworkConfig,
-    WalletNetworkHealth, WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode,
-    WalletNetworkProgress, WalletNetworkProgressStage, WalletTorClient, WalletTorClientProvider,
-    build_http_client, build_wallet_network_context, build_wallet_network_context_with_progress,
-    request_tor_state_reset, resolve_wallet_network_mode,
+    HttpContext, OperationHttpClient, OperationNetworkIsolation, TorBridgeActivitySnapshot,
+    TorRuntimeHealth, WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthCause,
+    WalletNetworkHealthState, WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage,
+    WalletTorClient, WalletTorClientProvider, build_http_client, build_wallet_network_context,
+    build_wallet_network_context_with_progress, request_tor_state_reset,
+    resolve_wallet_network_mode,
 };
 pub use native_topup::{
     DesktopNativeTopUpPlan, DesktopNativeTopUpRequest, NATIVE_TOP_UP_ARBITRUM_AMOUNT,
@@ -202,7 +206,10 @@ pub(crate) use native_topup::{
     native_top_up_net_after_protocol_fee, native_top_up_wrapped_native_amount_for_net,
 };
 pub(crate) use protocol_fee::{FEE_BASIS_POINTS_DENOMINATOR, railgun_protocol_fee_amount};
-pub use protocol_fee::{RAILGUN_PROTOCOL_FEE_BPS, format_protocol_fee_percentage};
+pub use protocol_fee::{
+    RAILGUN_PROTOCOL_FEE_BPS, format_protocol_fee_percentage, read_shield_fee_bps,
+    read_unshield_fee_bps,
+};
 pub use public_wallet::{
     DappRpcReadClient, EvmFeeModel, HardwareTrezorPinMatrixProvider,
     PUBLIC_NATIVE_UNWRAP_GAS_UNITS, PublicAccountBalance, PublicActionAttemptInfo,

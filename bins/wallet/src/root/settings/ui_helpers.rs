@@ -93,6 +93,13 @@ pub(in crate::root) fn render_token_dialog_content(
         .flex()
         .flex_col()
         .gap_3()
+        .when(!readonly_identity, |this| {
+            this.child(settings_warning_banner(
+                "Tokens that rebase, charge transfer fees, or restrict transfers may fail in Railgun \
+                 or cause loss of funds. Adding a token makes it available for swaps on supported \
+                 chains and means you accept these risks.",
+            ))
+        })
         .child(settings_dialog_field(
             "Chain ID",
             &inputs.chain_id,

@@ -105,6 +105,8 @@ impl PreparedSelfBroadcastDraft {
         if self.funding == SelfBroadcastFundingMode::PublicBalance {
             let cost = match &self.output {
                 PrivateEstimateOutput::Send => estimate_desktop_send_self_broadcast_cost(
+                    self.raw.chain_id,
+                    self.effective_chain.gas.gas_limit_buffer,
                     &utxos,
                     self.asset.token,
                     self.amount,
@@ -116,13 +118,11 @@ impl PreparedSelfBroadcastDraft {
                     unwrap,
                     native_top_up,
                 } => estimate_desktop_unshield_self_broadcast_cost(
-                    Some(&self.effective_chain)
-                        .filter(|chain| {
-                            (*unwrap || native_top_up.is_some())
-                                && session.executor_owner().is_some()
-                                && chain.accepted_executor_profile().is_some()
-                        })
-                        .map(|chain| &chain.gas),
+                    self.raw.chain_id,
+                    self.effective_chain.gas.gas_limit_buffer,
+                    (*unwrap || native_top_up.is_some())
+                        && session.executor_owner().is_some()
+                        && self.effective_chain.accepted_executor_profile().is_some(),
                     &utxos,
                     self.asset.token,
                     self.amount,

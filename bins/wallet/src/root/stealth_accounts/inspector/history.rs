@@ -161,6 +161,10 @@ pub(super) fn recorded_outcomes(record: &ExecutorRecord) -> Vec<String> {
                 (ExecutorPayloadPurpose::Recovery, ExecutorExecutionResult::MissingEffects) => {
                     "Recovery effects missing"
                 }
+                // Not iterated above; swap hook outcomes are not summarized here yet.
+                (ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook, _) => {
+                    continue;
+                }
             };
             outcomes.push(if transactions.len() == 1 {
                 format!("{label} in block #{}.", block_label(last))

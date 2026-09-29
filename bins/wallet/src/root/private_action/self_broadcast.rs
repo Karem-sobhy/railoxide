@@ -97,7 +97,7 @@ pub(in crate::root) fn sponsored_estimate_from_authorization_limit(
     primary_unshield_protocol_fee: Option<SponsoredAssetFee>,
 ) -> SponsoredFundingEstimateState {
     let Ok(expected_payment) = sponsorship_payment(
-        limit.max_transaction_gas_limit,
+        limit.expected_transaction_gas_limit,
         expected_fee_per_gas,
         limit.signer_native_balance_snapshot,
         limit.incentive,
@@ -529,9 +529,18 @@ impl WalletRoot {
         else {
             return;
         };
+        let Some(gas_limit_buffer) = self
+            .effective_chain_configs
+            .get(asset.chain_id)
+            .map(|chain| chain.gas.gas_limit_buffer)
+        else {
+            return;
+        };
         let utxos = session.unspent_utxos();
         let join = self.runtime.spawn_blocking(move || {
             estimate_desktop_send_self_broadcast_cost(
+                asset.chain_id,
+                gas_limit_buffer,
                 &utxos,
                 asset.token,
                 amount,
@@ -636,18 +645,18 @@ impl WalletRoot {
         let unwrap = form.unwrap;
         let native_top_up =
             enabled_native_top_up_plan(form.native_top_up_enabled, form.native_top_up.as_ref());
-        let executor_gas = self
-            .effective_chain_configs
-            .get(asset.chain_id)
-            .filter(|chain| {
-                (unwrap || native_top_up.is_some())
-                    && session.executor_owner().is_some()
-                    && chain.accepted_executor_profile().is_some()
-            })
-            .map(|chain| chain.gas.clone());
+        let Some(chain) = self.effective_chain_configs.get(asset.chain_id) else {
+            return;
+        };
+        let gas_limit_buffer = chain.gas.gas_limit_buffer;
+        let executor = (unwrap || native_top_up.is_some())
+            && session.executor_owner().is_some()
+            && chain.accepted_executor_profile().is_some();
         let join = self.runtime.spawn_blocking(move || {
             estimate_desktop_unshield_self_broadcast_cost(
-                executor_gas.as_ref(),
+                asset.chain_id,
+                gas_limit_buffer,
+                executor,
                 &utxos,
                 asset.token,
                 amount,

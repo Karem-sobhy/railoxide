@@ -1,6 +1,7 @@
 use super::*;
 use alloy::uint;
 use eyre::eyre;
+use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel, TransactGasShape};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -1425,6 +1426,13 @@ pub(crate) fn broadcaster_fee_covers(available_fee: U256, required_fee: U256) ->
     available_fee >= required_fee
 }
 
+/// Allow a 25% increase over the estimated fee in spend review. This is an approval
+/// ceiling; payment still uses the required fee with the ordinary fee buffer.
+#[must_use]
+pub fn default_public_broadcaster_fee_limit(estimated_fee: U256) -> U256 {
+    estimated_fee.saturating_add(estimated_fee / U256::from(4))
+}
+
 #[must_use]
 pub fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
     let buffer = required_fee / PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR;
@@ -1477,7 +1485,6 @@ pub(crate) struct ApproximateTransactionShape {
     pub(crate) relay_call_count: usize,
     pub(crate) uses_relay_adapt: bool,
     pub(crate) unwrap_count: usize,
-    pub(crate) send: bool,
     pub(crate) executor: bool,
 }
 
@@ -1968,21 +1975,56 @@ pub(super) async fn public_broadcaster_setup(
     })
 }
 
-pub(crate) const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
-    let raw = APPROX_BASE_GAS
-        + APPROX_GAS_PER_TRANSACTION * shape.transaction_count.saturating_sub(1) as u64
-        + APPROX_GAS_PER_INPUT * shape.input_count as u64
-        + APPROX_GAS_PER_PRIVATE_OUTPUT * shape.private_output_count as u64
-        + APPROX_GAS_PER_PUBLIC_OUTPUT * shape.public_output_count as u64
-        + if shape.send { APPROX_SEND_EXTRA_GAS } else { 0 }
-        + APPROX_UNWRAP_EXTRA_GAS * shape.unwrap_count as u64
-        + APPROX_SAFETY_GAS
-        // Provisional budget for delegation setup, owner-signature verification,
-        // and the first nonce write. Final proved requests use RPC estimation.
-        + if shape.executor { 60_000 } else { 0 };
-    raw.saturating_mul(APPROX_GAS_UPLIFT_NUMERATOR)
-        .saturating_add(APPROX_GAS_UPLIFT_DENOMINATOR - 1)
-        / APPROX_GAS_UPLIFT_DENOMINATOR
+/// Basis points of a transaction's `UpperBound` execution gas that an approved Arbitrum One gas
+/// ceiling reserves for L1 data gas.
+///
+/// The shared gas model excludes L1 data gas, but Arbitrum's `eth_estimateGas` includes it.
+/// Samples from 2026-09-28 (325 Railgun calls, blocks 508,687,391-509,677,298) put
+/// `gasUsedForL1` at a median of 2.5k, a p99 of 116k and a max of 426k, up to 26.1% of L2 gas.
+/// This is headroom sized from history, not a model of L1 pricing. A spike beyond it still fails
+/// the approved-maximum check safely, and the user can retry. A complete fix would size data gas
+/// from the encoded calldata and a live `ArbGasInfo` L1 price snapshot taken at quote time.
+pub(crate) const ARBITRUM_ONE_DATA_GAS_ALLOWANCE_BPS: u64 = 3_500;
+
+/// L1 data gas that an approved gas ceiling adds to `execution_gas`. Zero outside Arbitrum One.
+pub(crate) const fn arbitrum_data_gas_allowance(chain_id: u64, execution_gas: u64) -> u64 {
+    if chain_id == 42161 {
+        execution_gas.saturating_mul(ARBITRUM_ONE_DATA_GAS_ALLOWANCE_BPS) / 10_000
+    } else {
+        0
+    }
+}
+
+/// Gas of a transaction with `shape` in `mode`, including the intrinsic gas and excluding the
+/// chain's gas limit buffer. Each public output is one transaction's unshield. Final proved
+/// requests use RPC estimation.
+pub(crate) const fn approximate_public_broadcaster_gas(
+    model: &RailgunGasModel,
+    mode: GasEstimateMode,
+    shape: ApproximateTransactionShape,
+) -> u64 {
+    let transact = model.transact(
+        mode,
+        TransactGasShape {
+            transactions: shape.transaction_count,
+            inputs: shape.input_count,
+            outputs: shape
+                .private_output_count
+                .saturating_add(shape.public_output_count),
+            unshields: shape.public_output_count,
+        },
+    );
+    let relay = if shape.uses_relay_adapt {
+        model.relay(shape.relay_call_count)
+    } else {
+        0
+    };
+    let executor = if shape.executor { model.executor() } else { 0 };
+    TRANSACTION_INTRINSIC_GAS
+        .saturating_add(transact)
+        .saturating_add(relay)
+        .saturating_add(RELAY_NATIVE_UNWRAP_GAS.saturating_mul(shape.unwrap_count as u64))
+        .saturating_add(executor)
 }
 
 pub(super) const fn gas_shortfall_bps(
@@ -2040,8 +2082,10 @@ pub(super) fn log_public_broadcaster_fee_prediction_failure(
     );
 }
 
+/// The live fee check adds `gas_limit_buffer` to the RPC estimate, so the quote adds it too.
 pub(crate) fn approximate_public_broadcaster_cost(
     broadcaster: PublicBroadcasterCandidate,
+    gas_limit_buffer: u64,
     action_token: Address,
     fee_token: Address,
     entered_amount: U256,
@@ -2053,6 +2097,7 @@ pub(crate) fn approximate_public_broadcaster_cost(
     mut select_shape: impl FnMut(PublicBroadcasterAmountSplit) -> Result<ApproximateTransactionShape>,
 ) -> Result<PublicBroadcasterCostEstimate> {
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
+    let model = RailgunGasModel::for_chain(broadcaster.chain_id);
     let mut fee_amount = custom_fee_amount.map_or(Ok(initial_fee_amount), |amount| {
         validate_custom_public_broadcaster_fee(amount, U256::ZERO, None)
     })?;
@@ -2070,7 +2115,8 @@ pub(crate) fn approximate_public_broadcaster_cost(
             protocol_fee_bps,
         )?;
         let shape = select_shape(split)?;
-        let gas_limit = approximate_public_broadcaster_gas(shape);
+        let gas_limit = approximate_public_broadcaster_gas(model, GasEstimateMode::Expected, shape)
+            .saturating_add(gas_limit_buffer);
         let computed_fee = broadcaster_fee_amount(broadcaster.fee, gas_limit, service_gas_price);
         latest_shape = Some(shape);
         latest_split = Some(split);
@@ -2158,13 +2204,20 @@ pub(crate) fn approximate_public_broadcaster_cost(
     })
 }
 
+/// Like [`approximate_public_broadcaster_cost`], the seed fee includes `gas_limit_buffer`.
 pub(crate) fn initial_separate_token_public_broadcaster_fee(
     broadcaster: &PublicBroadcasterCandidate,
+    gas_limit_buffer: u64,
     min_gas_price: u128,
     seed_shape: ApproximateTransactionShape,
 ) -> U256 {
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
-    let gas_limit = approximate_public_broadcaster_gas(seed_shape);
+    let gas_limit = approximate_public_broadcaster_gas(
+        RailgunGasModel::for_chain(broadcaster.chain_id),
+        GasEstimateMode::Expected,
+        seed_shape,
+    )
+    .saturating_add(gas_limit_buffer);
     buffered_public_broadcaster_fee(broadcaster_fee_amount(
         broadcaster.fee,
         gas_limit,
@@ -2174,6 +2227,7 @@ pub(crate) fn initial_separate_token_public_broadcaster_fee(
 
 pub(super) fn initial_public_broadcaster_fee_amount(
     broadcaster: &PublicBroadcasterCandidate,
+    gas_limit_buffer: u64,
     min_gas_price: u128,
     same_token_fee: bool,
     seed_shape: impl FnOnce() -> Result<ApproximateTransactionShape>,
@@ -2183,6 +2237,7 @@ pub(super) fn initial_public_broadcaster_fee_amount(
     } else {
         Ok(initial_separate_token_public_broadcaster_fee(
             broadcaster,
+            gas_limit_buffer,
             min_gas_price,
             seed_shape()?,
         ))
@@ -2203,7 +2258,6 @@ pub(crate) const fn send_approximate_shape(
         uses_relay_adapt: false,
         unwrap_count: 0,
         executor: false,
-        send: true,
     }
 }
 
@@ -2222,7 +2276,6 @@ pub(crate) const fn unshield_approximate_shape(
         uses_relay_adapt: unwrap,
         unwrap_count: if unwrap { 1 } else { 0 },
         executor: false,
-        send: false,
     }
 }
 
@@ -2263,7 +2316,6 @@ pub(crate) fn native_top_up_approximate_shape(
             uses_relay_adapt: true,
             unwrap_count: 1,
             executor: false,
-            send: false,
         });
     }
 
@@ -2316,7 +2368,6 @@ pub(crate) fn native_top_up_approximate_shape(
         uses_relay_adapt: true,
         unwrap_count: 1,
         executor: false,
-        send: false,
     })
 }
 

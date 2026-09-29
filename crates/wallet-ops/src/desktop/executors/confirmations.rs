@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use alloy::primitives::B256;
+use broadcaster_core::contracts::cow::OrderUid;
 use eyre::Result;
-use sync_service::WalletHandle;
+use sync_service::{WalletCurrentSnapshot, WalletHandle};
 use tokio::sync::watch;
 
 use super::ExecutorOwner;
 use crate::WalletSyncTip;
 use crate::desktop::executor_observation::observe_synced_executor_history;
+use crate::vault::{ExecutorOperationId, ExecutorRecord};
 
 impl ExecutorOwner {
     /// Resume submitted executions from the private actor's durable receive/spend
@@ -21,9 +25,16 @@ impl ExecutorOwner {
             .confirmation_observation_join
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Checked under this lock so `close` cannot run between the check and the store.
+        let mut synced = self
+            .synced_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if join.is_some() || self.ensure_active().is_err() {
             return;
         }
+        *synced = Some((wallet.clone(), tip.clone()));
+        drop(synced);
         let owner = Arc::clone(self);
         *join = Some(tokio::spawn(async move {
             let mut closed = owner.closed.subscribe();
@@ -33,11 +44,24 @@ impl ExecutorOwner {
                 let safe_head = tip.borrow_and_update().safe_head_block;
                 observations.borrow_and_update();
                 changes.borrow_and_update();
-                // Unavailable RPC leaves the durable history untouched. Retry on
-                // the next chain, private projection, or submission update.
-                let _ = owner
-                    .while_active(owner.confirm_synced_history(&wallet, safe_head))
+                // Unavailable RPC leaves the durable history untouched. Fast chain
+                // tips must not turn failures into a continuous RPC retry loop.
+                let result = owner
+                    .while_active(Box::pin(owner.confirm_synced_history(&wallet, safe_head)))
                     .await;
+                if result.is_err() {
+                    tracing::debug!(
+                        target: "executor_observation",
+                        retry_after_secs = 15,
+                        "confirmation observation unavailable; delaying retry"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = closed.wait_for(|closed| *closed) => break,
+                        () = tokio::time::sleep(Duration::from_secs(15)) => {},
+                    }
+                    continue;
+                }
                 tokio::select! {
                     biased;
                     _ = closed.wait_for(|closed| *closed) => break,
@@ -54,55 +78,145 @@ impl ExecutorOwner {
         wallet: &WalletHandle,
         safe_head: Option<u64>,
     ) -> Result<()> {
-        let _guard = self.lock_activity().await;
         self.ensure_active()?;
         let Some(snapshot) = wallet.current_snapshot() else {
             return Ok(());
         };
-        let locations = snapshot
-            .utxos
-            .iter()
-            .flat_map(|utxo| std::iter::once(&utxo.utxo.source).chain(utxo.spent.iter()))
-            .map(|source| (source.tx_hash, source.block_number))
-            .collect::<BTreeMap<_, _>>();
-        for mut record in self.store.records()? {
-            let numbers = record
-                .issued()
-                .iter()
-                .filter(|payload| payload.inclusion().is_none())
-                .flat_map(crate::vault::IssuedExecutorPayload::transaction_hashes)
-                .filter_map(|hash| locations.get(hash).copied())
-                .filter(|number| safe_head.is_none_or(|head| *number <= head))
-                .collect::<BTreeSet<_>>();
-            for number in numbers {
-                let observed =
-                    observe_synced_executor_history(&self.chain, &self.http, &record, number)
-                        .await?;
-                self.ensure_active()?;
-                if wallet
-                    .current_snapshot()
-                    .is_none_or(|current| current.reset_generation != snapshot.reset_generation)
-                {
-                    return Ok(());
-                }
-                let unchanged = record.issued().iter().all(|payload| {
-                    payload.inclusion()
-                        == observed
-                            .inclusions
-                            .iter()
-                            .find(|(hash, _)| *hash == payload.hash())
-                            .map(|(_, inclusion)| *inclusion)
-                });
-                if !unchanged {
-                    record = self.store.record_history(
-                        record.operation(),
-                        observed.block,
-                        &observed.inclusions,
-                    )?;
-                    self.notify_change();
-                }
+        let locations = synced_locations(&snapshot);
+        for record in self.store.records()? {
+            if !self
+                .confirm_synced_record(wallet, &snapshot, &locations, safe_head, record)
+                .await?
+            {
+                return Ok(());
             }
         }
         Ok(())
     }
+
+    /// Foreground counterpart of the confirmation observer for one operation, run
+    /// before a history page read. It only records verified inclusions; the page
+    /// read still evaluates the nonce and grants no admission from a location alone.
+    pub(super) async fn confirm_synced_operation(
+        &self,
+        operation: ExecutorOperationId,
+    ) -> Result<()> {
+        let synced = self
+            .synced_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some((wallet, tip)) = synced else {
+            return Ok(());
+        };
+        let safe_head = tip.borrow().safe_head_block;
+        let Some(snapshot) = wallet.current_snapshot() else {
+            return Ok(());
+        };
+        let Some(record) = self
+            .store
+            .records()?
+            .into_iter()
+            .find(|record| record.operation() == operation)
+        else {
+            return Ok(());
+        };
+        let locations = synced_locations(&snapshot);
+        self.while_active(Box::pin(
+            self.confirm_synced_record(&wallet, &snapshot, &locations, safe_head, record),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Private sync's spend location of the inputs unshielded by the pre-hook of `record`'s
+    /// order `uid`. Like the orderbook's trade block, this is an untrusted hint: only the
+    /// settlement receipts at that block establish the trade.
+    #[must_use]
+    pub fn synced_settlement_block(&self, record: &ExecutorRecord, uid: OrderUid) -> Option<u64> {
+        let wallet = self
+            .synced_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|(wallet, _)| wallet.clone())?;
+        let snapshot = wallet.current_snapshot()?;
+        let order = record
+            .swap()?
+            .orders()
+            .iter()
+            .find(|order| order.uid() == uid)?;
+        let payload = record
+            .issued()
+            .iter()
+            .find(|payload| payload.hash() == order.pre_hook().payload())?;
+        let inputs = payload.context().inputs();
+        snapshot
+            .utxos
+            .iter()
+            .filter(|utxo| inputs.iter().any(|input| input.matches(&utxo.utxo)))
+            .filter_map(|utxo| utxo.spent.as_ref().map(|spent| spent.block_number))
+            .min()
+    }
+
+    /// Record the verified inclusions of `record`'s payloads located by private sync
+    /// at or below the safe head. Returns false once the private snapshot was reset,
+    /// so callers stop using its locations.
+    async fn confirm_synced_record(
+        &self,
+        wallet: &WalletHandle,
+        snapshot: &WalletCurrentSnapshot,
+        locations: &BTreeMap<B256, u64>,
+        safe_head: Option<u64>,
+        mut record: ExecutorRecord,
+    ) -> Result<bool> {
+        let numbers = record
+            .issued()
+            .iter()
+            .filter(|payload| payload.inclusion().is_none())
+            .flat_map(crate::vault::IssuedExecutorPayload::transaction_hashes)
+            .filter_map(|hash| locations.get(hash).copied())
+            .filter(|number| safe_head.is_none_or(|head| *number <= head))
+            .collect::<BTreeSet<_>>();
+        for number in numbers {
+            let observed =
+                observe_synced_executor_history(&self.endpoints, &self.chain, &record, number)
+                    .await?;
+            let _guard = self.lock_activity().await;
+            self.require_record_unchanged(&record)?;
+            if wallet
+                .current_snapshot()
+                .is_none_or(|current| current.reset_generation != snapshot.reset_generation)
+            {
+                return Ok(false);
+            }
+            let unchanged = record.issued().iter().all(|payload| {
+                payload.inclusion()
+                    == observed
+                        .inclusions
+                        .iter()
+                        .find(|(hash, _)| *hash == payload.hash())
+                        .map(|(_, inclusion)| *inclusion)
+            });
+            if !unchanged {
+                record = self.store.record_history(
+                    record.operation(),
+                    observed.block,
+                    &observed.inclusions,
+                )?;
+                self.notify_change();
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Private-sync receive and spend locations, by transaction hash.
+fn synced_locations(snapshot: &WalletCurrentSnapshot) -> BTreeMap<B256, u64> {
+    snapshot
+        .utxos
+        .iter()
+        .flat_map(|utxo| std::iter::once(&utxo.utxo.source).chain(utxo.spent.iter()))
+        .map(|source| (source.tx_hash, source.block_number))
+        .collect()
 }

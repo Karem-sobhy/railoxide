@@ -10,6 +10,7 @@ use broadcaster_core::contracts::railgun::{Call, ShieldRequest, TokenData, shiel
 use broadcaster_core::contracts::shield::{build_approve_calldata, build_shield_request};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
+use railgun_wallet::tx::RailgunGasModel;
 use zeroize::Zeroizing;
 
 use super::{ExecutorDelivery, ExecutorOwner};
@@ -32,8 +33,10 @@ mod retry;
 mod submission;
 pub use approval::ExecutorRecoveryApproval;
 pub use output::{ExecutorRecoveryOutputId, ExecutorRecoveryOutputStatus};
+pub(super) use paid::PaidExecutionPurpose;
 pub use paid::{
-    ExecutorPaidRecoveryOutcome, ExecutorPaidRecoveryRequest, ExecutorRecoveryFeeEstimate,
+    ExecutorPaidRecoveryOutcome, ExecutorPaidRecoveryRequest, ExecutorPrivateFeeLimitExceeded,
+    ExecutorRecoveryFeeEstimate,
 };
 pub use retry::PreparedExecutorRecoveryRetry;
 
@@ -121,7 +124,7 @@ pub struct PreparedExecutorRecovery {
     steps: Vec<PublicActionProgressStep>,
     gas_limits: Vec<u64>,
     maximum_native_fee: U256,
-    shield: ShieldRequest,
+    shield: Option<ShieldRequest>,
 }
 
 impl PreparedExecutorRecovery {
@@ -172,6 +175,7 @@ impl PreparedExecutorRecovery {
     pub fn recipient(&self) -> &str {
         &self.recipient
     }
+    /// For a swap's early cancellation, the sell token, with a zero amount.
     #[must_use]
     pub const fn asset(&self) -> ExecutorAsset {
         self.asset
@@ -204,9 +208,10 @@ impl PreparedExecutorRecovery {
     pub fn calls(&self) -> &[Call] {
         &self.calls
     }
+    /// `None` for a swap's early cancellation, which recovers no asset.
     #[must_use]
-    pub const fn shield(&self) -> &ShieldRequest {
-        &self.shield
+    pub const fn shield(&self) -> Option<&ShieldRequest> {
+        self.shield.as_ref()
     }
 }
 
@@ -220,8 +225,15 @@ impl ExecutorOwner {
         funding: ExecutorRecoveryFunding,
         authorization: &DesktopPrivateSpendAuthorization,
     ) -> Result<PreparedExecutorRecovery> {
-        self.prepare_recovery_amount(operation, asset, amount, funding, authorization, false)
-            .await
+        self.prepare_recovery_amount(
+            operation,
+            Some(asset),
+            amount,
+            funding,
+            authorization,
+            false,
+        )
+        .await
     }
 
     /// Prepare at most the reviewed native amount, retaining a conservative gas
@@ -240,7 +252,7 @@ impl ExecutorOwner {
         }
         self.prepare_recovery_amount(
             operation,
-            ExecutorAsset::Native,
+            Some(ExecutorAsset::Native),
             maximum_amount,
             funding,
             authorization,
@@ -249,10 +261,12 @@ impl ExecutorOwner {
         .await
     }
 
-    async fn prepare_recovery_amount(
+    /// `asset` is `None` only for a swap's early cancellation, which recovers no asset and
+    /// is always broadcaster-funded.
+    pub(super) async fn prepare_recovery_amount(
         &self,
         operation: ExecutorOperationId,
-        asset: ExecutorAsset,
+        asset: Option<ExecutorAsset>,
         mut amount: U256,
         mut funding: ExecutorRecoveryFunding,
         authorization: &DesktopPrivateSpendAuthorization,
@@ -277,12 +291,33 @@ impl ExecutorOwner {
                 return Err(eyre!("review a private fee limit for broadcaster recovery"));
             }
         }
-        let value = Uint::<120, 2>::uint_try_from(amount)
-            .map_err(|_| eyre!("recovery amount exceeds the shield value range"))?;
-        if amount.is_zero() || matches!(asset, ExecutorAsset::Erc721 { .. }) && amount != U256::ONE
-        {
-            return Err(eyre!("select a positive token amount or exactly one NFT"));
-        }
+        // A cancellation inspects the sell token, which the executor holds none of before its
+        // pre-hook runs.
+        let inspected = match (asset, record.swap()) {
+            (Some(asset), _) => asset,
+            (None, Some(swap))
+                if matches!(funding, ExecutorRecoveryFunding::PublicBroadcaster { .. }) =>
+            {
+                ExecutorAsset::Erc20(swap.terms().sell_token())
+            }
+            (None, _) => {
+                return Err(eyre!(
+                    "early cancellation needs a swap order and broadcaster funding"
+                ));
+            }
+        };
+        let value = asset
+            .map(|asset| -> Result<Uint<120, 2>> {
+                let value = Uint::<120, 2>::uint_try_from(amount)
+                    .map_err(|_| eyre!("recovery amount exceeds the shield value range"))?;
+                if amount.is_zero()
+                    || matches!(asset, ExecutorAsset::Erc721 { .. }) && amount != U256::ONE
+                {
+                    return Err(eyre!("select a positive token amount or exactly one NFT"));
+                }
+                Ok(value)
+            })
+            .transpose()?;
         let signer = self.authorized_executor_signer(
             authorization,
             &super::HardwareExecutorAction::Recover(record.operation()),
@@ -308,7 +343,7 @@ impl ExecutorOwner {
                 &chain,
                 &self.http,
                 source,
-                &[asset],
+                &[inspected],
             ))
             .await?;
         let code = inspection
@@ -323,11 +358,7 @@ impl ExecutorOwner {
         let nonce = inspection
             .execution_nonce()
             .ok_or_else(|| eyre!("recovery execution nonce is unknown"))?;
-        if record
-            .issued()
-            .iter()
-            .any(|payload| payload.nonce() > nonce)
-        {
+        if record.records_future_nonce(nonce) {
             return Err(eyre!(
                 "recorded execution state is ahead of the current chain; refresh recovery after confirmation"
             ));
@@ -344,63 +375,87 @@ impl ExecutorOwner {
                 ExecutorRecoveryExecution::PaidExecute { nonce }
             }
         };
-        let railgun = self.chain.require_railgun()?.deployment.contract;
-        let token = recovery_token(asset, self.chain.wrapped_native_token)?;
-        let allowance = self
-            .while_active(recovery_allowance(
-                &chain,
-                &self.http,
-                &inspection,
-                &token,
-                railgun,
-            ))
+        // A swap executor's orders become unfillable in the same batch that recovers assets.
+        let swap_calls = self
+            .swap_recovery_preparation(&chain, &record, &inspection, nonce, asset.is_none())
             .await?;
         let recipient = self.view.receive_address()?;
-        let address = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
-        let recipient_data = broadcaster_core::crypto::railgun::AddressData::try_from(&address)?;
-        let secret = Zeroizing::new(signer.to_bytes().0);
-        let shield_key = Zeroizing::new(
-            broadcaster_core::contracts::shield::derive_shield_private_key(&secret)?,
-        );
-        let mut shield = build_shield_request(
-            recipient_data.master_public_key,
-            &recipient_data.viewing_public_key,
-            token.clone(),
-            value,
-            &shield_key,
-        )?;
-        drop(signer);
-        let shield_executor = (execution != ExecutorRecoveryExecution::Ordinary).then_some(source);
-        let (mut steps, mut calls) =
-            recovery_calls(asset, amount, allowance, railgun, &shield, shield_executor);
-        let mut gas_limits =
-            recovery_gas_limits(&steps, execution, self.chain.gas.gas_limit_buffer);
-        if reserve_native_gas {
-            let reserve =
-                recovery_funding_admission(&inspection, asset, U256::ZERO, &funding, &gas_limits)?;
-            let native = inspection
-                .balances()
-                .get(&ExecutorAsset::Native)
-                .copied()
-                .flatten()
-                .ok_or_else(|| eyre!("native balance is unavailable"))?;
-            amount = native_recovery_remainder(amount, native, reserve)?;
-            shield = build_shield_request(
+        let buffer = self.chain.gas.gas_limit_buffer;
+        let gas_model = RailgunGasModel::for_chain(self.chain.chain_id);
+        let (steps, calls, gas_limits, shield) = if let Some((asset, value)) = asset.zip(value) {
+            let railgun = self.chain.require_railgun()?.deployment.contract;
+            let token = recovery_token(asset, self.chain.wrapped_native_token)?;
+            let allowance = self
+                .while_active(recovery_allowance(
+                    &chain,
+                    &self.http,
+                    &inspection,
+                    &token,
+                    railgun,
+                ))
+                .await?;
+            let address = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
+            let recipient_data =
+                broadcaster_core::crypto::railgun::AddressData::try_from(&address)?;
+            let secret = Zeroizing::new(signer.to_bytes().0);
+            let shield_key = Zeroizing::new(
+                broadcaster_core::contracts::shield::derive_shield_private_key(&secret)?,
+            );
+            let mut shield = build_shield_request(
                 recipient_data.master_public_key,
                 &recipient_data.viewing_public_key,
-                token,
-                Uint::<120, 2>::uint_try_from(amount)
-                    .map_err(|_| eyre!("recovery amount exceeds the shield value range"))?,
+                token.clone(),
+                value,
                 &shield_key,
             )?;
-            (steps, calls) =
-                recovery_calls(asset, amount, allowance, railgun, &shield, shield_executor);
-            // Lowering the amount can remove an approval, never add a step. Keep
-            // the conservative remainder and review the final plan's gas ceiling.
-            gas_limits = recovery_gas_limits(&steps, execution, self.chain.gas.gas_limit_buffer);
-        }
+            drop(signer);
+            let shield_executor =
+                (execution != ExecutorRecoveryExecution::Ordinary).then_some(source);
+            let (mut steps, mut calls) = with_swap_preparation(
+                &swap_calls,
+                recovery_calls(asset, amount, allowance, railgun, &shield, shield_executor),
+            );
+            let mut gas_limits = recovery_gas_limits(gas_model, &steps, execution, buffer);
+            if reserve_native_gas {
+                let reserve = recovery_funding_admission(
+                    &inspection,
+                    asset,
+                    U256::ZERO,
+                    &funding,
+                    &gas_limits,
+                )?;
+                let native = inspection
+                    .balances()
+                    .get(&ExecutorAsset::Native)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| eyre!("native balance is unavailable"))?;
+                amount = native_recovery_remainder(amount, native, reserve)?;
+                shield = build_shield_request(
+                    recipient_data.master_public_key,
+                    &recipient_data.viewing_public_key,
+                    token,
+                    Uint::<120, 2>::uint_try_from(amount)
+                        .map_err(|_| eyre!("recovery amount exceeds the shield value range"))?,
+                    &shield_key,
+                )?;
+                (steps, calls) = with_swap_preparation(
+                    &swap_calls,
+                    recovery_calls(asset, amount, allowance, railgun, &shield, shield_executor),
+                );
+                // Lowering the amount can remove an approval, never add a step. Keep
+                // the conservative remainder and review the final plan's gas ceiling.
+                gas_limits = recovery_gas_limits(gas_model, &steps, execution, buffer);
+            }
+            (steps, calls, gas_limits, Some(shield))
+        } else {
+            drop(signer);
+            let (steps, calls) = with_swap_preparation(&swap_calls, (Vec::new(), Vec::new()));
+            let gas_limits = recovery_gas_limits(gas_model, &steps, execution, buffer);
+            (steps, calls, gas_limits, None)
+        };
         let maximum_native_fee =
-            recovery_funding_admission(&inspection, asset, amount, &funding, &gas_limits)?;
+            recovery_funding_admission(&inspection, inspected, amount, &funding, &gas_limits)?;
         self.ensure_active()?;
         let recovery = ExecutorOperationId::random()?;
         if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
@@ -417,7 +472,7 @@ impl ExecutorOwner {
             account_nonce,
             replacement_nonce,
             recipient,
-            asset,
+            asset: inspected,
             amount,
             funding,
             execution,
@@ -480,11 +535,7 @@ fn recovery_execution(
             let nonce = inspection
                 .execution_nonce()
                 .ok_or_else(|| eyre!("reconcile the issued execution nonce before recovery"))?;
-            if record
-                .issued()
-                .iter()
-                .any(|payload| payload.nonce() > nonce)
-            {
+            if record.records_future_nonce(nonce) {
                 return Err(eyre!(
                     "a recorded future execution nonce requires reconciliation before recovery"
                 ));
@@ -493,7 +544,7 @@ fn recovery_execution(
                 if record
                     .issued()
                     .iter()
-                    .any(|payload| payload.nonce() == nonce)
+                    .any(|payload| record.is_outstanding_at(payload, nonce))
                 {
                     ExecutorRecoveryExecution::SignedMulticall { nonce }
                 } else {
@@ -562,7 +613,7 @@ fn recovery_token(asset: ExecutorAsset, wrapped: Option<Address>) -> Result<Toke
     })
 }
 
-async fn recovery_allowance(
+pub(super) async fn recovery_allowance(
     chain: &crate::settings::EffectiveChainConfig,
     http: &crate::HttpContext,
     inspection: &ExecutorInspection,
@@ -685,30 +736,50 @@ fn recovery_calls(
     (steps, calls)
 }
 
-fn recovery_gas_limits(
+/// A swap executor's batch first runs the calls that make its orders unfillable and reset the
+/// settlement approval. Each is priced like an approval, a single storage write.
+fn with_swap_preparation(
+    swap_calls: &[Call],
+    (steps, calls): (Vec<PublicActionProgressStep>, Vec<Call>),
+) -> (Vec<PublicActionProgressStep>, Vec<Call>) {
+    let mut batch_steps = vec![PublicActionProgressStep::Approve; swap_calls.len()];
+    batch_steps.extend(steps);
+    let mut batch_calls = swap_calls.to_vec();
+    batch_calls.extend(calls);
+    (batch_steps, batch_calls)
+}
+
+pub(super) fn recovery_gas_limits(
+    model: &RailgunGasModel,
     steps: &[PublicActionProgressStep],
     execution: ExecutorRecoveryExecution,
     buffer: u64,
 ) -> Vec<u64> {
     let limits = steps
         .iter()
-        .map(|step| public_native_action_gas_units_with_buffer(&[*step], buffer))
+        .map(|step| public_native_action_gas_units_with_buffer(model, &[*step], buffer))
         .collect::<Vec<_>>();
     if execution == ExecutorRecoveryExecution::Ordinary {
         limits
     } else {
-        // Same provisional execution overhead used by private executor quotes. Final RPC
-        // estimation must fit this reviewed ceiling; dependent calls cannot be estimated alone.
+        // Same execution overhead used by private executor quotes. Final RPC estimation must
+        // fit this reviewed ceiling; dependent calls cannot be estimated alone.
         vec![
             limits
                 .iter()
-                .fold(60_000_u64, |sum, limit| sum.saturating_add(*limit)),
+                .fold(model.executor(), |sum, limit| sum.saturating_add(*limit)),
         ]
     }
 }
 
-fn maximum_recovery_gas_limit(asset: ExecutorAsset, buffer: u64) -> u64 {
-    let mut steps = Vec::new();
+/// `swap_calls` bounds the calls a swap executor's batch runs before its asset steps.
+fn maximum_recovery_gas_limit(
+    model: &RailgunGasModel,
+    asset: ExecutorAsset,
+    swap_calls: usize,
+    buffer: u64,
+) -> u64 {
+    let mut steps = vec![PublicActionProgressStep::Approve; swap_calls];
     if asset == ExecutorAsset::Native {
         steps.push(PublicActionProgressStep::Wrap);
     }
@@ -720,6 +791,7 @@ fn maximum_recovery_gas_limit(asset: ExecutorAsset, buffer: u64) -> u64 {
         PublicActionProgressStep::Shield,
     ]);
     recovery_gas_limits(
+        model,
         &steps,
         ExecutorRecoveryExecution::SignedMulticall { nonce: U256::ZERO },
         buffer,
@@ -840,7 +912,9 @@ mod tests {
             &shield,
             None,
         );
+        let gas_model = RailgunGasModel::for_chain(chain.chain_id);
         let limits = recovery_gas_limits(
+            gas_model,
             &steps,
             ExecutorRecoveryExecution::Ordinary,
             chain.gas.gas_limit_buffer,
@@ -913,6 +987,7 @@ mod tests {
             Uint::from(amount)
         );
         let batched = recovery_gas_limits(
+            gas_model,
             &steps,
             ExecutorRecoveryExecution::SignedMulticall { nonce: U256::ZERO },
             chain.gas.gas_limit_buffer,

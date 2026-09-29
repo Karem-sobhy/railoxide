@@ -9,7 +9,7 @@ use gpui_component::{
     select::{SearchableVec, SelectDelegate, SelectItem},
 };
 
-use crate::theme::{self, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
+use crate::theme::{self, AMOUNT_PANEL_TEXT_SIZE, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 
 /// Searchable items whose custom rows fill the menu width.
 ///
@@ -263,6 +263,28 @@ pub fn app_button_label(label: impl Into<SharedString>) -> Div {
 pub fn app_text(label: impl Into<SharedString>) -> Div {
     div()
         .text_size(APP_TEXT_SIZE)
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .child(label.into())
+}
+
+/// A borderless input for an amount panel's leading amount. Its height follows the shared line
+/// height at the panel text size, so the text and the control scale together.
+#[must_use]
+pub fn app_amount_input(state: &Entity<InputState>) -> Input {
+    let input = Input::new(state)
+        .appearance(false)
+        .px_0()
+        .text_size(AMOUNT_PANEL_TEXT_SIZE)
+        .line_height(relative(APP_TEXT_LINE_HEIGHT));
+    // `Input::h` sizes multi-line inputs only; the frame height goes through `Styled`.
+    Styled::h(input, AMOUNT_PANEL_TEXT_SIZE * APP_TEXT_LINE_HEIGHT)
+}
+
+/// Read-only text at the amount panel size, on the same line box as [`app_amount_input`].
+#[must_use]
+pub fn app_amount_text(label: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(AMOUNT_PANEL_TEXT_SIZE)
         .line_height(relative(APP_TEXT_LINE_HEIGHT))
         .child(label.into())
 }

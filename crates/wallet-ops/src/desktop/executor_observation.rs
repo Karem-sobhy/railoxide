@@ -1,31 +1,257 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::Range;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use alloy::consensus::Transaction as _;
+use alloy::consensus::{Transaction as _, TxReceipt};
 use alloy::network::TransactionResponse as _;
 use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
-use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{DynProvider, Provider as _};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::{DynProvider, EthGetBlock, Provider as _};
+use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::{SolCall, SolValue};
+use alloy::transports::{RpcError, TransportError};
 use broadcaster_core::contracts::railgun::{
     Call, Nullified, RelayAdapt7702, Shield, ShieldRequest, Transact, Transaction, shieldCall,
 };
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
+use tracing::Instrument as _;
 
 use crate::HttpContext;
 use crate::block_observer::fetch_checked_block_receipts;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadInclusion, ExecutorRecord,
-    IssuedExecutorPayload,
+    ExecutorExecutionResult, ExecutorNonceObservation, ExecutorOperationId,
+    ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
+    IssuedExecutorRecoveryTransaction,
 };
 
 const MAX_OBSERVATION_BLOCKS: u64 = 64;
+/// How long an endpoint whose request failed sits out executor observations.
+const ENDPOINT_COOLDOWN: Duration = Duration::from_mins(3);
 
 mod recovery;
+
+/// Time observation work without recording account data or RPC error contents.
+pub(super) fn trace_step<T, E>(
+    step: &'static str,
+    future: impl Future<Output = Result<T, E>>,
+) -> impl Future<Output = Result<T, E>> {
+    // Keep nested timing wrappers from multiplying observation futures on the stack.
+    let future = Box::pin(future);
+    async move {
+        let started = Instant::now();
+        tracing::debug!(target: "executor_observation", step, "started");
+        let result = future.await;
+        tracing::debug!(
+            target: "executor_observation",
+            step,
+            elapsed_ms = started.elapsed().as_millis(),
+            success = result.is_ok(),
+            "finished"
+        );
+        result
+    }
+}
+
+/// The chain endpoints one executor owner observes through, kept for its session.
+///
+/// Admission is the wallet's RPC identity admission: a route that requires identity
+/// checks verifies each endpoint's chain once, and a failed check is retried in the
+/// background with backoff while the owner lives, not on every observation. An
+/// endpoint whose request fails sits out [`ENDPOINT_COOLDOWN`] unless it is the last
+/// one available. The endpoint that served the last observation is tried first.
+///
+/// The pool lives until [`Self::release`]. Admission's background retries hold only
+/// a weak reference to it, so releasing the pool lets them stop. A released owner
+/// never rebuilds the pool and has no endpoints.
+///
+/// It also remembers, for this session only, which inclusions a full canonical
+/// read of their block confirmed, so that a later observation can recheck those
+/// by header alone.
+pub(super) struct ObservationEndpoints {
+    route: crate::RpcChainRoute,
+    client: reqwest::Client,
+    /// Completes once the first admission returned, whether or not the pool was kept.
+    admitted: tokio::sync::OnceCell<()>,
+    /// Never locked across an await.
+    pool: Mutex<PoolSlot>,
+    /// Pool index of the last endpoint that served an observation, or `usize::MAX`.
+    preferred: AtomicUsize,
+    /// Per operation, the inclusions the last successful observation read or
+    /// rechecked on the canonical chain.
+    verified: Mutex<BTreeMap<ExecutorOperationId, Vec<(B256, ExecutorPayloadInclusion)>>>,
+}
+
+#[derive(Default)]
+struct PoolSlot {
+    pool: Option<Arc<QueryRpcPool>>,
+    /// Terminal: once set, the pool is gone and is never published again.
+    released: bool,
+}
+
+impl ObservationEndpoints {
+    pub(super) fn new(chain: &EffectiveChainConfig, http: &HttpContext) -> Self {
+        Self {
+            route: chain.rpc_route.clone(),
+            client: http.rpc_client.clone(),
+            admitted: tokio::sync::OnceCell::new(),
+            pool: Mutex::new(PoolSlot::default()),
+            preferred: AtomicUsize::new(usize::MAX),
+            verified: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn verified_inclusions(
+        &self,
+        operation: ExecutorOperationId,
+    ) -> Vec<(B256, ExecutorPayloadInclusion)> {
+        self.verified
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&operation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replaces the operation's verified inclusions, dropping any whose block changed.
+    fn confirm_inclusions(
+        &self,
+        operation: ExecutorOperationId,
+        inclusions: Vec<(B256, ExecutorPayloadInclusion)>,
+    ) {
+        self.verified
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(operation, inclusions);
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, PoolSlot> {
+        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn current_pool(&self) -> Option<Arc<QueryRpcPool>> {
+        self.slot().pool.clone()
+    }
+
+    /// Drops the pool for good. Idempotent. Admission still in flight completes
+    /// without publishing its pool.
+    pub(super) fn release(&self) {
+        let mut slot = self.slot();
+        slot.released = true;
+        slot.pool = None;
+    }
+
+    /// Admitted endpoints outside their cool-down, the preferred one first. Empty
+    /// once released.
+    pub(super) async fn providers(&self) -> Vec<ProviderHandle> {
+        if self.slot().released {
+            return Vec::new();
+        }
+        let started = Instant::now();
+        tracing::debug!(
+            target: "executor_observation",
+            step = "endpoint_admission",
+            initialized = self.admitted.initialized(),
+            "started"
+        );
+        self.admitted
+            .get_or_init(|| async {
+                let pool = Arc::new(
+                    QueryRpcPool::with_http_client(
+                        self.route.endpoint_urls(),
+                        ENDPOINT_COOLDOWN,
+                        self.client.clone(),
+                    )
+                    .with_pending_admission(),
+                );
+                // Returns at the first admitted endpoint or once every first check
+                // failed. The pool is kept either way and admits endpoints as they
+                // pass, unless the owner released it meanwhile.
+                let _ = self.route.admit_sync_pool(&self.client, &pool, None).await;
+                let mut slot = self.slot();
+                if !slot.released {
+                    slot.pool = Some(pool);
+                }
+            })
+            .await;
+        let Some(pool) = self.current_pool() else {
+            return Vec::new();
+        };
+        let mut providers = pool.available_providers();
+        tracing::debug!(
+            target: "executor_observation",
+            step = "endpoint_admission",
+            elapsed_ms = started.elapsed().as_millis(),
+            available = providers.len(),
+            "finished"
+        );
+        let preferred = self.preferred.load(Ordering::Relaxed);
+        if let Some(position) = providers
+            .iter()
+            .position(|provider| provider.index == preferred)
+        {
+            providers[..=position].rotate_right(1);
+        }
+        providers
+    }
+
+    pub(super) fn succeeded(&self, provider: &ProviderHandle) {
+        self.preferred.store(provider.index, Ordering::Relaxed);
+    }
+
+    /// Cools `provider` down when the endpoint failed rather than the observation:
+    /// a transport or HTTP failure, an unusable response, or an error response
+    /// other than a revert. Chain changes and incomplete history don't count.
+    pub(super) fn failed(&self, provider: &ProviderHandle, error: &eyre::Report) {
+        // RPC error text can contain response bodies, addresses, or endpoint credentials.
+        let (failure, rpc_code) = match error.downcast_ref::<TransportError>() {
+            Some(RpcError::Transport(_)) => ("transport", None),
+            Some(RpcError::NullResp) => ("missing_response", None),
+            Some(RpcError::DeserError { .. }) => ("decode", None),
+            Some(RpcError::ErrorResp(payload)) => ("rpc_error", Some(payload.code)),
+            Some(_) => ("rpc_client", None),
+            None => ("observation", None),
+        };
+        tracing::debug!(
+            target: "executor_observation",
+            rpc_index = provider.index,
+            failure,
+            rpc_code,
+            "observation failed"
+        );
+        let Some(pool) = self.current_pool() else {
+            return;
+        };
+        let endpoint_failed =
+            error
+                .downcast_ref::<TransportError>()
+                .is_some_and(|error| match error {
+                    RpcError::Transport(_) | RpcError::NullResp | RpcError::DeserError { .. } => {
+                        true
+                    }
+                    RpcError::ErrorResp(payload) => !payload.message.contains("revert"),
+                    _ => false,
+                });
+        if !endpoint_failed {
+            return;
+        }
+        let _ = self.preferred.compare_exchange(
+            provider.index,
+            usize::MAX,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        // Keep one endpoint to try, so a local outage can't stop every observation
+        // for a whole cool-down.
+        if pool.available_providers().len() > 1 {
+            pool.mark_bad_provider(provider);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum NonceSource {
@@ -37,23 +263,27 @@ enum NonceSource {
 pub(super) struct ExecutorHistoryObservation {
     pub(super) nonce: Option<ExecutorNonceObservation>,
     pub(super) block: alloy::eips::BlockNumHash,
+    /// The executor's code at `block`, when the nonce read loaded it.
+    pub(super) code: Option<Bytes>,
     pub(super) inclusions: Vec<(B256, ExecutorPayloadInclusion)>,
     pub(super) recovery_inclusions: Vec<(B256, ExecutorPayloadInclusion)>,
+    /// Every inclusion this observation read in full or rechecked, still canonical.
+    verified: Vec<(B256, ExecutorPayloadInclusion)>,
 }
 
 /// Scan explicit blocks, never query a private transaction hash at a remote endpoint.
 /// Signing supplies its already checked nonce and canonical block. Reuse that
 /// snapshot within this operation; other explicit reconciliation supplies `None`.
 pub(super) async fn observe_executor_history(
+    endpoints: &ObservationEndpoints,
     chain: &EffectiveChainConfig,
-    http: &HttpContext,
     record: &ExecutorRecord,
     range: Range<u64>,
     signing_nonce: Option<ExecutorNonceObservation>,
 ) -> Result<ExecutorHistoryObservation> {
     observe_history(
+        endpoints,
         chain,
-        http,
         record,
         range,
         signing_nonce.map_or(NonceSource::Inspect, NonceSource::Signing),
@@ -64,14 +294,14 @@ pub(super) async fn observe_executor_history(
 /// Private sync supplies a block location, not proof of executor execution.
 /// Verify its receipt and expected effects without querying the account or hash.
 pub(super) async fn observe_synced_executor_history(
+    endpoints: &ObservationEndpoints,
     chain: &EffectiveChainConfig,
-    http: &HttpContext,
     record: &ExecutorRecord,
     number: u64,
 ) -> Result<ExecutorHistoryObservation> {
     observe_history(
+        endpoints,
         chain,
-        http,
         record,
         number..number.saturating_add(1),
         NonceSource::HistoryOnly,
@@ -80,8 +310,8 @@ pub(super) async fn observe_synced_executor_history(
 }
 
 async fn observe_history(
+    endpoints: &ObservationEndpoints,
     chain: &EffectiveChainConfig,
-    http: &HttpContext,
     record: &ExecutorRecord,
     range: Range<u64>,
     nonce_source: NonceSource,
@@ -101,29 +331,36 @@ async fn observe_history(
         return Ok(ExecutorHistoryObservation {
             nonce: Some(observed),
             block: observed.block(),
+            code: None,
             inclusions: Vec::new(),
             recovery_inclusions: Vec::new(),
+            verified: Vec::new(),
         });
     }
-    let pool = QueryRpcPool::with_http_client(
-        chain.rpc_route.endpoint_urls(),
-        Duration::from_secs(30),
-        http.rpc_client.clone(),
-    );
-    for provider in pool.available_providers() {
-        if provider.provider.get_chain_id().await.ok() != Some(chain.chain_id) {
-            continue;
-        }
-        if let Ok(observation) = observe_history_at_provider(
-            &provider.provider,
-            chain,
-            record,
-            range.clone(),
-            nonce_source,
+    let verified = endpoints.verified_inclusions(record.operation());
+    for provider in endpoints.providers().await {
+        let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = provider.index);
+        match trace_step(
+            "history_rpc",
+            observe_history_at_provider(
+                &provider.provider,
+                chain,
+                record,
+                range.clone(),
+                nonce_source,
+                &verified,
+            ),
         )
+        .instrument(span)
         .await
         {
-            return Ok(observation);
+            Ok(mut observation) => {
+                endpoints.succeeded(&provider);
+                let confirmed = std::mem::take(&mut observation.verified);
+                endpoints.confirm_inclusions(record.operation(), confirmed);
+                return Ok(observation);
+            }
+            Err(error) => endpoints.failed(&provider, &error),
         }
     }
     Err(eyre!(
@@ -137,11 +374,12 @@ async fn observe_history_at_provider(
     record: &ExecutorRecord,
     range: Range<u64>,
     nonce_source: NonceSource,
+    verified: &[(B256, ExecutorPayloadInclusion)],
 ) -> Result<ExecutorHistoryObservation> {
     let address = record
         .address()
         .ok_or_else(|| eyre!("executor address is unavailable"))?;
-    let latest = provider.get_block_number().await?;
+    let latest = trace_step("history_head", async { provider.get_block_number().await }).await?;
     let confirmed_tip = latest.saturating_sub(chain.finality_depth);
     let signing_nonce = match nonce_source {
         NonceSource::Signing(observed) => Some(observed),
@@ -153,10 +391,19 @@ async fn observe_history_at_provider(
             "requested executor history has not reached the configured confirmation depth"
         ));
     }
-    let confirmed = provider
-        .get_block_by_number(confirmed_number.into())
-        .await?
-        .ok_or_else(|| eyre!("confirmed executor block is unavailable"))?;
+    // Counts only, showing whether the nonce read lies past the scanned page.
+    tracing::debug!(
+        target: "executor_observation",
+        step = "history_range",
+        blocks = range.end.saturating_sub(range.start),
+        beyond_range = confirmed_number.saturating_sub(range.end - 1),
+        "planned"
+    );
+    let confirmed = trace_step("history_confirmed_block", async {
+        provider.get_block_by_number(confirmed_number.into()).await
+    })
+    .await?
+    .ok_or_else(|| eyre!("confirmed executor block is unavailable"))?;
     let block = confirmed.header.num_hash();
     if block.number != confirmed_number {
         return Err(eyre!(
@@ -166,57 +413,209 @@ async fn observe_history_at_provider(
     if signing_nonce.is_some_and(|observed| observed.block() != block) {
         return Err(eyre!("executor signing block is no longer canonical"));
     }
-    let nonce = match nonce_source {
-        NonceSource::Signing(observed) => Some(observed.nonce()),
+    let (nonce, code) = match nonce_source {
+        NonceSource::Signing(observed) => (Some(observed.nonce()), None),
         NonceSource::Inspect => {
-            super::executor_discovery::execution_nonce_at(provider, chain, address, block).await
+            let started = Instant::now();
+            tracing::debug!(target: "executor_observation", step = "history_nonce", "started");
+            // Keep the code that selects the nonce layout; a swap setup check reuses it.
+            let block_id = alloy::eips::BlockId::hash_canonical(block.hash);
+            let code = provider.get_code_at(address).block_id(block_id).await.ok();
+            let nonce = super::executor_discovery::execution_nonce_with_code(
+                provider,
+                chain,
+                address,
+                block_id,
+                code.as_ref().map(AsRef::as_ref),
+                false,
+            )
+            .await;
+            tracing::debug!(
+                target: "executor_observation",
+                step = "history_nonce",
+                elapsed_ms = started.elapsed().as_millis(),
+                available = nonce.is_some(),
+                "finished"
+            );
+            (nonce, code)
         }
-        NonceSource::HistoryOnly => None,
+        NonceSource::HistoryOnly => (None, None),
     };
     let railgun = chain.require_railgun()?.deployment.contract;
-    let mut numbers = range.clone().collect::<BTreeSet<_>>();
     // Revalidate previous inclusions, even outside this discovery page. An old
-    // cached winner must not survive a reorg or an unavailable receipt read.
-    for payload in record.issued() {
-        if let Some(inclusion) = payload.inclusion()
-            && inclusion.block().number <= confirmed_number
-        {
-            numbers.insert(inclusion.block().number);
+    // cached winner must not survive a reorg or an unavailable block read. Only a
+    // full canonical read proves an inclusion: a recorded one may rest on local
+    // evidence, such as a sending endpoint's receipt, at a canonical block that
+    // lacks the transaction. Once this session read a block in full, its receipts
+    // stay fixed while its hash does, so the inclusions confirmed there stand after
+    // a header read. Every other block is read in full: one with an inclusion not
+    // confirmed in this session, a changed or unavailable one, one whose payload
+    // inclusion still lacks the sender's account nonce while recovery transactions
+    // may need that evidence, and one that private sync reported for a payload.
+    let needs_account_nonce = !record.recovery_transactions().is_empty();
+    let synced =
+        |number: u64| matches!(nonce_source, NonceSource::HistoryOnly) && range.contains(&number);
+    let mut revalidated = BTreeMap::<u64, bool>::new();
+    for inclusion in record
+        .issued()
+        .iter()
+        .filter_map(IssuedExecutorPayload::inclusion)
+    {
+        let number = inclusion.block().number;
+        if number <= confirmed_number {
+            *revalidated.entry(number).or_insert_with(|| synced(number)) |=
+                needs_account_nonce && inclusion.executor_account_nonce().is_none();
         }
     }
-    for transaction in record.recovery_transactions() {
-        if let Some(inclusion) = transaction.inclusion()
-            && inclusion.block().number <= confirmed_number
-        {
-            numbers.insert(inclusion.block().number);
+    for inclusion in record
+        .recovery_transactions()
+        .iter()
+        .filter_map(IssuedExecutorRecoveryTransaction::inclusion)
+    {
+        let number = inclusion.block().number;
+        if number <= confirmed_number {
+            revalidated.entry(number).or_insert_with(|| synced(number));
         }
     }
-    let mut inclusions = BTreeMap::new();
-    let mut recovery_inclusions = Vec::new();
-    for number in numbers {
-        let observed = observe_block(provider, railgun, record, number).await?;
-        recovery_inclusions.extend(observed.recovery);
-        for (hash, inclusion) in observed.execution {
-            let previous = inclusions.get(&hash).copied();
-            if previous.is_none_or(|previous: ExecutorPayloadInclusion| {
-                previous.result() != ExecutorExecutionResult::Executed
-            }) {
-                inclusions.insert(hash, inclusion);
+    let mut blocks = BTreeMap::new();
+    for (number, mut full_read) in revalidated {
+        full_read |=
+            !recorded_inclusions(record, number).all(|recorded| verified.contains(&recorded));
+        if !full_read {
+            let current = if number == confirmed_number {
+                Some(block)
+            } else {
+                trace_step("history_inclusion_header", async {
+                    provider.get_block_by_number(number.into()).await
+                })
+                .await?
+                .map(|current| current.header.num_hash())
+            };
+            full_read = current.is_none_or(|current| {
+                recorded_inclusions(record, number)
+                    .any(|(_, inclusion)| inclusion.block() != current)
+            });
+        }
+        let observed = if full_read {
+            trace_step(
+                "history_inclusion_block",
+                observe_block(provider, railgun, record, number),
+            )
+            .await?
+        } else {
+            recorded_block(record, number)
+        };
+        blocks.insert(number, observed);
+    }
+    let scan_range = nonce.is_none_or(|nonce| {
+        let (inclusions, recovery_inclusions) = merge_observed_blocks(blocks.values());
+        range_scan_can_find_executions(record, nonce, &inclusions, &recovery_inclusions)
+    });
+    if scan_range {
+        for number in range {
+            if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(number) {
+                entry.insert(
+                    trace_step(
+                        "history_scan_block",
+                        observe_block(provider, railgun, record, number),
+                    )
+                    .await?,
+                );
             }
         }
     }
-    let still_canonical = provider
-        .get_block_by_number(confirmed_number.into())
-        .await?
-        .is_some_and(|current| current.header.num_hash() == block);
+    let (inclusions, recovery_inclusions) = merge_observed_blocks(blocks.values());
+    let still_canonical = trace_step("history_canonical_recheck", async {
+        provider.get_block_by_number(confirmed_number.into()).await
+    })
+    .await?
+    .is_some_and(|current| current.header.num_hash() == block);
     if !still_canonical {
         return Err(eyre!("executor chain changed during observation"));
     }
     Ok(ExecutorHistoryObservation {
         nonce: nonce.map(|nonce| ExecutorNonceObservation::new(block, nonce)),
         block,
+        code,
         inclusions: inclusions.into_iter().collect(),
         recovery_inclusions,
+        verified: blocks
+            .values()
+            .flat_map(|observed| observed.execution.iter().chain(&observed.recovery))
+            .copied()
+            .collect(),
+    })
+}
+
+/// Merge in block order. An executed inclusion outranks any other of the same payload.
+fn merge_observed_blocks<'a>(
+    blocks: impl Iterator<Item = &'a ObservedExecutorBlock>,
+) -> (
+    BTreeMap<B256, ExecutorPayloadInclusion>,
+    Vec<(B256, ExecutorPayloadInclusion)>,
+) {
+    let mut inclusions = BTreeMap::new();
+    let mut recovery_inclusions = Vec::new();
+    for observed in blocks {
+        recovery_inclusions.extend(observed.recovery.iter().copied());
+        for (hash, inclusion) in &observed.execution {
+            let previous = inclusions.get(hash).copied();
+            if previous.is_none_or(|previous: ExecutorPayloadInclusion| {
+                previous.result() != ExecutorExecutionResult::Executed
+            }) {
+                inclusions.insert(*hash, *inclusion);
+            }
+        }
+    }
+    (inclusions, recovery_inclusions)
+}
+
+/// Whether a block scan for direct executor calls could find anything that the
+/// execution `nonce` at the confirmed block and the revalidated inclusions leave
+/// unexplained. Each block costs a full-transaction read, so a page is skipped
+/// when this is false and the caller still treats it as covered.
+///
+/// A successful direct call consumes its payload's nonce, so a winner can hide
+/// in the page only at a consumed nonce that no executed inclusion and no swap
+/// hook observation accounts for. Swap hooks run inside settlements, not as
+/// direct calls, and swap observation finds them. Recovery transactions are
+/// plain executor-account transactions with no execution nonce to compare, so
+/// any without an inclusion forces the scan.
+///
+/// Tradeoff: an attempt that reverted in a skipped page leaves the nonce
+/// unchanged and is not recorded as reverted. Its payload stays pending and
+/// keeps its inputs reserved, which is the conservative outcome. Private sync
+/// separately reports spend locations for executed payloads.
+fn range_scan_can_find_executions(
+    record: &ExecutorRecord,
+    nonce: U256,
+    inclusions: &BTreeMap<B256, ExecutorPayloadInclusion>,
+    recovery_inclusions: &[(B256, ExecutorPayloadInclusion)],
+) -> bool {
+    let explained = |consumed: U256| {
+        record.issued().iter().any(|payload| {
+            payload.nonce() == consumed
+                && inclusions.get(&payload.hash()).is_some_and(|inclusion| {
+                    inclusion.result() == ExecutorExecutionResult::Executed
+                })
+        }) || record.swap().is_some_and(|swap| {
+            swap.orders().iter().any(|order| {
+                let observed = order.observations();
+                (order.pre_hook().nonce() == consumed && observed.pre_hook_executed.is_some())
+                    || (order.post_hook().nonce() == consumed && observed.shielded.is_some())
+            })
+        })
+    };
+    record.issued().iter().any(|payload| {
+        matches!(
+            payload.purpose(),
+            ExecutorPayloadPurpose::Operation | ExecutorPayloadPurpose::Recovery
+        ) && payload.nonce() < nonce
+            && !explained(payload.nonce())
+    }) || record.recovery_transactions().iter().any(|transaction| {
+        !recovery_inclusions
+            .iter()
+            .any(|(hash, _)| *hash == transaction.hash())
     })
 }
 
@@ -226,17 +625,63 @@ struct ObservedExecutorBlock {
     recovery: Vec<(B256, ExecutorPayloadInclusion)>,
 }
 
+/// The recorded payload and recovery inclusions at `number`, keyed as observed.
+fn recorded_inclusions(
+    record: &ExecutorRecord,
+    number: u64,
+) -> impl Iterator<Item = (B256, ExecutorPayloadInclusion)> + '_ {
+    recorded_payload_inclusions(record, number).chain(recorded_recovery_inclusions(record, number))
+}
+
+fn recorded_payload_inclusions(
+    record: &ExecutorRecord,
+    number: u64,
+) -> impl Iterator<Item = (B256, ExecutorPayloadInclusion)> + '_ {
+    record.issued().iter().filter_map(move |payload| {
+        payload
+            .inclusion()
+            .filter(|inclusion| inclusion.block().number == number)
+            .map(|inclusion| (payload.hash(), inclusion))
+    })
+}
+
+fn recorded_recovery_inclusions(
+    record: &ExecutorRecord,
+    number: u64,
+) -> impl Iterator<Item = (B256, ExecutorPayloadInclusion)> + '_ {
+    record
+        .recovery_transactions()
+        .iter()
+        .filter_map(move |transaction| {
+            transaction
+                .inclusion()
+                .filter(|inclusion| inclusion.block().number == number)
+                .map(|inclusion| (transaction.hash(), inclusion))
+        })
+}
+
+/// The recorded outcomes at `number`, for a block that this session read in full
+/// and that still has the same hash.
+fn recorded_block(record: &ExecutorRecord, number: u64) -> ObservedExecutorBlock {
+    ObservedExecutorBlock {
+        execution: recorded_payload_inclusions(record, number).collect(),
+        recovery: recorded_recovery_inclusions(record, number).collect(),
+    }
+}
+
 async fn observe_block(
     provider: &DynProvider,
     railgun: Address,
     record: &ExecutorRecord,
     number: u64,
 ) -> Result<ObservedExecutorBlock> {
-    let block = provider
-        .get_block_by_number(number.into())
-        .full()
-        .await?
-        .ok_or_else(|| eyre!("executor observation block is unavailable"))?;
+    // Full blocks and their receipts can contain chain-specific transaction types
+    // (e.g. Arbitrum system transactions). Keep the admitted, privacy-routed client.
+    let block =
+        EthGetBlock::<alloy::network::AnyRpcBlock>::by_number(number.into(), provider.client())
+            .full()
+            .await?
+            .ok_or_else(|| eyre!("executor observation block is unavailable"))?;
     let identity = block.header.num_hash();
     if identity.number != number {
         return Err(eyre!("executor block identity mismatch"));
@@ -317,9 +762,9 @@ fn execution_effects(
     railgun: Address,
     executor: Address,
     payload: &IssuedExecutorPayload,
-    receipt: &TransactionReceipt,
+    receipt: &TransactionReceipt<impl TxReceipt<Log = Log>>,
 ) -> Result<ExecutorExecutionResult> {
-    if !receipt.status() {
+    if !receipt.inner.status() {
         return Ok(ExecutorExecutionResult::Reverted);
     }
     let data = payload.context().calldata();
@@ -348,7 +793,7 @@ fn execution_effects(
     {
         return Ok(ExecutorExecutionResult::MissingEffects);
     }
-    if !private_effects_present(railgun, &transactions, receipt)
+    if !private_effects_present(railgun, &transactions, receipt.logs())
         || !shield_effects_present(railgun, &shields, receipt)
     {
         return Ok(ExecutorExecutionResult::MissingEffects);
@@ -372,15 +817,16 @@ pub(super) fn expected_shields(
     Ok(requests)
 }
 
-fn private_effects_present(
+/// Every nullifier and ciphertext-bearing commitment of `transactions` appears in
+/// `logs`, which come from one successful transaction.
+pub(super) fn private_effects_present(
     railgun: Address,
     transactions: &[Transaction],
-    receipt: &TransactionReceipt,
+    logs: &[Log],
 ) -> bool {
     let mut nullifiers = BTreeSet::new();
     let mut commitments = BTreeSet::new();
-    for log in receipt
-        .logs()
+    for log in logs
         .iter()
         .filter(|log| log.address() == railgun && !log.removed)
     {
@@ -414,7 +860,7 @@ fn private_effects_present(
 fn shield_effects_present(
     railgun: Address,
     requests: &[ShieldRequest],
-    receipt: &TransactionReceipt,
+    receipt: &TransactionReceipt<impl TxReceipt<Log = Log>>,
 ) -> bool {
     let mut observed = Vec::new();
     for log in receipt
@@ -458,11 +904,10 @@ fn shield_effects_present(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{ExecutorPayloadContext, ExecutorPayloadPurpose};
+    use crate::vault::ExecutorPayloadContext;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope};
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{Bytes, Uint};
-    use alloy::rpc::types::Log;
     use alloy::sol_types::SolEvent;
     use broadcaster_core::contracts::railgun::{
         BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702ActionData,
@@ -501,11 +946,11 @@ mod tests {
         .cloned()
         .unwrap();
         chain.rpc_route = crate::RpcChainRoute::new(1, Vec::<url::Url>::new());
-        let http = HttpContext::direct_for_tests();
+        let endpoints = ObservationEndpoints::new(&chain, &HttpContext::direct_for_tests());
         let record = empty_record(&chain);
         let observed =
             ExecutorNonceObservation::new(BlockNumHash::new(50, B256::repeat_byte(50)), U256::ZERO);
-        let history = observe_executor_history(&chain, &http, &record, 50..51, Some(observed))
+        let history = observe_executor_history(&endpoints, &chain, &record, 50..51, Some(observed))
             .await
             .unwrap();
         assert_eq!(history.nonce, Some(observed));
@@ -514,7 +959,7 @@ mod tests {
         // Neither an absent observation nor any previously issued payload can
         // use the offline branch, including ordinary recovery transactions.
         assert!(
-            observe_executor_history(&chain, &http, &record, 50..51, None)
+            observe_executor_history(&endpoints, &chain, &record, 50..51, None)
                 .await
                 .is_err()
         );
@@ -541,7 +986,7 @@ mod tests {
             value[field] = values;
             let previous = serde_json::from_value(value).unwrap();
             assert!(
-                observe_executor_history(&chain, &http, &previous, 50..51, Some(observed),)
+                observe_executor_history(&endpoints, &chain, &previous, 50..51, Some(observed),)
                     .await
                     .is_err()
             );
@@ -576,8 +1021,8 @@ mod tests {
             // A newer confirmed tip must not move the signing snapshot.
             responses.push_success(&format!("0x{:x}", pinned.number + chain.finality_depth + 2));
             responses.push_success(&block);
-            // Signing already obtained the nonce at this exact block.
-            responses.push_success(&block);
+            // Signing already obtained the nonce at this exact block, and with
+            // nothing issued there is no page to scan.
             responses.push_success(&block);
             let result = observe_history_at_provider(
                 &provider,
@@ -585,6 +1030,7 @@ mod tests {
                 &record,
                 50..51,
                 NonceSource::Signing(ExecutorNonceObservation::new(pinned, U256::ZERO)),
+                &[],
             )
             .await;
             if reorg {
@@ -636,6 +1082,7 @@ mod tests {
                 &record,
                 50..51,
                 NonceSource::HistoryOnly,
+                &[],
             )
             .await;
             if confirmed && !reorg {
@@ -644,6 +1091,419 @@ mod tests {
                 assert!(result.is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn history_skips_full_blocks_unless_a_consumed_nonce_or_recovery_is_unexplained() {
+        use crate::vault::{ExecutorRecoveryStepKind, IssuedExecutorRecoveryTransaction};
+        use alloy::providers::{ProviderBuilder, mock::Asserter};
+        let chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        let record = empty_record(&chain);
+        let signed =
+            ExecutorNonceObservation::new(BlockNumHash::new(30, B256::ZERO), U256::from(5));
+        // A stuck operation at nonce 5 whose earlier attempt reverted in block 30.
+        let mut pending = serde_json::to_value(IssuedExecutorPayload::new(
+            U256::from(5),
+            record.delegate(),
+            B256::repeat_byte(1),
+            ExecutorPayloadPurpose::Operation,
+            ExecutorPayloadContext::new(Bytes::from_static(&[1]), signed, Vec::new()),
+        ))
+        .unwrap();
+        pending["inclusion"] = serde_json::to_value(ExecutorPayloadInclusion::new(
+            BlockNumHash::new(30, B256::repeat_byte(30)),
+            B256::repeat_byte(2),
+            ExecutorExecutionResult::Reverted,
+        ))
+        .unwrap();
+        let recovery = IssuedExecutorRecoveryTransaction::new(
+            record.operation(),
+            0,
+            ExecutorRecoveryStepKind::Wrap,
+            alloy::rpc::types::TransactionRequest::default(),
+            B256::repeat_byte(3),
+            signed.block(),
+        );
+        let block_at = |number: u64| {
+            let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+            block.header.inner.number = number;
+            block.header.hash = B256::repeat_byte(u8::try_from(number).unwrap());
+            block.transactions = BlockTransactions::Full(Vec::new());
+            block
+        };
+        let range = 40..48;
+        // An unconsumed nonce cannot hide a winner in the page. A consumed one
+        // without an executed inclusion, or an unincluded recovery transaction, can.
+        for (current, recovering, scanned) in [(5, false, false), (6, false, true), (5, true, true)]
+        {
+            let mut value = serde_json::to_value(&record).unwrap();
+            value["issued"] = serde_json::json!([pending]);
+            if recovering {
+                value["recovery_transactions"] = serde_json::json!([recovery]);
+            }
+            let previous: ExecutorRecord = serde_json::from_value(value).unwrap();
+            let responses = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .connect_mocked_client(responses.clone())
+                .erased();
+            responses.push_success(&format!("0x{:x}", 50 + chain.finality_depth));
+            responses.push_success(&block_at(50));
+            // An undelegated executor exposes its execution nonce in storage.
+            responses.push_success(&Bytes::new());
+            responses.push_success(&U256::from(current));
+            // The recorded inclusion is revalidated either way.
+            responses.push_success(&block_at(30));
+            if scanned {
+                for number in range.clone() {
+                    responses.push_success(&block_at(number));
+                }
+            }
+            responses.push_success(&block_at(50));
+            let history = observe_history_at_provider(
+                &provider,
+                &chain,
+                &previous,
+                range.clone(),
+                NonceSource::Inspect,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(responses.read_q().is_empty());
+            assert_eq!(
+                history.nonce,
+                Some(ExecutorNonceObservation::new(
+                    BlockNumHash::new(50, B256::repeat_byte(50)),
+                    U256::from(current)
+                ))
+            );
+            assert!(history.inclusions.is_empty());
+            assert!(history.recovery_inclusions.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_inclusions_read_in_full_this_session_are_rechecked_by_header() {
+        use alloy::consensus::transaction::Recovered;
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::primitives::{Signature, TxKind};
+        use alloy::providers::{ProviderBuilder, mock::Asserter};
+        let chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        let record = empty_record(&chain);
+        let executor = record.address().unwrap();
+        let signed =
+            ExecutorNonceObservation::new(BlockNumHash::new(20, B256::ZERO), U256::from(5));
+        let payload = IssuedExecutorPayload::new(
+            U256::from(5),
+            record.delegate(),
+            B256::repeat_byte(1),
+            ExecutorPayloadPurpose::Operation,
+            ExecutorPayloadContext::new(Bytes::from_static(&[1]), signed, Vec::new()),
+        );
+        // The executor itself sent the payload in block 30, and it reverted.
+        let included = BlockNumHash::new(30, B256::repeat_byte(30));
+        let sent = TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 1,
+            max_fee_per_gas: 1,
+            to: TxKind::Call(executor),
+            input: Bytes::from_static(&[1]),
+            ..TxEip1559::default()
+        }
+        .into_signed(Signature::test_signature());
+        let sent_hash = *sent.hash();
+        let mut block_30 = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block_30.header.inner.number = included.number;
+        block_30.header.hash = included.hash;
+        block_30.transactions = BlockTransactions::Full(vec![alloy::rpc::types::Transaction {
+            inner: Recovered::new_unchecked(TxEnvelope::Eip1559(sent), executor),
+            block_hash: Some(included.hash),
+            block_number: Some(included.number),
+            transaction_index: Some(0),
+            effective_gas_price: Some(1),
+            block_timestamp: None,
+        }]);
+        let mut reverted = receipt(false, Vec::new());
+        reverted.transaction_hash = sent_hash;
+        reverted.block_hash = Some(included.hash);
+        reverted.block_number = Some(included.number);
+        let inclusion =
+            ExecutorPayloadInclusion::new(included, sent_hash, ExecutorExecutionResult::Reverted)
+                .with_executor_account_nonce(Some(7));
+        let mut value = serde_json::to_value(&record).unwrap();
+        let mut issued = serde_json::to_value(&payload).unwrap();
+        issued["inclusion"] = serde_json::to_value(inclusion).unwrap();
+        value["issued"] = serde_json::json!([issued]);
+        let previous: ExecutorRecord = serde_json::from_value(value).unwrap();
+        let block_at = |number: u64, hash: u8| {
+            let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+            block.header.inner.number = number;
+            block.header.hash = B256::repeat_byte(hash);
+            block.transactions = BlockTransactions::Full(Vec::new());
+            block
+        };
+        let observe = |block_30: Vec<serde_json::Value>,
+                       verified: Vec<(B256, ExecutorPayloadInclusion)>| {
+            let chain = &chain;
+            let previous = &previous;
+            async move {
+                let responses = Asserter::new();
+                let provider = ProviderBuilder::new()
+                    .connect_mocked_client(responses.clone())
+                    .erased();
+                responses.push_success(&format!("0x{:x}", 50 + chain.finality_depth));
+                responses.push_success(&block_at(50, 50));
+                // Nonce 5 is still unused, so no page scan follows.
+                responses.push_success(&Bytes::new());
+                responses.push_success(&U256::from(5));
+                for response in &block_30 {
+                    responses.push_success(response);
+                }
+                responses.push_success(&block_at(50, 50));
+                let history = observe_history_at_provider(
+                    &provider,
+                    chain,
+                    previous,
+                    50..51,
+                    NonceSource::Inspect,
+                    &verified,
+                )
+                .await
+                .unwrap();
+                assert!(responses.read_q().is_empty());
+                history
+            }
+        };
+        let full_block = serde_json::to_value(&block_30).unwrap();
+        // The first observation this session reads the block, its receipts, and its
+        // canonicality in full, then keeps the inclusion with its sender nonce.
+        let first = observe(
+            vec![
+                full_block.clone(),
+                serde_json::to_value(vec![reverted]).unwrap(),
+                full_block.clone(),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(first.inclusions, vec![(payload.hash(), inclusion)]);
+        // Once read in full, the same block is rechecked by one header read.
+        let second = observe(vec![full_block], first.verified).await;
+        assert_eq!(second.inclusions, vec![(payload.hash(), inclusion)]);
+        // A changed block is read in full again, and the inclusion goes with it.
+        let reorged = serde_json::to_value(block_at(30, 31)).unwrap();
+        let third = observe(vec![reorged.clone(), reorged], second.verified).await;
+        assert!(third.inclusions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observes_executor_inclusion_alongside_arbitrum_system_transactions() {
+        use alloy::consensus::transaction::Recovered;
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::primitives::{Signature, TxKind};
+        use alloy::providers::{ProviderBuilder, mock::Asserter};
+        use serde_json::json;
+
+        let chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(42161)
+        .cloned()
+        .unwrap();
+        let record = empty_record(&chain);
+        let executor = record.address().unwrap();
+        let included = BlockNumHash::new(30, B256::repeat_byte(30));
+        let payload = issued(vec![1]);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["issued"] = json!([payload]);
+        let record = serde_json::from_value(value).unwrap();
+        let sent = TxEip1559 {
+            chain_id: chain.chain_id,
+            nonce: 7,
+            gas_limit: 1,
+            max_fee_per_gas: 1,
+            to: TxKind::Call(executor),
+            input: Bytes::from_static(&[1]),
+            ..TxEip1559::default()
+        }
+        .into_signed(Signature::test_signature());
+        let sent_hash = *sent.hash();
+        let transaction = alloy::rpc::types::Transaction {
+            inner: Recovered::new_unchecked(TxEnvelope::Eip1559(sent), executor),
+            block_hash: Some(included.hash),
+            block_number: Some(included.number),
+            transaction_index: Some(1),
+            effective_gas_price: Some(1),
+            block_timestamp: None,
+        };
+        let system_hash = B256::repeat_byte(99);
+        let mut header: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        header.header.inner.number = included.number;
+        header.header.hash = included.hash;
+        let mut block = serde_json::to_value(&header).unwrap();
+        // Arbitrum's internal transaction (0x6a) is not an Ethereum envelope.
+        block["transactions"] = json!([
+            {
+                "type": "0x6a", "hash": system_hash, "from": Address::ZERO,
+                "to": Address::repeat_byte(100), "input": "0x", "nonce": "0x0",
+                "gas": "0x0", "gasPrice": "0x0", "value": "0x0",
+                "blockHash": included.hash, "blockNumber": "0x1e", "transactionIndex": "0x0"
+            },
+            transaction
+        ]);
+        let mut reverted = receipt(false, Vec::new());
+        reverted.transaction_hash = sent_hash;
+        reverted.block_hash = Some(included.hash);
+        reverted.block_number = Some(included.number);
+        let mut system_receipt = serde_json::to_value(&reverted).unwrap();
+        system_receipt["type"] = json!("0x6a");
+        system_receipt["transactionHash"] = json!(system_hash);
+        system_receipt["status"] = json!("0x1");
+        let responses = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(responses.clone())
+            .erased();
+        responses.push_success(&block);
+        responses.push_success(&json!([system_receipt, reverted]));
+        responses.push_success(&header);
+        let observed = observe_block(
+            &provider,
+            chain.require_railgun().unwrap().deployment.contract,
+            &record,
+            included.number,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            observed.execution,
+            vec![(
+                payload.hash(),
+                ExecutorPayloadInclusion::new(
+                    included,
+                    sent_hash,
+                    ExecutorExecutionResult::Reverted
+                )
+                .with_executor_account_nonce(Some(7)),
+            )]
+        );
+        assert!(responses.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_endpoint_sits_out_and_a_verified_one_is_not_rechecked() {
+        use serde_json::{Value, json};
+        let mut chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block.header.inner.number = 50;
+        block.header.hash = B256::repeat_byte(50);
+        let head = format!("0x{:x}", 50 + chain.finality_depth);
+        let logged = |methods: &Arc<Mutex<Vec<String>>>, request: &Value| {
+            let method = request["method"].as_str().unwrap().to_owned();
+            methods.lock().unwrap().push(method.clone());
+            method
+        };
+        let failing_methods = Arc::new(Mutex::new(Vec::new()));
+        let recorded = failing_methods.clone();
+        let (failing, failing_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request: Value| {
+                if logged(&recorded, &request) == "eth_chainId" {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"})
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": {"code": -32000, "message": "payment required"}
+                    })
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let serving_methods = Arc::new(Mutex::new(Vec::new()));
+        let recorded = serving_methods.clone();
+        let (serving, serving_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request: Value| {
+                let result = match logged(&recorded, &request).as_str() {
+                    "eth_chainId" => json!("0x1"),
+                    "eth_blockNumber" => json!(head),
+                    "eth_getBlockByNumber" => serde_json::to_value(&block).unwrap(),
+                    "eth_getCode" => json!("0x"),
+                    "eth_getStorageAt" => json!(B256::ZERO),
+                    method => panic!("unexpected RPC method {method}"),
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        chain.rpc_route =
+            crate::RpcChainRoute::new(1, vec![failing, serving]).with_identity_verification();
+        let endpoints = ObservationEndpoints::new(&chain, &HttpContext::direct_for_tests());
+        // Admission returns at the first verified endpoint and admits the other after.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while endpoints.providers().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let record = empty_record(&chain);
+        for _ in 0..2 {
+            let history = observe_executor_history(&endpoints, &chain, &record, 50..51, None)
+                .await
+                .unwrap();
+            assert_eq!(history.block, BlockNumHash::new(50, B256::repeat_byte(50)));
+        }
+        // The first observation tried the failing endpoint once. The second skipped it.
+        assert_eq!(
+            *failing_methods.lock().unwrap(),
+            vec!["eth_chainId", "eth_blockNumber"]
+        );
+        let served = serving_methods.lock().unwrap().clone();
+        let count = |method: &str| served.iter().filter(|call| *call == method).count();
+        assert_eq!((count("eth_chainId"), count("eth_blockNumber")), (1, 2));
+
+        // Releasing drops the pool, so admission's weak reference can't keep it, and
+        // nothing rebuilds it.
+        let pool = Arc::downgrade(&endpoints.current_pool().unwrap());
+        endpoints.release();
+        endpoints.release();
+        assert!(endpoints.providers().await.is_empty());
+        assert!(pool.upgrade().is_none());
+        assert!(endpoints.current_pool().is_none());
+
+        // A release while the first admission is pending wins over its completion.
+        let pending_endpoints = ObservationEndpoints::new(&chain, &HttpContext::direct_for_tests());
+        let mut pending = std::pin::pin!(pending_endpoints.providers());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        pending_endpoints.release();
+        assert!(pending.await.is_empty());
+        assert!(pending_endpoints.current_pool().is_none());
+        assert!(pending_endpoints.providers().await.is_empty());
+        failing_server.abort();
+        serving_server.abort();
     }
 
     fn event_log(event: &impl SolEvent, address: Address) -> Log {

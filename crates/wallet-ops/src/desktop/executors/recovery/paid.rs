@@ -2,33 +2,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
+use broadcaster_core::contracts::railgun::Call;
 use eyre::{Result, eyre};
 use railgun_wallet::tx::{
-    BuildError, MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateSend,
-    MixedPrivateSendRole,
+    BuildError, GasEstimateMode, MixedPrivateActionRequest, MixedPrivateOutputRole,
+    MixedPrivateSend, MixedPrivateSendRole, RailgunGasModel,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, Utxo};
+use tracing::Instrument as _;
 
 use super::{
     ExecutorOwner, ExecutorRecoveryFunding, PreparedExecutorRecovery, maximum_recovery_gas_limit,
 };
+use crate::desktop::executor_observation::trace_step;
+use crate::desktop::executors::IssueRetry;
+use crate::desktop::executors::swap::swap_recovery_call_bound;
 use crate::desktop::{
     ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS,
-    approximate_public_broadcaster_gas, artifact_source, buffered_gas_price_from_rpc_pool,
-    effective_desktop_chain_config, estimate_public_broadcaster_fee_from_rpc_pool,
-    query_rpc_pool_with_http_client, submit_public_broadcaster_transaction,
-    update_transaction_generation_stage,
+    approximate_public_broadcaster_gas, artifact_source, bounded_public_broadcaster_fee,
+    buffered_gas_price_from_rpc_pool, effective_desktop_chain_config,
+    estimate_public_broadcaster_fee_from_rpc_pool, query_rpc_pool_with_http_client,
+    submit_public_broadcaster_transaction, update_transaction_generation_stage,
 };
 use crate::poi_contexts::{
     persist_pending_mixed_output_poi_contexts, public_broadcaster_pre_transaction_pois,
 };
+use crate::settings::ExecutorProfile;
 use crate::vault::ExecutorOperationId;
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, PreparedExecutorOperation,
     PublicBroadcasterCandidate, PublicBroadcasterResultKind, TransactionGenerationProgressSender,
     TransactionGenerationStage, WakuClient, WalletSession, broadcaster_fee_amount,
-    buffered_public_broadcaster_fee, public_broadcaster_bound_min_gas_price,
-    public_broadcaster_service_gas_price,
+    public_broadcaster_bound_min_gas_price, public_broadcaster_service_gas_price,
 };
 
 #[derive(Clone)]
@@ -83,6 +88,57 @@ pub struct ExecutorPaidRecoveryOutcome {
     pub result: PublicBroadcasterResultKind,
 }
 
+/// A private broadcaster fee that requires a new spending approval.
+#[derive(Debug, thiserror::Error)]
+#[error("{purpose} private fee exceeds the reviewed maximum; review a new fee limit")]
+pub struct ExecutorPrivateFeeLimitExceeded {
+    purpose: &'static str,
+    fee_token: Address,
+    maximum: U256,
+    required: U256,
+}
+
+impl ExecutorPrivateFeeLimitExceeded {
+    #[must_use]
+    pub const fn fee_token(&self) -> Address {
+        self.fee_token
+    }
+
+    #[must_use]
+    pub const fn maximum(&self) -> U256 {
+        self.maximum
+    }
+
+    #[must_use]
+    pub const fn required(&self) -> U256 {
+        self.required
+    }
+}
+
+/// Broadcaster-paid executor executions share fee selection, issuance, POI, and
+/// submission. The purpose names the spend approval and user-facing fee errors.
+#[derive(Clone, Copy)]
+pub(in crate::desktop::executors) enum PaidExecutionPurpose {
+    Recovery,
+    SwapSetup,
+}
+
+impl PaidExecutionPurpose {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Recovery => "recovery",
+            Self::SwapSetup => "swap setup",
+        }
+    }
+
+    const fn signer_operation(self) -> &'static str {
+        match self {
+            Self::Recovery => "executor recovery private fee",
+            Self::SwapSetup => "swap setup private fee",
+        }
+    }
+}
+
 impl ExecutorOwner {
     /// Preview the private fee without deriving keys, reserving an executor, or signing.
     /// Uses the submission planner and a conservative recovery budget including approval reset.
@@ -94,20 +150,41 @@ impl ExecutorOwner {
         candidate: PublicBroadcasterCandidate,
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         self.ensure_active()?;
-        if !session
-            .executor_owner()
-            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
-        {
-            return Err(eyre!(
-                "recovery private fee wallet belongs to another session"
-            ));
-        }
+        self.require_fee_session(session, PaidExecutionPurpose::Recovery)?;
         let record = self.recovery_record(operation)?;
-        let profile =
-            crate::settings::ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
-                .ok_or_else(|| {
-                    eyre!("this historical delegate does not support broadcaster recovery")
-                })?;
+        let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
+            .ok_or_else(|| {
+                eyre!("this historical delegate does not support broadcaster recovery")
+            })?;
+        let swap_calls = swap_recovery_call_bound(&record);
+        self.estimate_paid_execution_fee(
+            PaidExecutionPurpose::Recovery,
+            profile,
+            candidate,
+            &session.unspent_utxos(),
+            |buffer| {
+                maximum_recovery_gas_limit(
+                    RailgunGasModel::for_chain(self.chain.chain_id),
+                    asset,
+                    swap_calls,
+                    buffer,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Preview a paid execute's private fee. `budget_gas` receives the chain's gas
+    /// limit buffer and must cover the execution's calls, delegation overhead, and that
+    /// buffer at least once.
+    pub(in crate::desktop::executors) async fn estimate_paid_execution_fee(
+        &self,
+        purpose: PaidExecutionPurpose,
+        profile: ExecutorProfile,
+        candidate: PublicBroadcasterCandidate,
+        inputs: &[Utxo],
+        budget_gas: impl FnOnce(u64) -> u64,
+    ) -> Result<ExecutorRecoveryFeeEstimate> {
         ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone())).admit(profile)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
@@ -120,9 +197,9 @@ impl ExecutorOwner {
             railgun_contract: chain.railgun_contract,
             relay_adapt_contract: chain.relay_adapt_contract,
         };
-        let recovery_gas = maximum_recovery_gas_limit(asset, chain.gas.gas_limit_buffer);
-        // Only the private fee affects note selection. The recovery calls' gas is
-        // accounted for above; their signed calldata is created after authorization.
+        let budget_gas = budget_gas(chain.gas.gas_limit_buffer);
+        // Only the private fee affects note selection. The calls' gas is accounted
+        // for above; their signed calldata is created after authorization.
         let request = MixedPrivateActionRequest {
             executor: None,
             executor_calls: Vec::new(),
@@ -142,14 +219,15 @@ impl ExecutorOwner {
             spend_up_to: false,
             rebuild: None,
         };
-        let (gas_limit, fee_amount) = estimate_recovery_fee(
+        let (gas_limit, fee_amount) = estimate_private_fee(
             &builder,
-            &session.unspent_utxos(),
+            inputs,
             request,
-            recovery_gas,
+            budget_gas,
             candidate.fee,
             U256::MAX,
             min_gas_price,
+            purpose,
         )?;
         self.ensure_active()?;
         Ok(ExecutorRecoveryFeeEstimate {
@@ -158,6 +236,23 @@ impl ExecutorOwner {
             gas_limit,
             min_gas_price,
         })
+    }
+
+    pub(in crate::desktop::executors) fn require_fee_session(
+        &self,
+        session: &WalletSession,
+        purpose: PaidExecutionPurpose,
+    ) -> Result<()> {
+        if !session
+            .executor_owner()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
+        {
+            return Err(eyre!(
+                "{} private fee wallet belongs to another session",
+                purpose.label()
+            ));
+        }
+        Ok(())
     }
 
     /// Pay a compatible broadcaster from private notes while shielding the exact
@@ -175,15 +270,7 @@ impl ExecutorOwner {
         &self,
         request: ExecutorPaidRecoveryRequest,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
-        if !request
-            .session
-            .executor_owner()
-            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
-        {
-            return Err(eyre!(
-                "recovery private fee wallet belongs to another session"
-            ));
-        }
+        self.require_fee_session(&request.session, PaidExecutionPurpose::Recovery)?;
         let preparation =
             self.prepare_broadcaster_recovery_execution(Arc::clone(&request.recovery))?;
         let ExecutorRecoveryFunding::PublicBroadcaster {
@@ -193,10 +280,90 @@ impl ExecutorOwner {
         else {
             return Err(eyre!("this recovery selected another funding route"));
         };
+        self.submit_paid_execution(
+            PaidExecutionPurpose::Recovery,
+            &preparation,
+            candidate,
+            request.recovery.calls(),
+            request.recovery.gas_limits()[0],
+            *maximum_private_fee,
+            &request.session,
+            request.authorization,
+            &request.waku,
+            request.verify_proof,
+            request.progress_tx.as_ref(),
+            request.response_timeout,
+            request.republish_interval,
+        )
+        .await
+    }
+
+    /// Prove, issue, and hand one executor `execute` to its selected broadcaster.
+    /// The only private output is the broadcaster fee; `calls` run as its actions.
+    pub(in crate::desktop::executors) async fn submit_paid_execution(
+        &self,
+        purpose: PaidExecutionPurpose,
+        preparation: &PreparedExecutorOperation,
+        candidate: &PublicBroadcasterCandidate,
+        calls: &[Call],
+        budget_gas: u64,
+        maximum_private_fee: U256,
+        session: &WalletSession,
+        authorization: DesktopPrivateSpendAuthorization,
+        waku: &Arc<WakuClient>,
+        verify_proof: bool,
+        progress_tx: Option<&TransactionGenerationProgressSender>,
+        response_timeout: Duration,
+        republish_interval: Duration,
+    ) -> Result<ExecutorPaidRecoveryOutcome> {
+        let span = tracing::debug_span!(target: "executor_observation", "paid_execution",
+            purpose = purpose.label());
+        trace_step(
+            "paid_total",
+            self.submit_paid_execution_active(
+                purpose,
+                preparation,
+                candidate,
+                calls,
+                budget_gas,
+                maximum_private_fee,
+                session,
+                authorization,
+                waku,
+                verify_proof,
+                progress_tx,
+                response_timeout,
+                republish_interval,
+            ),
+        )
+        .instrument(span)
+        .await
+    }
+
+    async fn submit_paid_execution_active(
+        &self,
+        purpose: PaidExecutionPurpose,
+        preparation: &PreparedExecutorOperation,
+        candidate: &PublicBroadcasterCandidate,
+        calls: &[Call],
+        budget_gas: u64,
+        maximum_private_fee: U256,
+        session: &WalletSession,
+        authorization: DesktopPrivateSpendAuthorization,
+        waku: &Arc<WakuClient>,
+        verify_proof: bool,
+        progress_tx: Option<&TransactionGenerationProgressSender>,
+        response_timeout: Duration,
+        republish_interval: Duration,
+    ) -> Result<ExecutorPaidRecoveryOutcome> {
         preparation.require_broadcaster(candidate)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
-        let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+        let min_gas_price = trace_step(
+            "paid_gas_price",
+            buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas),
+        )
+        .await?;
         let bound_min_gas_price =
             public_broadcaster_bound_min_gas_price(self.chain.chain_id, min_gas_price);
         let builder = TransactionBuilder {
@@ -206,78 +373,96 @@ impl ExecutorOwner {
             relay_adapt_contract: chain.relay_adapt_contract,
         };
         update_transaction_generation_stage(
-            request.progress_tx.as_ref(),
+            progress_tx,
             TransactionGenerationStage::SelectingPrivateNotes,
         );
-        let utxos = request.session.unspent_utxos_for_executor(&preparation)?;
-        let (_, mut fee_amount) = estimate_recovery_fee(
-            &builder,
-            &utxos,
-            recovery_fee_request(
-                &preparation,
-                &request.recovery,
-                candidate,
-                U256::ONE,
-                bound_min_gas_price,
-                request.verify_proof,
-            ),
-            request.recovery.gas_limits()[0],
-            candidate.fee,
-            *maximum_private_fee,
-            min_gas_price,
-        )?;
-        let source = artifact_source(&self.http, &request.session.db)?;
-        let prover = ProverService::new_with_db(&source, &request.session.db);
-        let chain_handle = request
-            .session
+        let utxos = session.unspent_utxos_for_executor(preparation)?;
+        let (_, mut fee_amount) = trace_step("paid_fee_quote", async {
+            estimate_private_fee(
+                &builder,
+                &utxos,
+                paid_execution_request(
+                    preparation,
+                    calls,
+                    candidate,
+                    U256::ONE,
+                    bound_min_gas_price,
+                    verify_proof,
+                ),
+                budget_gas,
+                candidate.fee,
+                maximum_private_fee,
+                min_gas_price,
+                purpose,
+            )
+        })
+        .await?;
+        let source = artifact_source(&self.http, &session.db)?;
+        let prover = ProverService::new_with_db(&source, &session.db);
+        let chain_handle = session
             .sync_manager
-            .chain_handle(&request.session.chain_key)
+            .chain_handle(&session.chain_key)
             .await
-            .ok_or_else(|| eyre!("recovery private fee chain is unavailable"))?;
-        let mut forest = chain_handle.forest.read().await.clone();
+            .ok_or_else(|| eyre!("{} private fee chain is unavailable", purpose.label()))?;
+        let mut forest = trace_step("paid_forest", async {
+            Ok::<_, eyre::Report>(chain_handle.forest.read().await.clone())
+        })
+        .await?;
         forest.compute_roots();
-        let signer = request.authorization.signer(
-            &self.vault,
-            &self.view,
-            "executor recovery private fee",
-        )?;
+        let signer = authorization.signer(&self.vault, &self.view, purpose.signer_operation())?;
+        // Repriced rounds may reuse the first round's chain evidence. Dropped
+        // before submission so a lost broadcaster response cannot enable reuse.
+        let mut issue_retry = IssueRetry::default();
 
-        for _ in 0..PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-            require_recovery_fee_limit(fee_amount, *maximum_private_fee)?;
-            self.validate_preparation(&preparation)?;
+        for round in 0..PUBLIC_BROADCASTER_FEE_ATTEMPTS {
+            let span = tracing::debug_span!(target: "executor_observation", "paid_round", round);
+            require_private_fee_limit(candidate.token, fee_amount, maximum_private_fee, purpose)?;
+            self.validate_preparation(preparation)?;
             preparation.require_broadcaster(candidate)?;
-            let utxos = request.session.unspent_utxos_for_executor(&preparation)?;
+            let utxos = session.unspent_utxos_for_executor(preparation)?;
             update_transaction_generation_stage(
-                request.progress_tx.as_ref(),
+                progress_tx,
                 TransactionGenerationStage::ProvingTransaction,
             );
-            let plan = builder
-                .build_mixed_private_action_plan_with_signer(
+            let plan = trace_step(
+                "paid_transaction_proof",
+                builder.build_mixed_private_action_plan_with_signer(
                     &self.view.scan_keys(),
                     &signer,
                     &forest,
                     &utxos,
-                    recovery_fee_request(
-                        &preparation,
-                        &request.recovery,
+                    paid_execution_request(
+                        preparation,
+                        calls,
                         candidate,
                         fee_amount,
                         bound_min_gas_price,
-                        request.verify_proof,
+                        verify_proof,
                     ),
                     &prover,
-                )
-                .await
-                .map_err(recovery_fee_build_error)?;
+                ),
+            )
+            .instrument(span.clone())
+            .await
+            .map_err(|error| private_fee_build_error(error, purpose))?;
             let inputs = plan
                 .inputs
                 .iter()
                 .map(|input| input.utxo.clone())
                 .collect::<Vec<_>>();
             // Even simulation exposes a usable signed payload. Persist it first.
-            let issued = self
-                .issue_operation(&preparation, &plan.call, &inputs, &request.authorization)
-                .await?;
+            let issued = trace_step(
+                "paid_issue",
+                self.issue_operation_retrying(
+                    preparation,
+                    &plan.call,
+                    &inputs,
+                    &authorization,
+                    &mut issue_retry,
+                ),
+            )
+            .instrument(span.clone())
+            .await?;
             let mut transaction = issued.transaction().clone();
             if transaction.transaction_type == Some(4) {
                 transaction.max_fee_per_gas =
@@ -285,40 +470,53 @@ impl ExecutorOwner {
                 transaction.max_priority_fee_per_gas = Some(min_gas_price);
             }
             update_transaction_generation_stage(
-                request.progress_tx.as_ref(),
+                progress_tx,
                 TransactionGenerationStage::EstimatingBroadcasterFee,
             );
-            let (gas_limit, required_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
-                &query_rpc_pool,
-                self.chain.chain_id,
-                transaction.clone(),
-                candidate.fee,
-                min_gas_price,
-                chain.gas.gas_limit_buffer,
+            let (gas_limit, required_fee) = trace_step(
+                "paid_broadcaster_fee_estimate",
+                estimate_public_broadcaster_fee_from_rpc_pool(
+                    &query_rpc_pool,
+                    self.chain.chain_id,
+                    transaction.clone(),
+                    candidate.fee,
+                    min_gas_price,
+                    chain.gas.gas_limit_buffer,
+                ),
             )
+            .instrument(span.clone())
             .await?;
             if required_fee > fee_amount {
-                fee_amount = buffered_public_broadcaster_fee(required_fee);
-                require_recovery_fee_limit(fee_amount, *maximum_private_fee)?;
+                fee_amount = bounded_private_fee(
+                    candidate.token,
+                    required_fee,
+                    maximum_private_fee,
+                    purpose,
+                )?;
                 continue;
             }
             // Keep approval through fee retries, then release it before POI and submission.
+            drop(issue_retry);
             drop(signer);
-            drop(request.authorization);
+            drop(authorization);
             transaction.gas = Some(gas_limit);
             update_transaction_generation_stage(
-                request.progress_tx.as_ref(),
+                progress_tx,
                 TransactionGenerationStage::GeneratingPoiProofs,
             );
-            let pois = public_broadcaster_pre_transaction_pois(
-                &plan.chunks,
-                candidate,
-                &request.session,
-                self.chain.chain_id,
-                &prover,
-                request.verify_proof,
-                &self.http,
+            let pois = trace_step(
+                "paid_pre_transaction_poi",
+                public_broadcaster_pre_transaction_pois(
+                    &plan.chunks,
+                    candidate,
+                    session,
+                    self.chain.chain_id,
+                    &prover,
+                    verify_proof,
+                    &self.http,
+                ),
             )
+            .instrument(span.clone())
             .await?;
             // The fee recipient belongs to the broadcaster. Only this wallet's
             // change receives pending output POI context; the shield is indexed normally.
@@ -327,33 +525,46 @@ impl ExecutorOwner {
                 .into_iter()
                 .filter(|output| output.role == MixedPrivateOutputRole::Change)
                 .collect::<Vec<_>>();
-            persist_pending_mixed_output_poi_contexts(
-                &request.session,
-                &plan.chunks,
-                &change,
-                &pois.pending_pois,
-                &pois.pending_poi_list_keys,
+            trace_step(
+                "paid_poi_context_persist",
+                persist_pending_mixed_output_poi_contexts(
+                    session,
+                    &plan.chunks,
+                    &change,
+                    &pois.pending_pois,
+                    &pois.pending_poi_list_keys,
+                ),
             )
+            .instrument(span.clone())
             .await?;
-            self.validate_preparation(&preparation)?;
+            self.validate_preparation(preparation)?;
             preparation.require_broadcaster(candidate)?;
-            let result = submit_public_broadcaster_transaction(
-                Arc::clone(&request.waku),
-                transaction,
-                pois.request_pois,
-                candidate,
-                bound_min_gas_price,
-                request.progress_tx.clone(),
-                request.response_timeout,
-                request.republish_interval,
+            let result = trace_step(
+                "paid_submit",
+                submit_public_broadcaster_transaction(
+                    Arc::clone(waku),
+                    transaction,
+                    pois.request_pois,
+                    candidate,
+                    bound_min_gas_price,
+                    progress_tx.cloned(),
+                    response_timeout,
+                    republish_interval,
+                ),
             )
+            .instrument(span.clone())
             .await?;
             if let PublicBroadcasterResultKind::Submitted { tx_hash } = &result {
-                self.store.record_submission(
-                    issued.operation(),
-                    issued.payload_hash(),
-                    tx_hash.parse()?,
-                )?;
+                let transaction_hash: B256 = tx_hash.parse()?;
+                trace_step("paid_record_submission", async {
+                    self.store.record_submission(
+                        issued.operation(),
+                        issued.payload_hash(),
+                        transaction_hash,
+                    )
+                })
+                .instrument(span)
+                .await?;
                 self.notify_change();
             }
             return Ok(ExecutorPaidRecoveryOutcome {
@@ -366,14 +577,15 @@ impl ExecutorOwner {
             });
         }
         Err(eyre!(
-            "recovery private fee did not stabilize; refresh the fee quote and review again"
+            "{} private fee did not stabilize; refresh the fee quote and review again",
+            purpose.label()
         ))
     }
 }
 
-fn recovery_fee_request(
+fn paid_execution_request(
     preparation: &PreparedExecutorOperation,
-    recovery: &PreparedExecutorRecovery,
+    calls: &[Call],
     candidate: &PublicBroadcasterCandidate,
     fee_amount: U256,
     min_gas_price: u128,
@@ -381,7 +593,7 @@ fn recovery_fee_request(
 ) -> MixedPrivateActionRequest {
     MixedPrivateActionRequest {
         executor: Some(preparation.context()),
-        executor_calls: recovery.calls().to_vec(),
+        executor_calls: calls.to_vec(),
         private_sends: vec![MixedPrivateSend {
             token_address: candidate.token,
             amount: fee_amount,
@@ -397,67 +609,113 @@ fn recovery_fee_request(
     }
 }
 
-fn estimate_recovery_fee(
+fn estimate_private_fee(
     builder: &TransactionBuilder,
     utxos: &[Utxo],
     mut request: MixedPrivateActionRequest,
-    recovery_gas: u64,
+    budget_gas: u64,
     fee_per_unit_gas: U256,
     maximum_private_fee: U256,
     min_gas_price: u128,
+    purpose: PaidExecutionPurpose,
 ) -> Result<(u64, U256)> {
-    // This request contains only the broadcaster payment; recovered assets stay in its calls.
+    // This request contains only the broadcaster payment; executor actions stay in its calls.
+    let model = RailgunGasModel::for_chain(builder.chain_id);
     let mut fee = U256::ONE;
     for _ in 0..PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        require_recovery_fee_limit(fee, maximum_private_fee)?;
+        require_private_fee_limit(
+            request.private_sends[0].token_address,
+            fee,
+            maximum_private_fee,
+            purpose,
+        )?;
         request.private_sends[0].amount = fee;
         let preview = builder
             .preview_mixed_private_action_plan(utxos, &request)
-            .map_err(recovery_fee_build_error)?;
-        let gas = approximate_public_broadcaster_gas(ApproximateTransactionShape {
-            transaction_count: preview.shape.transaction_count,
-            input_count: preview.shape.input_count,
-            private_output_count: preview.shape.private_output_count,
-            public_output_count: 0,
-            max_receiver_amount: fee,
-            relay_call_count: preview.shape.relay_call_count,
-            uses_relay_adapt: true,
-            unwrap_count: 0,
-            send: true,
-            // The reviewed recovery batch budget already includes delegation/signature overhead.
-            executor: false,
-        })
-        .saturating_add(recovery_gas);
-        let required = buffered_public_broadcaster_fee(broadcaster_fee_amount(
-            fee_per_unit_gas,
-            gas,
-            public_broadcaster_service_gas_price(min_gas_price),
-        ));
+            .map_err(|error| private_fee_build_error(error, purpose))?;
+        // `budget_gas` is the reviewed execution budget: the executor's calls, its delegation
+        // and signature overhead, and the chain's gas limit buffer. Only the fee payment's
+        // Railgun transaction is priced here, so the quote doesn't depend on the calls.
+        let gas = approximate_public_broadcaster_gas(
+            model,
+            GasEstimateMode::Expected,
+            ApproximateTransactionShape {
+                transaction_count: preview.shape.transaction_count,
+                input_count: preview.shape.input_count,
+                private_output_count: preview.shape.private_output_count,
+                public_output_count: 0,
+                max_receiver_amount: fee,
+                relay_call_count: 0,
+                uses_relay_adapt: false,
+                unwrap_count: 0,
+                executor: false,
+            },
+        )
+        .saturating_add(budget_gas);
+        let required = bounded_private_fee(
+            request.private_sends[0].token_address,
+            broadcaster_fee_amount(
+                fee_per_unit_gas,
+                gas,
+                public_broadcaster_service_gas_price(min_gas_price),
+            ),
+            maximum_private_fee,
+            purpose,
+        )?;
         if fee >= required {
             return Ok((gas, fee));
         }
         fee = required;
     }
     Err(eyre!(
-        "recovery fee estimate did not stabilize; refresh the fee quote"
+        "{} fee estimate did not stabilize; refresh the fee quote",
+        purpose.label()
     ))
 }
 
-fn require_recovery_fee_limit(fee: U256, maximum: U256) -> Result<()> {
+fn bounded_private_fee(
+    fee_token: Address,
+    required: U256,
+    maximum: U256,
+    purpose: PaidExecutionPurpose,
+) -> Result<U256> {
+    // Preserve the amounts for review when the required fee itself exceeds approval.
+    // Optional padding can consume the remaining allowance, but cannot raise it.
+    require_private_fee_limit(fee_token, required, maximum, purpose)?;
+    bounded_public_broadcaster_fee(required, Some(maximum))
+}
+
+fn require_private_fee_limit(
+    fee_token: Address,
+    fee: U256,
+    maximum: U256,
+    purpose: PaidExecutionPurpose,
+) -> Result<()> {
     if fee > maximum {
-        return Err(eyre!(
-            "recovery private fee exceeds the reviewed maximum; review a new fee limit"
-        ));
+        return Err(ExecutorPrivateFeeLimitExceeded {
+            purpose: purpose.label(),
+            fee_token,
+            maximum,
+            required: fee,
+        }
+        .into());
     }
     Ok(())
 }
 
-fn recovery_fee_build_error(error: BuildError) -> eyre::Report {
+fn private_fee_build_error(error: BuildError, purpose: PaidExecutionPurpose) -> eyre::Report {
     if matches!(
         error,
         BuildError::InsufficientBalance(_) | BuildError::InsufficientFeeTokenBalance(_)
     ) {
-        return eyre::Report::new(error).wrap_err("add POI-spendable private funds in the selected fee token, or fund the executor's native gas and review that route");
+        return eyre::Report::new(error).wrap_err(match purpose {
+            PaidExecutionPurpose::Recovery => {
+                "add POI-spendable private funds in the selected fee token, or fund the executor's native gas and review that route"
+            }
+            PaidExecutionPurpose::SwapSetup => {
+                "add POI-spendable private funds in the selected fee token"
+            }
+        });
     }
     error.into()
 }
@@ -525,7 +783,7 @@ mod tests {
         };
         let rate = U256::from(10).pow(U256::from(18));
         let quote = |utxos: &[Utxo], recovery_gas, maximum| {
-            estimate_recovery_fee(
+            estimate_private_fee(
                 &builder,
                 utxos,
                 request.clone(),
@@ -533,6 +791,7 @@ mod tests {
                 rate,
                 maximum,
                 1,
+                PaidExecutionPurpose::Recovery,
             )
             .map(|(_, fee)| fee)
         };
@@ -549,11 +808,37 @@ mod tests {
         let mut preview = request.clone();
         preview.executor = None;
         preview.executor_calls.clear();
-        let (_, preview_fee) =
-            estimate_recovery_fee(&builder, &funded, preview, 300_000, rate, U256::MAX, 1).unwrap();
+        let (gas, preview_fee) = estimate_private_fee(
+            &builder,
+            &funded,
+            preview,
+            300_000,
+            rate,
+            U256::MAX,
+            1,
+            PaidExecutionPurpose::Recovery,
+        )
+        .unwrap();
         assert_eq!(preview_fee, fee);
         assert!(fee > quote(&funded, 0, U256::MAX).unwrap());
         assert_eq!(quote(&funded, 300_000, fee).unwrap(), fee);
-        assert!(quote(&funded, 300_000, fee - U256::ONE).is_err());
+        // Approval headroom must not become part of the private fee payment.
+        let maximum = crate::default_public_broadcaster_fee_limit(fee);
+        assert_eq!(quote(&funded, 300_000, maximum).unwrap(), fee);
+        let required = broadcaster_fee_amount(rate, gas, public_broadcaster_service_gas_price(1));
+        let approved = quote(&funded, 299_000, U256::MAX).unwrap();
+        // A higher execution estimate can consume the earlier quote's cushion.
+        assert!(required < approved && approved < fee);
+        assert_eq!(quote(&funded, 300_000, approved).unwrap(), approved);
+        // The entire cushion is optional, but the unbuffered fee must still fit.
+        assert_eq!(quote(&funded, 300_000, required).unwrap(), required);
+        let maximum = required - U256::ONE;
+        let error = quote(&funded, 300_000, maximum).unwrap_err();
+        let exceeded = error
+            .downcast_ref::<ExecutorPrivateFeeLimitExceeded>()
+            .unwrap();
+        assert_eq!(exceeded.fee_token(), fee_token);
+        assert_eq!(exceeded.maximum(), maximum);
+        assert_eq!(exceeded.required(), required);
     }
 }

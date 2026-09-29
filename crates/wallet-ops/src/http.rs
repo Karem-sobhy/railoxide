@@ -807,6 +807,54 @@ impl HttpContext {
         Ok(generation)
     }
 
+    /// Build an HTTP client for the traffic of one wallet operation, such as one swap.
+    ///
+    /// In built-in Tor mode the operation gets its own loopback SOCKS bridge over an
+    /// `isolated_client()` handle of the shared Arti instance. Arti gives each `TorClient`
+    /// handle its own `IsolationToken`, and streams with different tokens never share a
+    /// circuit. Sync, RPC, broadcaster, and other operations' traffic use other handles, so
+    /// none of it shares circuits with this operation. The client uses the same proxy-only
+    /// builder as the shared client, so a failed bridge fails the request rather than
+    /// bypassing Tor. The bridge stops when the last clone of the returned value is dropped.
+    ///
+    /// Proxy and direct modes can't isolate one operation's traffic. They return the shared
+    /// client and report isolation as unavailable so that callers can disclose it.
+    pub async fn operation_http_client(&self) -> Result<OperationHttpClient> {
+        match self.mode {
+            WalletNetworkMode::Tor => {
+                if self.socks_bridge.is_none() {
+                    return Err(eyre!(
+                        "operation network isolation requires the internal SOCKS bridge"
+                    ));
+                }
+                let arti_client = self
+                    .arti_client()
+                    .ok_or_else(|| eyre!("Tor client is unavailable"))?;
+                let bridge = Arc::new(
+                    ArtiSocksBridge::start(arti_client.isolated_client())
+                        .await
+                        .wrap_err("start operation Arti SOCKS bridge")?,
+                );
+                let proxy_url = Url::parse(&format!("socks5h://{}", bridge.local_addr()))
+                    .wrap_err("build operation Arti SOCKS proxy URL")?;
+                let client =
+                    wallet_reqwest_client_builder(WalletNetworkMode::Tor, Some(&proxy_url))?
+                        .build()
+                        .wrap_err("build operation HTTP client")?;
+                Ok(OperationHttpClient {
+                    client,
+                    isolation: OperationNetworkIsolation::Dedicated,
+                    bridge: Some(bridge),
+                })
+            }
+            WalletNetworkMode::Proxy | WalletNetworkMode::Direct => Ok(OperationHttpClient {
+                client: self.client.clone(),
+                isolation: OperationNetworkIsolation::Unavailable(self.mode),
+                bridge: None,
+            }),
+        }
+    }
+
     #[must_use]
     pub fn gateway_pool(&self) -> GatewayPool {
         self.gateway_pool.clone()
@@ -875,6 +923,69 @@ impl HttpContext {
             socks_bridge: None,
             fail_closed: mode != WalletNetworkMode::Direct,
         }
+    }
+}
+
+/// Whether one wallet operation's traffic is isolated from other wallet traffic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationNetworkIsolation {
+    /// Built-in Tor with circuits dedicated to this operation.
+    Dedicated,
+    /// The network mode can't isolate this operation from other wallet traffic.
+    Unavailable(WalletNetworkMode),
+}
+
+/// HTTP route for one wallet operation, built by [`HttpContext::operation_http_client`].
+///
+/// The `reqwest::Client` stays crate-private: a clone that outlived the operation's bridge
+/// could reach whatever later binds the same loopback port.
+#[derive(Clone)]
+pub struct OperationHttpClient {
+    client: reqwest::Client,
+    isolation: OperationNetworkIsolation,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "keeps the operation bridge running until the last clone drops"
+        )
+    )]
+    bridge: Option<Arc<ArtiSocksBridge>>,
+}
+
+impl OperationHttpClient {
+    #[must_use]
+    pub const fn isolation(&self) -> OperationNetworkIsolation {
+        self.isolation
+    }
+
+    pub(crate) const fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bridge_addr(&self) -> Option<SocketAddr> {
+        self.bridge.as_ref().map(|bridge| bridge.local_addr())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests(
+        client: reqwest::Client,
+        isolation: OperationNetworkIsolation,
+    ) -> Self {
+        Self {
+            client,
+            isolation,
+            bridge: None,
+        }
+    }
+}
+
+impl fmt::Debug for OperationHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OperationHttpClient")
+            .field("isolation", &self.isolation)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2178,6 +2289,117 @@ mod tests {
             .start_new_tor_session()
             .expect_err("Tor sessions require the internal SOCKS bridge");
         assert!(error.to_string().contains("internal SOCKS bridge"));
+    }
+
+    #[tokio::test]
+    async fn operation_isolation_is_unavailable_outside_built_in_tor() {
+        let direct = HttpContext::direct_for_tests()
+            .operation_http_client()
+            .await
+            .expect("direct operation client");
+        assert_eq!(
+            direct.isolation(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct)
+        );
+
+        let proxy = proxy_url();
+        let proxy_context = build_reqwest_context(
+            WalletNetworkMode::Proxy,
+            Some(proxy.clone()),
+            Some(proxy),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("proxy context");
+        let proxied = proxy_context
+            .operation_http_client()
+            .await
+            .expect("proxy operation client");
+        assert_eq!(
+            proxied.isolation(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Proxy)
+        );
+
+        let tor_without_bridge = build_reqwest_context(
+            WalletNetworkMode::Tor,
+            Some(proxy_url()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tor context");
+        assert!(
+            tor_without_bridge.operation_http_client().await.is_err(),
+            "Tor mode without its bridge fails closed"
+        );
+    }
+
+    #[test]
+    fn tor_operations_get_their_own_bridge_on_the_shared_tor_instance() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = test_data_dir("operation-isolation");
+        let arti_dir = data_dir.join(ARTI_DIR);
+        let state_dir = arti_dir.join(ARTI_STATE_DIR);
+        let cache_dir = arti_dir.join(ARTI_CACHE_DIR);
+        std::fs::create_dir_all(&state_dir).expect("create Arti state directory");
+        std::fs::create_dir_all(&cache_dir).expect("create Arti cache directory");
+
+        runtime.block_on(async {
+            let tor_config = TorClientConfigBuilder::from_directories(&state_dir, &cache_dir)
+                .build()
+                .expect("build Arti client config");
+            let arti_client = TorClient::builder()
+                .config(tor_config)
+                .create_unbootstrapped_async()
+                .await
+                .expect("create unbootstrapped Arti client");
+            let shared_bridge = Arc::new(
+                ArtiSocksBridge::start(arti_client.clone())
+                    .await
+                    .expect("start shared Arti SOCKS bridge"),
+            );
+            let shared_addr = shared_bridge.local_addr();
+            let proxy_url =
+                Url::parse(&format!("socks5h://{shared_addr}")).expect("shared bridge URL");
+            let context = build_reqwest_context(
+                WalletNetworkMode::Tor,
+                Some(proxy_url),
+                None,
+                Some(arti_client),
+                Some(state_dir),
+                Some(cache_dir),
+                Some(shared_bridge),
+            )
+            .expect("tor context");
+
+            let first = context
+                .operation_http_client()
+                .await
+                .expect("first operation client");
+            let second = context
+                .operation_http_client()
+                .await
+                .expect("second operation client");
+
+            assert_eq!(first.isolation(), OperationNetworkIsolation::Dedicated);
+            assert_eq!(second.isolation(), OperationNetworkIsolation::Dedicated);
+            let first_addr = first.bridge_addr().expect("first operation bridge");
+            let second_addr = second.bridge_addr().expect("second operation bridge");
+            assert!(first_addr.ip().is_loopback());
+            assert_ne!(first_addr, shared_addr);
+            assert_ne!(second_addr, shared_addr);
+            assert_ne!(first_addr, second_addr);
+            // Operation isolation leaves the shared sync, RPC, and broadcaster session alone.
+            assert_eq!(context.tor_session_generation(), 1);
+        });
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

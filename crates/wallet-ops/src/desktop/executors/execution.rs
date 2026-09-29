@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::eips::eip7702::Authorization;
@@ -102,6 +104,11 @@ impl PreparedExecutorOperation {
         &self.delivery
     }
 
+    /// A retained executor's recovery, including a swap's early cancellation.
+    pub(crate) const fn is_recovery(&self) -> bool {
+        self.recovery.is_some()
+    }
+
     pub(crate) fn require_broadcaster(&self, candidate: &PublicBroadcasterCandidate) -> Result<()> {
         let ExecutorDelivery::PublicBroadcaster(prepared) = &self.delivery else {
             return Err(eyre!("executor preparation selected another funding route"));
@@ -128,6 +135,56 @@ pub struct IssuedExecutorTransaction {
     operation: ExecutorOperationId,
     payload_hash: B256,
     transaction: TransactionRequest,
+}
+
+/// Chain evidence that one paid fee-convergence loop reuses to sign repriced
+/// variants of its own payload. The loop owns this value and drops it before
+/// broadcaster submission, on error, and on exhaustion, so it never outlives
+/// one signing approval.
+///
+/// Reuse is safe because every variant signs the same execution nonce, so at
+/// most one of them can execute. A fresh read would only notice a third party
+/// executing an exposed variant a few seconds earlier. Persistence, input
+/// reservations, authorization, and the durable nonce observation are
+/// unchanged. The context holds no signing material.
+#[derive(Default)]
+pub(crate) struct IssueRetry {
+    seed: Option<IssueRetrySeed>,
+}
+
+struct IssueRetrySeed {
+    operation: ExecutorOperationId,
+    execution_nonce: U256,
+    /// The unused-account inspection behind the first payload, including its
+    /// nonce observation.
+    checked: Arc<super::spare::CheckedExecutor>,
+    /// Every payload this context issued. Any other payload blocks reuse.
+    issued: BTreeSet<B256>,
+}
+
+impl IssueRetry {
+    /// Returns the saved inspection only while the durable record shows nothing
+    /// but this context's own unsent payloads under the same observation. History
+    /// reconciliation can replace that observation without an unused-cache change.
+    fn reusable(
+        &self,
+        prepared: &PreparedExecutorOperation,
+        record: &crate::vault::ExecutorRecord,
+    ) -> Option<Arc<super::spare::CheckedExecutor>> {
+        let seed = self.seed.as_ref()?;
+        (prepared.recovery.is_none()
+            && record.recovery_transactions().is_empty()
+            && seed.operation == prepared.operation
+            && seed.execution_nonce == prepared.context.execution_nonce
+            && record.issued().iter().all(|payload| {
+                seed.issued.contains(&payload.hash())
+                    && payload.transaction_hashes().is_empty()
+                    && payload.inclusion().is_none()
+            })
+            && seed.checked.ensure_valid().is_ok()
+            && record.nonce_observation() == Some(seed.checked.observed))
+        .then(|| Arc::clone(&seed.checked))
+    }
 }
 
 fn require_unfinished_operation(record: &crate::vault::ExecutorRecord) -> Result<()> {
@@ -434,6 +491,32 @@ impl ExecutorOwner {
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
     ) -> Result<IssuedExecutorTransaction> {
+        self.issue_operation_with(prepared, call, inputs, authorization, None)
+            .await
+    }
+
+    /// Issue one round of a paid fee-convergence loop. `retry` belongs to that
+    /// loop; see [`IssueRetry`] for when a repriced round skips the chain reads.
+    pub(crate) async fn issue_operation_retrying(
+        &self,
+        prepared: &PreparedExecutorOperation,
+        call: &TransactionCall,
+        inputs: &[Utxo],
+        authorization: &crate::DesktopPrivateSpendAuthorization,
+        retry: &mut IssueRetry,
+    ) -> Result<IssuedExecutorTransaction> {
+        self.issue_operation_with(prepared, call, inputs, authorization, Some(retry))
+            .await
+    }
+
+    async fn issue_operation_with(
+        &self,
+        prepared: &PreparedExecutorOperation,
+        call: &TransactionCall,
+        inputs: &[Utxo],
+        authorization: &crate::DesktopPrivateSpendAuthorization,
+        mut retry: Option<&mut IssueRetry>,
+    ) -> Result<IssuedExecutorTransaction> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
@@ -503,10 +586,23 @@ impl ExecutorOwner {
                 "private inputs are reserved by another executor operation"
             ));
         }
-        let checked = if prepared.recovery.is_none()
+        let initially_unissued = prepared.recovery.is_none()
             && record.issued().is_empty()
-            && record.recovery_transactions().is_empty()
-        {
+            && record.recovery_transactions().is_empty();
+        let reused = match retry.as_deref_mut() {
+            Some(retry) if !initially_unissued => {
+                let reused = retry.reusable(prepared, &record);
+                if reused.is_none() {
+                    // Once this loop needs fresh evidence, later rounds need it too.
+                    retry.seed = None;
+                }
+                reused
+            }
+            _ => None,
+        };
+        let checked = if let Some(checked) = &reused {
+            Arc::clone(checked)
+        } else if initially_unissued {
             self.unused_inspection(
                 record.index(),
                 prepared.context.executor,
@@ -515,7 +611,9 @@ impl ExecutorOwner {
             .await?
         } else {
             let (inspection, observed) = if let Some(recovery) = &prepared.recovery {
-                self.while_active(
+                // Keep this larger branch out of the setup/signing future, including
+                // operations that never take the recovery path.
+                self.while_active(Box::pin(
                     crate::desktop::executor_discovery::inspect_for_recovery_batch(
                         &chain,
                         &self.http,
@@ -523,7 +621,7 @@ impl ExecutorOwner {
                         &[recovery.asset()],
                         recovery.replacement_nonce(),
                     ),
-                )
+                ))
                 .await?
             } else {
                 self.while_active(inspect_for_signing(
@@ -548,9 +646,7 @@ impl ExecutorOwner {
                 "executor nonce changed; rebuild the approved operation"
             ));
         }
-        if prepared.recovery.is_none()
-            && record.issued().is_empty()
-            && record.recovery_transactions().is_empty()
+        if initially_unissued
             && (inspection.activity() != ExecutorActivity::NoObservedActivity
                 || !observed.nonce().is_zero())
         {
@@ -571,32 +667,31 @@ impl ExecutorOwner {
         }
         // Recheck known inclusions even when the latest page does not cover all
         // issued history. Unknown older winners keep future-nonce signing blocked.
-        self.reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?
-            .remove(&prepared.operation);
-        self.store.invalidate_observation(prepared.operation)?;
-        let history = self
-            .while_active(
-                crate::desktop::executor_observation::observe_executor_history(
-                    &chain,
-                    &self.http,
-                    &record,
-                    observed.block().number..observed.block().number + 1,
-                    Some(observed),
-                ),
-            )
-            .await?;
-        if history.nonce != Some(observed) {
-            return Err(eyre!(
-                "executor chain observation changed; retry preparation"
-            ));
-        }
-        let reconciled = self
-            .store
-            .reconcile(prepared.operation, observed, &history.inclusions)?;
-        if prepared.recovery.is_none() {
-            require_unfinished_operation(&reconciled)?;
+        // A reused round keeps the durable observation its evidence matched.
+        if reused.is_none() {
+            self.store.invalidate_observation(prepared.operation)?;
+            let history = self
+                .while_active(
+                    crate::desktop::executor_observation::observe_executor_history(
+                        &self.endpoints,
+                        &chain,
+                        &record,
+                        observed.block().number..observed.block().number + 1,
+                        Some(observed),
+                    ),
+                )
+                .await?;
+            if history.nonce != Some(observed) {
+                return Err(eyre!(
+                    "executor chain observation changed; retry preparation"
+                ));
+            }
+            let reconciled =
+                self.store
+                    .reconcile(prepared.operation, observed, &history.inclusions)?;
+            if prepared.recovery.is_none() {
+                require_unfinished_operation(&reconciled)?;
+            }
         }
         let action = if let Some(recovery) = &prepared.recovery {
             self.recovery_authorization_action(authorization, recovery)?
@@ -668,6 +763,20 @@ impl ExecutorOwner {
             .lock()
             .map_err(|_| eyre!("executor preparation is unavailable"))?
             .remove(record.index());
+        if let Some(retry) = retry {
+            if initially_unissued {
+                retry.seed = Some(IssueRetrySeed {
+                    operation: prepared.operation,
+                    execution_nonce: prepared.context.execution_nonce,
+                    checked: Arc::clone(&checked),
+                    issued: BTreeSet::from([hash]),
+                });
+            } else if reused.is_some()
+                && let Some(seed) = &mut retry.seed
+            {
+                seed.issued.insert(hash);
+            }
+        }
         self.ensure_active()?;
         self.notify_change();
         Ok(IssuedExecutorTransaction {

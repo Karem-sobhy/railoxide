@@ -8,8 +8,10 @@ use zeroize::Zeroizing;
 mod public_account;
 mod recovery;
 mod spare;
+mod swap;
 pub use recovery::*;
 pub(crate) use spare::ExecutorSpare;
+pub use swap::*;
 
 use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, RecordKind, VaultError,
@@ -53,6 +55,8 @@ pub enum ExecutorStoreError {
     OutstandingNonce,
     #[error("private inputs are reserved by another executor operation")]
     InputReserved,
+    #[error("a previous swap attempt's pre-hook can still execute")]
+    SwapAttemptOutstanding,
 }
 
 /// Stable native operation identity, retained across retries and presentation cleanup.
@@ -75,7 +79,12 @@ impl ExecutorOperationId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutorPayloadPurpose {
     Operation,
+    /// Also covers swap cancellation, which is recovery with no assets.
     Recovery,
+    /// A swap order's pre-hook at the current nonce, recorded only with its order.
+    SwapPreHook,
+    /// A swap order's post-hook at the pre-hook's nonce plus one.
+    SwapPostHook,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +204,9 @@ impl ExecutorPayloadContext {
         self
     }
 
-    pub(crate) const fn history_start(&self) -> u64 {
+    /// First block a canonical scan must cover to find this payload's inclusion.
+    #[must_use]
+    pub const fn history_start(&self) -> u64 {
         match self.history_start {
             Some(block) => block,
             None => self.observed.block().number,
@@ -239,6 +250,9 @@ impl ExecutorPayloadInclusion {
     pub(crate) const fn with_executor_account_nonce(mut self, nonce: Option<u64>) -> Self {
         self.executor_account_nonce = nonce;
         self
+    }
+    pub(crate) const fn executor_account_nonce(self) -> Option<u64> {
+        self.executor_account_nonce
     }
     #[must_use]
     pub const fn block(self) -> BlockNumHash {
@@ -408,22 +422,52 @@ pub struct ExecutorRecord {
     recovery_observation: Option<BlockNumHash>,
     #[serde(default)]
     public_account_uuid: Option<String>,
+    #[serde(default)]
+    swap: Option<SwapOperationRecord>,
+    #[serde(default)]
+    swap_approval: Option<SwapApproval>,
+    #[serde(default)]
+    swap_setup_stopped: bool,
+    /// Issued payloads the user released from input reservation. Their signatures
+    /// remain valid; only the wallet's own spending of their inputs changes.
+    #[serde(default)]
+    released_payloads: Vec<B256>,
 }
 
 impl ExecutorRecord {
     /// Ordinary Public signing requires a freshly reconciled record. A reverted
     /// executor call still has a replayable execution signature; an ordinary
-    /// recovery transaction consumes its account nonce even when it reverts.
+    /// recovery transaction consumes its account nonce even when it reverts. A swap
+    /// hook never gets a direct-call status, so it resolves once the reconciled nonce
+    /// passes its own.
     #[must_use]
     pub fn has_unresolved_issued_work(&self) -> bool {
+        self.unresolved_issued_work(Self::payload_status, Self::recovery_transaction_status)
+    }
+
+    /// [`Self::has_unresolved_issued_work`] from the last recorded outcomes, which a restart
+    /// keeps. For local presentation only; it does not establish signing eligibility.
+    #[must_use]
+    pub fn has_recorded_unresolved_issued_work(&self) -> bool {
+        self.unresolved_issued_work(
+            Self::recorded_payload_status,
+            Self::recorded_recovery_transaction_status,
+        )
+    }
+
+    fn unresolved_issued_work(
+        &self,
+        payload_status: impl Fn(&Self, B256) -> Option<ExecutorPayloadStatus>,
+        recovery_status: impl Fn(&Self, B256) -> Option<ExecutorPayloadStatus>,
+    ) -> bool {
         self.issued().iter().any(|payload| {
             !matches!(
-                self.payload_status(payload.hash()),
+                payload_status(self, payload.hash()),
                 Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
-            )
+            ) && !self.swap_hook_nonce_passed(payload)
         }) || self.recovery_transactions().iter().any(|transaction| {
             !matches!(
-                self.recovery_transaction_status(transaction.hash()),
+                recovery_status(self, transaction.hash()),
                 Some(
                     ExecutorPayloadStatus::Executed
                         | ExecutorPayloadStatus::Reverted
@@ -556,15 +600,13 @@ impl ExecutorRecord {
 
     /// A reverted attempt does not revoke its signed payload or free its private inputs.
     /// Keep the winning payload's spent inputs protected while private sync catches up;
-    /// only a losing, invalidated payload releases its otherwise unspent inputs.
+    /// only a losing, invalidated payload releases its otherwise unspent inputs. A swap
+    /// pre-hook runs inside a settlement, so its inputs follow the order's observations,
+    /// and a payload that lost its nonce to that pre-hook is released the same way. A
+    /// payload the user explicitly released no longer reserves its inputs.
     #[must_use]
     pub fn reserved_inputs(&self) -> Vec<ExecutorInputIdentity> {
-        self.issued
-            .iter()
-            .filter(|payload| {
-                self.winner(payload.nonce)
-                    .is_none_or(|winner| winner == payload.hash)
-            })
+        self.reserving_payloads()
             .flat_map(|payload| payload.context.inputs.iter().cloned())
             .fold(Vec::new(), |mut inputs, input| {
                 if !inputs.contains(&input) {
@@ -572,6 +614,31 @@ impl ExecutorRecord {
                 }
                 inputs
             })
+    }
+
+    /// Issued payloads whose inputs [`Self::reserved_inputs`] reserves. A payload the
+    /// user released reserves again once the wallet issues or sends it again.
+    pub fn reserving_payloads(&self) -> impl Iterator<Item = &IssuedExecutorPayload> {
+        self.reserving_payloads_before_release()
+            .filter(|payload| !self.released_payloads.contains(&payload.hash))
+    }
+
+    /// Whether any payload would reserve inputs if the user had released none. A
+    /// release frees notes for other operations; it does not resolve this account.
+    pub(crate) fn reserves_inputs_before_release(&self) -> bool {
+        self.reserving_payloads_before_release()
+            .any(|payload| !payload.context.inputs.is_empty())
+    }
+
+    fn reserving_payloads_before_release(&self) -> impl Iterator<Item = &IssuedExecutorPayload> {
+        self.issued.iter().filter(|payload| {
+            if payload.purpose == ExecutorPayloadPurpose::SwapPreHook {
+                return !self.releases_swap_inputs(payload.hash);
+            }
+            self.winner(payload.nonce)
+                .is_none_or(|winner| winner == payload.hash)
+                && !self.swap_pre_hook_took_nonce(payload.nonce)
+        })
     }
 }
 
@@ -736,6 +803,10 @@ impl ExecutorStore {
             recovery_transactions: Vec::new(),
             recovery_observation: None,
             public_account_uuid: None,
+            swap: None,
+            swap_approval: None,
+            swap_setup_stopped: false,
+            released_payloads: Vec::new(),
         };
         updates.extend([
             self.seal(
@@ -839,6 +910,10 @@ impl ExecutorStore {
             recovery_transactions: Vec::new(),
             recovery_observation: None,
             public_account_uuid: None,
+            swap: None,
+            swap_approval: None,
+            swap_setup_stopped: false,
+            released_payloads: Vec::new(),
         };
         updates.extend([
             self.seal(
@@ -917,8 +992,13 @@ impl ExecutorStore {
             if record.address.is_none() || payload.delegate != record.delegate {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
-            if record.public_account_uuid.is_some()
+            // Swap hooks are recorded only together with their order.
+            if (record.public_account_uuid.is_some() || record.swap_setup_stopped)
                 && payload.purpose == ExecutorPayloadPurpose::Operation
+                || matches!(
+                    payload.purpose,
+                    ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook
+                )
             {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
@@ -931,6 +1011,15 @@ impl ExecutorStore {
                         .iter()
                         .any(|input| payload.context.inputs.contains(input))
             }) {
+                return Err(ExecutorStoreError::InputReserved);
+            }
+            // Recovery, including early cancellation, competes with this swap's own pre-hook.
+            if payload.purpose == ExecutorPayloadPurpose::Recovery
+                && record
+                    .swap_reserved_inputs()
+                    .iter()
+                    .any(|input| payload.context.inputs.contains(input))
+            {
                 return Err(ExecutorStoreError::InputReserved);
             }
             if record.nonce_observation != Some(payload.context.observed)
@@ -956,6 +1045,10 @@ impl ExecutorStore {
                 {
                     return Err(ExecutorStoreError::OperationMismatch);
                 }
+                // Recording a released payload again means it is being sent again.
+                record
+                    .released_payloads
+                    .retain(|hash| *hash != payload.hash);
             } else {
                 if payload.purpose == ExecutorPayloadPurpose::Recovery {
                     record.retired = true;
@@ -1030,8 +1123,8 @@ impl ExecutorStore {
         })
     }
 
-    /// Require fresh evidence before relying on persisted outcomes after restart,
-    /// an unavailable chain read, or a new reconciliation attempt.
+    /// Require fresh evidence for a new reconciliation attempt or after an unavailable
+    /// chain read. Restart alone retains the confirmed observation.
     pub fn invalidate_observation(
         &self,
         operation: ExecutorOperationId,
@@ -1042,6 +1135,61 @@ impl ExecutorStore {
         })
     }
 
+    /// The user's explicit release of issued payloads' input reservations. The signed
+    /// payloads can still execute; whichever transaction spends the notes first wins.
+    /// Payloads the wallet issues or sends again afterwards reserve their inputs again.
+    pub(crate) fn release_payloads(
+        &self,
+        operation: ExecutorOperationId,
+        payloads: &[B256],
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            for hash in payloads {
+                if !record.issued.iter().any(|payload| payload.hash == *hash) {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
+                if !record.released_payloads.contains(hash) {
+                    record.released_payloads.push(*hash);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The wallet is sending a released payload again, so it reserves its inputs again.
+    /// Refused while another operation reserves any of those inputs.
+    pub(crate) fn reserve_released(
+        &self,
+        operation: ExecutorOperationId,
+        payload: B256,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let inputs = record
+                .issued
+                .iter()
+                .find(|issued| issued.hash == payload)
+                .map(|issued| issued.context.inputs.clone())
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if !record.released_payloads.contains(&payload) {
+                return Ok(());
+            }
+            // Same predicate as `record_issued`, under the same record mutation lock.
+            if self.records()?.iter().any(|other| {
+                other.operation != operation
+                    && other
+                        .reserved_inputs()
+                        .iter()
+                        .any(|input| inputs.contains(input))
+            }) {
+                return Err(ExecutorStoreError::InputReserved);
+            }
+            record.released_payloads.retain(|hash| *hash != payload);
+            Ok(())
+        })
+    }
+
+    /// A send by this wallet reserves the payload's inputs again, even when another
+    /// operation selected them after the release.
     pub fn record_submission(
         &self,
         operation: ExecutorOperationId,
@@ -1057,6 +1205,9 @@ impl ExecutorStore {
             if !payload.transaction_hashes.contains(&transaction_hash) {
                 payload.transaction_hashes.push(transaction_hash);
             }
+            record
+                .released_payloads
+                .retain(|hash| *hash != payload_hash);
             Ok(())
         })
     }

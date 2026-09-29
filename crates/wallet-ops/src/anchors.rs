@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -27,9 +28,15 @@ use crate::settings::{
 };
 use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
 
+mod fresh;
 mod native_usd;
 mod uniswap_v3_twap;
 
+pub use fresh::{
+    AnchorBlock, AnchorBlocked, AnchorObservation, AnchorReadFailure, FreshAnchorParams,
+    FreshPairAnchor, PairAnchorRate, QuoteDeviationError, check_quote_against_anchor,
+    read_fresh_pair_anchor,
+};
 pub use native_usd::probe_native_usd_quote;
 
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
@@ -43,6 +50,7 @@ const TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 sol! {
     interface AggregatorInterface {
         function latestAnswer() external view returns (int256);
+        function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
         function decimals() external view returns (uint8);
     }
     interface UniswapV3PoolInterface {
@@ -247,6 +255,50 @@ impl TokenAnchorRateCache {
             .read()
             .ok()
             .and_then(|rates| rates.get(&TokenAnchorKey::new(chain_id, token)).copied())
+    }
+
+    /// Uses background rates for swap quote and signing checks without a network read.
+    /// A missing configured rate returns its read failure; absent configuration returns `None`.
+    pub(crate) fn cached_pair_rate(
+        &self,
+        chain_id: u64,
+        sell_token: Address,
+        buy_token: Address,
+        token_registry: &EffectiveTokenRegistry,
+    ) -> Result<Option<PairAnchorRate>, AnchorBlocked> {
+        let entries = token_anchor_entries_for_chains(&[chain_id], token_registry);
+        let sources_for = |token| {
+            entries
+                .iter()
+                .find(|entry| entry.token == token)
+                .map(|entry| entry.anchor_sources.as_slice())
+                .filter(|sources| !sources.is_empty())
+        };
+        let (Some(sell_sources), Some(buy_sources)) =
+            (sources_for(sell_token), sources_for(buy_token))
+        else {
+            return Ok(None);
+        };
+        let rate_for = |token, sources: &[RuntimeTokenAnchorSource]| {
+            self.cached_rate(chain_id, token)
+                .or_else(|| {
+                    // Fixed sources need no background read, including user-configured ones.
+                    average_non_outlier_anchor_rates(&anchor_rates_from_sources_with_inputs(
+                        chain_id,
+                        sources,
+                        &BTreeMap::new(),
+                        &TwapFetchedInputs::default(),
+                    ))
+                })
+                .ok_or_else(|| AnchorBlocked {
+                    token,
+                    failures: vec![AnchorReadFailure::NoRate],
+                })
+        };
+        Ok(Some(PairAnchorRate {
+            sell_rate: rate_for(sell_token, sell_sources)?,
+            buy_rate: rate_for(buy_token, buy_sources)?,
+        }))
     }
 
     pub fn store_rate(&self, chain_id: u64, token: Address, rate: U256) {
@@ -938,6 +990,27 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(request_timeout)
         .with_attempt_timeout(Duration::from_secs(5));
+    fetch_twap_inputs_at(
+        http,
+        &route,
+        BlockId::latest(),
+        WalletRpcOrigin::Anchors,
+        pools,
+        observations,
+    )
+    .await
+}
+
+/// Reads pool metadata and observations at `block`. Pools or observations that fail to read or
+/// decode are omitted from the result.
+async fn fetch_twap_inputs_at(
+    http: &HttpContext,
+    route: &RpcRoute,
+    block: BlockId,
+    origin: WalletRpcOrigin,
+    pools: &[PoolKey],
+    observations: &[ObservationKey],
+) -> Result<TwapFetchedInputs> {
     let metadata_calls = pools
         .iter()
         .flat_map(|pool| {
@@ -966,16 +1039,20 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
             )
         })
         .collect();
-    let metadata_results = rpc_broker_values::<UniswapV3PoolInterface::token0Call>(
+    let metadata_results = rpc_broker_values_at::<UniswapV3PoolInterface::token0Call>(
         http,
-        &route,
+        route,
+        block,
+        origin,
         metadata_calls,
         "anchors::uniswap_v3_twap.metadata",
     )
     .await?;
-    let observation_results = rpc_broker_values::<UniswapV3PoolInterface::observeCall>(
+    let observation_results = rpc_broker_values_at::<UniswapV3PoolInterface::observeCall>(
         http,
-        &route,
+        route,
+        block,
+        origin,
         observation_calls,
         "anchors::uniswap_v3_twap.observations",
     )
@@ -1022,9 +1099,28 @@ async fn rpc_broker_values<C: SolCall + 'static>(
     calls: Vec<(Address, Bytes)>,
     caller: &'static str,
 ) -> Result<Vec<std::result::Result<C::Return, RpcBrokerError>>> {
+    rpc_broker_values_at::<C>(
+        http,
+        route,
+        BlockId::latest(),
+        WalletRpcOrigin::Anchors,
+        calls,
+        caller,
+    )
+    .await
+}
+
+async fn rpc_broker_values_at<C: SolCall + 'static>(
+    http: &HttpContext,
+    route: &RpcRoute,
+    block: BlockId,
+    origin: WalletRpcOrigin,
+    calls: Vec<(Address, Bytes)>,
+    caller: &'static str,
+) -> Result<Vec<std::result::Result<C::Return, RpcBrokerError>>> {
     let results = http
         .rpc_broker()
-        .submit_calls_decoded_as::<C>(route.clone(), calls, WalletRpcOrigin::Anchors.into())
+        .submit_calls_decoded_at::<C>(route.clone(), calls, block, origin.into())
         .await?;
     if let Some(error) = total_failure(&results) {
         return Err(eyre::eyre!("{caller} RPC request failed: {error}"));
@@ -1551,6 +1647,39 @@ mod tests {
         let rates = [uint!(100_U256), uint!(1_000_U256)];
 
         assert_eq!(average_non_outlier_anchor_rates(&rates), None);
+    }
+
+    #[test]
+    fn cached_pair_requires_configured_rates_and_uses_fixed_sources_without_a_read() {
+        let cache = TokenAnchorRateCache::new();
+        let tokens = crate::settings::build_effective_token_registry(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap();
+        let weth = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        assert_eq!(
+            cache.cached_pair_rate(1, weth, usdc, &tokens),
+            Err(AnchorBlocked {
+                token: usdc,
+                failures: vec![AnchorReadFailure::NoRate]
+            }),
+        );
+        cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+        assert_eq!(
+            cache.cached_pair_rate(1, weth, usdc, &tokens),
+            Ok(Some(PairAnchorRate {
+                sell_rate: WRAPPED_NATIVE_FEE_RATE,
+                buy_rate: uint!(3_000_000_000_U256)
+            })),
+        );
+        let unconfigured = EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        assert_eq!(
+            cache.cached_pair_rate(1, weth, usdc, &unconfigured),
+            Ok(None)
+        );
     }
 
     #[test]

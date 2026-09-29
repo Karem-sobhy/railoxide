@@ -1,4 +1,5 @@
 use super::helpers::*;
+use railgun_wallet::tx::GasEstimateMode;
 
 #[test]
 fn self_broadcast_top_up_preflight_message_explains_current_gas_requirement() {
@@ -217,14 +218,12 @@ fn executor_unshield_estimate_includes_delegation_and_chain_buffer_before_alloca
     let token = address(0x42);
     let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
     let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
-    let gas = crate::settings::EffectiveChainGasSettings {
-        gas_limit_buffer: 30_000,
-        gas_price_buffer_numerator: 1,
-        gas_price_buffer_denominator: 1,
-    };
-    let estimate = |executor_gas| {
+    let gas_limit_buffer = 30_000;
+    let estimate_on = |chain_id, executor, gas_limit_buffer| {
         crate::estimate_desktop_unshield_self_broadcast_cost(
-            executor_gas,
+            chain_id,
+            gas_limit_buffer,
+            executor,
             &utxos,
             token,
             U256::from(1_000),
@@ -237,22 +236,59 @@ fn executor_unshield_estimate_includes_delegation_and_chain_buffer_before_alloca
         )
         .unwrap()
     };
-    let legacy = estimate(None);
-    let executor = estimate(Some(&gas));
-    let without_buffer = estimate(Some(&crate::settings::EffectiveChainGasSettings {
-        gas_limit_buffer: 0,
-        ..gas
-    }));
-    assert!(without_buffer.gas_limit > legacy.gas_limit);
+    let estimate = |executor, gas_limit_buffer| estimate_on(1, executor, gas_limit_buffer);
+    let selection =
+        railgun_wallet::tx::unshield_selection_info(&utxos, token, U256::from(1_000), false)
+            .unwrap();
+    let shape = unshield_approximate_shape(&selection, selection.max_spendable, true);
+    let gas = |chain_id, mode, executor| {
+        approximate_public_broadcaster_gas(
+            railgun_wallet::tx::RailgunGasModel::for_chain(chain_id),
+            mode,
+            shape.with_executor(executor),
+        )
+    };
+    let legacy = estimate(false, gas_limit_buffer);
+    let executor = estimate(true, gas_limit_buffer);
+    let without_buffer = estimate(true, 0);
+    assert!(executor.gas_limit > legacy.gas_limit);
     assert_eq!(
         executor.gas_limit,
-        without_buffer.gas_limit + gas.gas_limit_buffer
+        without_buffer.gas_limit + gas_limit_buffer
+    );
+    // The executor quote is the approved ceiling; the direct quote stays a fee preview.
+    assert_eq!(
+        executor.gas_limit,
+        gas(1, GasEstimateMode::UpperBound, true) + gas_limit_buffer
+    );
+    assert_eq!(
+        legacy.gas_limit,
+        gas(1, GasEstimateMode::Expected, false) + gas_limit_buffer
+    );
+    assert!(executor.gas_cost.expected_cost < executor.gas_cost.maximum_cost);
+    assert_eq!(
+        executor.gas_cost.expected_cost,
+        U256::from(gas(1, GasEstimateMode::Expected, true) + gas_limit_buffer)
+            * U256::from(executor.gas_cost.expected_fee_per_gas)
     );
     assert_eq!(
         executor.gas_cost.maximum_cost,
         U256::from(executor.gas_limit) * U256::from(120)
     );
     assert_eq!(executor.protocol_fees, legacy.protocol_fees);
+
+    // Arbitrum One's ceiling also reserves L1 data gas; its direct quote doesn't.
+    let arbitrum_upper_bound = gas(42161, GasEstimateMode::UpperBound, true);
+    assert_eq!(
+        estimate_on(42161, true, gas_limit_buffer).gas_limit,
+        arbitrum_upper_bound
+            + gas_limit_buffer
+            + crate::arbitrum_data_gas_allowance(42161, arbitrum_upper_bound)
+    );
+    assert_eq!(
+        estimate_on(42161, false, gas_limit_buffer).gas_limit,
+        gas(42161, GasEstimateMode::Expected, false) + gas_limit_buffer
+    );
 }
 
 #[test]
@@ -268,6 +304,8 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
     };
 
     let send = crate::estimate_desktop_send_self_broadcast_cost(
+        1,
+        crate::GAS_LIMIT_BUFFER,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -277,7 +315,9 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
     )
     .expect("send estimate");
     let unshield = crate::estimate_desktop_unshield_self_broadcast_cost(
-        None,
+        1,
+        crate::GAS_LIMIT_BUFFER,
+        false,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -325,7 +365,9 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     ];
 
     let separate_tokens = crate::estimate_desktop_unshield_self_broadcast_cost(
-        None,
+        1,
+        crate::GAS_LIMIT_BUFFER,
+        false,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -362,7 +404,9 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
         native_amount,
     );
     let combined = crate::estimate_desktop_unshield_self_broadcast_cost(
-        None,
+        1,
+        crate::GAS_LIMIT_BUFFER,
+        false,
         &wrapped_utxos,
         wrapped_native,
         entered_amount,

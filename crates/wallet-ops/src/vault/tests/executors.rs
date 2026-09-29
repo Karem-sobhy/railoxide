@@ -6,6 +6,7 @@ use railgun_wallet::{Utxo, UtxoCommitmentKind, UtxoSource};
 
 mod public_account;
 mod spare;
+mod swap;
 
 fn namespace(
     store: &DesktopVaultStore,
@@ -33,6 +34,11 @@ fn executor_records_saved_before_display_metadata_remain_readable() {
         retired: bool,
         issued: Vec<IssuedExecutorPayload>,
     }
+    #[derive(serde::Serialize)]
+    enum EarlierPurpose {
+        Operation,
+        Recovery,
+    }
     let earlier = EarlierRecord {
         version: 1,
         derivation: ExecutorDerivationScheme::Railgun7702V1,
@@ -53,6 +59,21 @@ fn executor_records_saved_before_display_metadata_remain_readable() {
     assert!(!record.is_hidden());
     assert!(record.created_at().is_none() && record.restored_at().is_none());
     assert!(record.purpose_summary().is_none() && record.assets().is_empty());
+    assert!(record.swap().is_none() && record.swap_approval().is_none());
+    assert!(!record.is_swap_setup_stopped());
+    // Payload purposes persisted before swap hooks keep decoding unchanged.
+    for (legacy, purpose) in [
+        (EarlierPurpose::Operation, ExecutorPayloadPurpose::Operation),
+        (EarlierPurpose::Recovery, ExecutorPayloadPurpose::Recovery),
+    ] {
+        assert_eq!(
+            rmp_serde::from_slice::<ExecutorPayloadPurpose>(
+                &rmp_serde::to_vec_named(&legacy).unwrap()
+            )
+            .unwrap(),
+            purpose
+        );
+    }
     assert_eq!(
         rmp_serde::from_slice::<ExecutorRecord>(&rmp_serde::to_vec_named(&record).unwrap(),)
             .unwrap(),
@@ -807,7 +828,11 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
         crate::HttpContext::direct_for_tests(),
     )
     .unwrap();
-    assert!(cold_owner.available_inputs(vec![input]).unwrap().is_empty());
+    assert_eq!(
+        cold_owner.available_inputs(vec![input]).unwrap().len(),
+        1,
+        "a confirmed losing payload must not reserve its notes again after restart"
+    );
     drop(cold_owner);
 
     // A reorg reopens pending state, and a subsequently observed original is
@@ -874,6 +899,147 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
         record.issued()[0].inclusion()
     );
     assert_eq!(stale.reserved_inputs(), inputs);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn released_executor_inputs_stay_spendable_until_a_later_payload_reserves_them() {
+    use crate::{ExecutorInputLockReason, ExecutorOwner, HttpContext};
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let namespace = namespace(&vault, &view, 1);
+    let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let delegate = Address::repeat_byte(1);
+    store.reserve(operation, delegate, None, &[]).unwrap();
+    store
+        .bind_address(operation, Address::repeat_byte(3))
+        .unwrap();
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
+        2,
+        3,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::from(3));
+    let issue = |hash: u8| {
+        store.reconcile(operation, observed, &[]).unwrap();
+        store
+            .record_issued(
+                operation,
+                IssuedExecutorPayload::new(
+                    U256::from(3),
+                    delegate,
+                    B256::repeat_byte(hash),
+                    ExecutorPayloadPurpose::Operation,
+                    ExecutorPayloadContext::new(
+                        Bytes::from(vec![hash]),
+                        observed,
+                        vec![ExecutorInputIdentity::from_utxo(&input)],
+                    ),
+                ),
+            )
+            .unwrap();
+    };
+    let chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+    let owner = |generation| {
+        ExecutorOwner::new(
+            generation,
+            db.clone(),
+            view.clone(),
+            chain.clone(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap()
+    };
+    issue(4);
+
+    // A saved nonce observation cannot resolve a never-included payload, even after restart.
+    let restarted = owner(0);
+    assert!(
+        restarted
+            .available_inputs(vec![input.clone()])
+            .unwrap()
+            .is_empty()
+    );
+    let locks = restarted.input_locks(std::slice::from_ref(&input)).unwrap();
+    assert_eq!(locks.len(), 1);
+    assert_eq!(locks[0].operation(), operation);
+    assert_eq!(
+        locks[0].reason(),
+        ExecutorInputLockReason::SignedNotConfirmed
+    );
+    assert_eq!(locks[0].notes().count(), 1);
+    restarted.release_input_lock(operation).unwrap();
+    assert_eq!(
+        restarted
+            .available_inputs(vec![input.clone()])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        restarted
+            .input_locks(std::slice::from_ref(&input))
+            .unwrap()
+            .is_empty()
+    );
+    drop(restarted);
+
+    // The release is durable.
+    let reloaded = owner(1);
+    assert_eq!(
+        reloaded
+            .available_inputs(vec![input.clone()])
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(reloaded);
+
+    // Sending the released payload again reserves its note again.
+    store
+        .record_submission(operation, B256::repeat_byte(4), B256::repeat_byte(40))
+        .unwrap();
+    let resent = owner(2);
+    assert!(
+        resent
+            .available_inputs(vec![input.clone()])
+            .unwrap()
+            .is_empty()
+    );
+    resent.release_input_lock(operation).unwrap();
+    assert_eq!(
+        resent.available_inputs(vec![input.clone()]).unwrap().len(),
+        1
+    );
+    drop(resent);
+
+    // A payload issued after the release reserves the note again.
+    issue(5);
+    let reissued = owner(3);
+    assert!(reissued.available_inputs(vec![input]).unwrap().is_empty());
+    drop(reissued);
     drop(store);
     drop(view);
     drop(vault);

@@ -89,7 +89,8 @@ impl EvmPreset {
                 native_usd_oracle: Some(address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0")),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_secs(1),
-                finality_depth: 256,
+                // Milestones finalize within a few blocks of head; 16 leaves room for a brief stall.
+                finality_depth: 16,
             }),
             42161 => Some(Self {
                 name: "Arbitrum",

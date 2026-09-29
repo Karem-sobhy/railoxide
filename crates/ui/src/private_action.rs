@@ -20,7 +20,12 @@ pub fn asset_row(label: impl Into<SharedString>, icon: Option<gpui::ImageSource>
         .flex()
         .items_center()
         .gap_1()
-        .children(icon.map(|icon| gpui::img(icon).size_4().rounded_full().flex_none()))
+        .child(
+            div()
+                .size_4()
+                .flex_none()
+                .children(icon.map(|icon| gpui::img(icon).size_full().rounded_full())),
+        )
         .child(div().min_w_0().truncate().child(label.into()))
 }
 
@@ -64,17 +69,15 @@ pub fn fee_token_control(control: impl IntoElement) -> Div {
 pub fn asset_select<D>(
     state: &gpui::Entity<gpui_component::select::SelectState<D>>,
     disabled: bool,
-) -> Div
+) -> gpui_component::select::Select<D>
 where
     D: gpui_component::select::SelectDelegate + 'static,
     <D::Item as gpui_component::select::SelectItem>::Value: PartialEq + Clone,
 {
-    div().w_full().child(
-        gpui_component::select::Select::new(state)
-            .w_full()
-            .placeholder("Select asset")
-            .disabled(disabled),
-    )
+    gpui_component::select::Select::new(state)
+        .w_full()
+        .placeholder("Select asset")
+        .disabled(disabled)
 }
 
 #[must_use]
@@ -143,6 +146,25 @@ pub fn broadcaster_settings(
     fee_mode: Option<gpui::AnyElement>,
     on_change: impl Fn(BroadcasterSettingsEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    div().child(
+        broadcaster_settings_fields(id, settings, fee_token, fee_mode, on_change)
+            .p_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER)),
+    )
+}
+
+/// Broadcaster controls without a surrounding panel, for containers such as popovers that
+/// already provide padding and a border.
+#[must_use]
+pub fn broadcaster_settings_fields(
+    id: impl Into<ElementId>,
+    settings: BroadcasterSettings,
+    fee_token: impl IntoElement,
+    fee_mode: Option<gpui::AnyElement>,
+    on_change: impl Fn(BroadcasterSettingsEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
     use BroadcasterSettingsEvent as Event;
     use gpui::{InteractiveElement, StatefulInteractiveElement as _, prelude::FluentBuilder as _};
     use gpui_component::tooltip::Tooltip;
@@ -152,95 +174,89 @@ pub fn broadcaster_settings(
     let random = on_change.clone();
     let disabled = settings.disabled;
     let selector_disabled = disabled || settings.candidate_count == 0;
-    div().child(
-        div()
-            .id(id)
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2p5()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .child(
-                // The pinned Switch stores its tooltip but does not render it.
-                div()
-                    .id("out-of-range-help")
-                    .tooltip(|window, cx| {
-                        Tooltip::new("Allow broadcaster fees outside the configured anchor range.")
-                            .build(window, cx)
-                    })
-                    .child(
-                        Switch::new("out-of-range")
-                            .small()
-                            .label("Allow out-of-range fees")
-                            .checked(settings.allow_out_of_range)
-                            .disabled(disabled)
-                            .on_click(move |checked, window, cx| {
-                                policy(Event::AllowOutOfRange(*checked), window, cx);
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("favorites-only-help")
-                    .tooltip(|window, cx| {
-                        Tooltip::new("Only use broadcasters saved in your favorites list.")
-                            .build(window, cx)
-                    })
-                    .child(
-                        Switch::new("favorites-only")
-                            .small()
-                            .label("Favorites only")
-                            .checked(settings.favorites_only)
-                            .disabled(disabled)
-                            .on_click(move |checked, window, cx| {
-                                favorites(Event::FavoritesOnly(*checked), window, cx);
-                            }),
-                    ),
-            )
-            .child(fee_token)
-            .child(
-                ButtonGroup::new("choice")
-                    .outline()
-                    .compact()
-                    .w_full()
-                    .disabled(selector_disabled)
-                    .child(
-                        app_segment_button(
-                            "random",
-                            "Random",
-                            settings.random_selected,
-                            selector_disabled,
-                            None,
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .on_click(move |_, window, cx| random(Event::Random, window, cx)),
-                    )
-                    .child(
-                        app_segment_button(
-                            "specific",
-                            settings.specific_label,
-                            !settings.random_selected,
-                            selector_disabled,
-                            None,
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .on_click(move |_, window, cx| {
-                            on_change(Event::ChooseSpecific, window, cx);
+    div()
+        .id(id)
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            // The pinned Switch stores its tooltip but does not render it.
+            div()
+                .id("out-of-range-help")
+                .tooltip(|window, cx| {
+                    Tooltip::new("Allow broadcaster fees outside the configured anchor range.")
+                        .build(window, cx)
+                })
+                .child(
+                    Switch::new("out-of-range")
+                        .small()
+                        .label("Allow out-of-range fees")
+                        .checked(settings.allow_out_of_range)
+                        .disabled(disabled)
+                        .on_click(move |checked, window, cx| {
+                            policy(Event::AllowOutOfRange(*checked), window, cx);
                         }),
-                    ),
-            )
-            .children(fee_mode)
-            .when(settings.candidate_count == 0, |this| {
-                this.child(app_muted_text(
-                    "No eligible broadcaster currently advertises this token.",
-                ))
-            }),
-    )
+                ),
+        )
+        .child(
+            div()
+                .id("favorites-only-help")
+                .tooltip(|window, cx| {
+                    Tooltip::new("Only use broadcasters saved in your favorites list.")
+                        .build(window, cx)
+                })
+                .child(
+                    Switch::new("favorites-only")
+                        .small()
+                        .label("Favorites only")
+                        .checked(settings.favorites_only)
+                        .disabled(disabled)
+                        .on_click(move |checked, window, cx| {
+                            favorites(Event::FavoritesOnly(*checked), window, cx);
+                        }),
+                ),
+        )
+        .child(fee_token)
+        .child(
+            ButtonGroup::new("choice")
+                .outline()
+                .compact()
+                .w_full()
+                .disabled(selector_disabled)
+                .child(
+                    app_segment_button(
+                        "random",
+                        "Random",
+                        settings.random_selected,
+                        selector_disabled,
+                        None,
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .on_click(move |_, window, cx| random(Event::Random, window, cx)),
+                )
+                .child(
+                    app_segment_button(
+                        "specific",
+                        settings.specific_label,
+                        !settings.random_selected,
+                        selector_disabled,
+                        None,
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .on_click(move |_, window, cx| {
+                        on_change(Event::ChooseSpecific, window, cx);
+                    }),
+                ),
+        )
+        .children(fee_mode)
+        .when(settings.candidate_count == 0, |this| {
+            this.child(app_muted_text(
+                "No eligible broadcaster currently advertises this token.",
+            ))
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

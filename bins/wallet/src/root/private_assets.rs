@@ -23,6 +23,7 @@ use wallet_ops::{
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 use super::chain_load::loading_summary;
+use super::private_swap::swap_entry_availability;
 use super::public_account::render_public_address_qr_dialog_content;
 use super::utxo::{
     UtxoDisplayRow, blocked_shield_refund_action_available, blocked_shield_refund_origin_resolving,
@@ -723,7 +724,11 @@ impl WalletRoot {
         });
     }
 
-    pub(super) fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
+    pub(super) fn render_private_assets_body(
+        &self,
+        root: &Entity<Self>,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
         if self.view_session.is_none() {
             return ui::private_assets::private_message("Choose a wallet to continue", None)
                 .into_any_element();
@@ -746,6 +751,7 @@ impl WalletRoot {
                 state.private_action_forms_available(),
                 true,
                 *progress,
+                cx,
             ),
             Some(state @ ChainUtxoState::Ready { snapshot, .. }) => self
                 .render_private_asset_snapshot(
@@ -754,6 +760,7 @@ impl WalletRoot {
                     state.private_action_forms_available(),
                     false,
                     None,
+                    cx,
                 ),
             Some(ChainUtxoState::Idle) | None => {
                 ui::private_assets::private_message("Select a chain to load private balances", None)
@@ -769,6 +776,7 @@ impl WalletRoot {
         actions_available: bool,
         syncing: bool,
         progress: Option<wallet_ops::SyncProgressUpdate>,
+        cx: &gpui::App,
     ) -> gpui::AnyElement {
         let presentation = self.private_asset_presentation(snapshot);
         let assets = &presentation.rows;
@@ -785,13 +793,36 @@ impl WalletRoot {
             .iter()
             .find_map(|asset| build_unshield_asset(snapshot, asset));
         let pending_summary = self.private_pending_summary_from_snapshot(snapshot, assets);
+        let swap_profile = self.private_swap_profile();
+        // Unfinished swaps share the pending-status slot, directly below the header.
+        let swap_card = self
+            .private_swaps_view()
+            .filter(|view| view.read(cx).has_shown_swaps())
+            .map(gpui::IntoElement::into_any_element);
+        let swap_entry = swap_profile.as_ref().map(|profile| {
+            assets
+                .iter()
+                .find_map(|asset| {
+                    let spendable = build_unshield_asset(snapshot, asset).is_some();
+                    (swap_entry_availability(Some(profile), asset.token, spendable, true)
+                        == Some(Ok(())))
+                    .then_some(asset.token)
+                    .flatten()
+                })
+                .filter(|_| actions_available)
+                .ok_or(if actions_available {
+                    "No private token can be swapped"
+                } else {
+                    "Available after wallet session starts"
+                })
+        });
         if assets.is_empty() {
             let message = if syncing {
                 loading_summary(progress)
             } else {
                 "No private assets found".to_string()
             };
-            if let Some(summary) = pending_summary.as_ref() {
+            if pending_summary.is_some() || swap_card.is_some() {
                 let empty = if receive_available {
                     Self::render_private_empty_state(root.clone(), message, receive_available)
                         .into_any_element()
@@ -811,7 +842,13 @@ impl WalletRoot {
                             .w(super::PRIVATE_ASSET_LIST_WIDTH)
                             .max_w_full()
                             .mx_auto()
-                            .child(Self::render_private_pending_status_card(root, summary)),
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(swap_card)
+                            .children(pending_summary.as_ref().map(|summary| {
+                                Self::render_private_pending_status_card(root, summary)
+                            })),
                     )
                     .child(div().flex_1().min_h(px(0.0)).child(empty))
                     .into_any_element();
@@ -845,6 +882,7 @@ impl WalletRoot {
                             receive_available,
                             send_asset,
                             unshield_asset,
+                            swap_entry,
                             actions_available,
                             syncing,
                         ))
@@ -855,6 +893,7 @@ impl WalletRoot {
                             receive_available,
                         ))
                     })
+                    .children(swap_card)
                     .when_some(pending_summary, |column, summary| {
                         column.child(Self::render_private_pending_status_card(root, &summary))
                     })
@@ -864,6 +903,7 @@ impl WalletRoot {
                             ix,
                             asset,
                             snapshot,
+                            swap_profile,
                             actions_available,
                             syncing,
                         )
@@ -1134,17 +1174,21 @@ impl WalletRoot {
             )
     }
 
+    // One header renderer keeps the private actions in one row and one order.
+    #[allow(clippy::too_many_arguments)]
     fn render_private_balance_hero(
         root: Entity<Self>,
         total_balance: String,
         receive_available: bool,
         send_asset: Option<UnshieldAsset>,
         unshield_asset: Option<UnshieldAsset>,
+        swap_entry: Option<Result<Address, &'static str>>,
         actions_available: bool,
         syncing: bool,
     ) -> gpui::Div {
         let receive_root = root.clone();
         let send_root = root.clone();
+        let swap_root = root.clone();
         let unshield_root = root;
         let can_send = actions_available && send_asset.is_some();
         let can_unshield = actions_available && unshield_asset.is_some();
@@ -1204,7 +1248,15 @@ impl WalletRoot {
                                 root.open_unshield_form(asset, window, cx);
                             });
                         }),
-                ),
+                )
+                .when_some(swap_entry, |actions, entry| {
+                    actions.child(render_private_swap_button(
+                        "wallet-private-hero-swap".into(),
+                        entry,
+                        "Swap a private token for another, privately",
+                        swap_root,
+                    ))
+                }),
         )
     }
 
@@ -1213,6 +1265,7 @@ impl WalletRoot {
         ix: usize,
         asset: FormattedTokenTotal,
         snapshot: &ListUtxosOutput,
+        swap_profile: Option<wallet_ops::settings::SwapProfile>,
         actions_available: bool,
         syncing: bool,
     ) -> gpui::Div {
@@ -1242,8 +1295,16 @@ impl WalletRoot {
         let pending_outgoing_amount = asset.pending_outgoing_amount.clone();
         let asset_label = asset.label.clone();
         let (primary_amount, secondary_amount) = private_asset_display_amounts(&asset);
+        let swap_entry = swap_entry_availability(
+            swap_profile.as_ref(),
+            asset.token,
+            unshield_asset.is_some(),
+            actions_available,
+        )
+        .map(|availability| availability.map(|()| asset.token.unwrap_or_default()));
         let row_group = SharedString::from(format!("wallet-private-asset-row-{ix}"));
         let send_root = root.clone();
+        let swap_root = root.clone();
         let unshield_root = root;
 
         ui::private_assets::PrivateAssetRow {
@@ -1303,13 +1364,56 @@ impl WalletRoot {
                                 root.open_unshield_form(asset, window, cx);
                             });
                         }),
-                    ))
+                    )
+                    .when_some(swap_entry, |actions, entry| {
+                        actions.child(
+                            render_private_swap_button(
+                                SharedString::from(format!("wallet-asset-swap-{ix}")),
+                                entry,
+                                "Swap this token privately",
+                                swap_root,
+                            )
+                            .opacity(if entry.is_ok() {
+                                1.0
+                            } else {
+                                0.5
+                            }),
+                        )
+                    }))
                 .into_any_element(),
             ),
         }
         .into_div()
         .group(SharedString::from(format!("wallet-private-asset-row-{ix}")))
     }
+}
+
+/// Swap sits beside Receive, Send and Unshield with the same outline treatment. A disabled
+/// Swap keeps its reason in the tooltip.
+fn render_private_swap_button(
+    id: SharedString,
+    entry: Result<Address, &'static str>,
+    ready_tooltip: &'static str,
+    root: Entity<WalletRoot>,
+) -> gpui_component::button::Button {
+    let enabled = entry.is_ok();
+    app_button(id, "Swap")
+        .child(
+            Icon::empty()
+                .path(ui::icons::arrow_right_left_icon_path())
+                .small(),
+        )
+        .outline()
+        .when(enabled, |button| button.bg(rgb(theme::SURFACE)))
+        .disabled(!enabled)
+        .tooltip(entry.err().unwrap_or(ready_tooltip))
+        .on_click(move |_event, window, cx| {
+            if let Ok(token) = entry {
+                root.update(cx, |root, cx| {
+                    root.open_private_swap_form(token, window, cx);
+                });
+            }
+        })
 }
 
 pub(super) fn retry_poi_label(count: usize, retrying: bool) -> String {

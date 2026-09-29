@@ -362,6 +362,7 @@ impl WalletRoot {
 
     pub(super) fn clear_public_wallet_runtime_state(&mut self, cx: &mut Context<'_, Self>) {
         self.clear_stealth_accounts(cx);
+        self.clear_private_swaps(cx);
         self.public_balance_cache.clear();
         self.public_accounts.clear();
         self.public_balance_snapshot = None;

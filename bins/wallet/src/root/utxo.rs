@@ -139,6 +139,10 @@ impl WalletRoot {
             .get(&self.selected_chain)
             .and_then(ChainUtxoState::poi_refresh_session)
             .is_some();
+        self.executor_locked_note_count = self
+            .selected_chain_session()
+            .and_then(|session| session.note_locks().ok())
+            .map_or(0, |locks| locks.executor_note_count());
         let finality_context = self.utxo_finality_context();
         self.utxo_table.update(cx, |state, cx| {
             state.delegate_mut().set_rows(
@@ -914,6 +918,7 @@ impl WalletRoot {
                     ),
                 )
             })
+            .children(self.render_executor_lock_summary(root))
             .child(
                 div()
                     .flex()
@@ -941,94 +946,29 @@ impl WalletRoot {
         root: Entity<Self>,
         count: usize,
     ) -> impl IntoElement {
-        let confirming = self.local_pending_spent_clear_confirming;
         let begin_root = root.clone();
         let cancel_root = root.clone();
         let clear_root = root;
-        let noun = if count == 1 { "UTXO" } else { "UTXOs" };
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(if confirming {
-                theme::DANGER
-            } else {
-                theme::BORDER
-            }))
-            .bg(if confirming {
-                rgb_with_alpha(theme::DANGER, 0.08)
-            } else {
-                rgb(theme::SURFACE)
-            })
-            .p(px(10.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        app_muted_text(format!(
-                            "Locally locked pending submission: {count} {noun}"
-                        ))
-                        .line_height(px(18.0)),
-                    )
-                    .child(div().flex_1())
-                    .when(!confirming, |this| {
-                        this.child(
-                            app_button("wallet-clear-local-pending-spent", "Clear local locks")
-                                .outline()
-                                .small()
-                                .danger()
-                                .on_click(move |_event, _window, cx| {
-                                    begin_root.update(cx, |root, cx| {
-                                        root.begin_clear_local_pending_spent_confirmation(cx);
-                                    });
-                                }),
-                        )
-                    }),
-            )
-            .when(confirming, |this| {
-                this.child(
-                    div()
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
-                        .text_color(rgb(theme::DANGER))
-                        .child("This only clears local submitted-transaction locks. If the original transaction later confirms, these UTXOs may fail simulation or become spent again."),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            app_button("wallet-cancel-clear-local-pending-spent", "Cancel")
-                                .outline()
-                                .small()
-                                .on_click(move |_event, _window, cx| {
-                                    cancel_root.update(cx, |root, cx| {
-                                        root.cancel_clear_local_pending_spent_confirmation(cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            app_button(
-                                "wallet-confirm-clear-local-pending-spent",
-                                "Clear local locks",
-                            )
-                            .small()
-                            .danger()
-                            .on_click(move |_event, _window, cx| {
-                                clear_root.update(cx, |root, cx| {
-                                    root.clear_local_pending_spent_locks(cx);
-                                });
-                            }),
-                        ),
-                )
-            })
+        local_pending_spent_card(
+            "wallet",
+            local_pending_spent_summary(count),
+            self.local_pending_spent_clear_confirming,
+            move |_window, cx| {
+                begin_root.update(cx, |root, cx| {
+                    root.begin_clear_local_pending_spent_confirmation(cx);
+                });
+            },
+            move |_window, cx| {
+                cancel_root.update(cx, |root, cx| {
+                    root.cancel_clear_local_pending_spent_confirmation(cx);
+                });
+            },
+            move |_window, cx| {
+                clear_root.update(cx, |root, cx| {
+                    root.clear_local_pending_spent_locks(cx);
+                });
+            },
+        )
     }
 
     fn on_action_utxo_page_up(
@@ -1126,6 +1066,12 @@ pub(super) struct UtxoFinalityContext {
     finality_depth: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BlockFinalityProgress {
+    Confirming { elapsed: u64, depth: u64 },
+    Safe,
+}
+
 impl UtxoFinalityContext {
     pub(super) const fn new(
         head_block: Option<u64>,
@@ -1137,6 +1083,20 @@ impl UtxoFinalityContext {
             safe_head_block,
             finality_depth,
         }
+    }
+
+    pub(super) fn progress(self, block: u64) -> Option<BlockFinalityProgress> {
+        let head = self.head_block?;
+        let safe_head = self.safe_head_block?;
+        let depth = self.finality_depth?;
+        if block == 0 || depth == 0 || safe_head > head || head < block {
+            return None;
+        }
+        if safe_head >= block {
+            return Some(BlockFinalityProgress::Safe);
+        }
+        let elapsed = head - block;
+        (elapsed < depth).then_some(BlockFinalityProgress::Confirming { elapsed, depth })
     }
 }
 
@@ -1449,6 +1409,94 @@ impl TableDelegate for UtxoDelegate {
     }
 }
 
+pub(super) fn local_pending_spent_summary(count: usize) -> String {
+    let noun = if count == 1 { "UTXO" } else { "UTXOs" };
+    format!("Locally locked pending submission: {count} {noun}")
+}
+
+/// Local pending-submission locks with their two-step clear, shared by the Activity tab
+/// and the locked notes dialog. `id` prefixes the button IDs.
+pub(super) fn local_pending_spent_card(
+    id: &str,
+    summary: impl Into<SharedString>,
+    confirming: bool,
+    begin: impl Fn(&mut Window, &mut App) + 'static,
+    cancel: impl Fn(&mut Window, &mut App) + 'static,
+    confirm: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if confirming {
+            theme::DANGER
+        } else {
+            theme::BORDER
+        }))
+        .bg(if confirming {
+            rgb_with_alpha(theme::DANGER, 0.08)
+        } else {
+            rgb(theme::SURFACE)
+        })
+        .p(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(app_muted_text(summary).line_height(px(18.0)))
+                .child(div().flex_1())
+                .when(!confirming, |this| {
+                    this.child(
+                        app_button(
+                            SharedString::from(format!("{id}-clear-local-pending-spent")),
+                            "Clear local locks",
+                        )
+                        .outline()
+                        .small()
+                        .danger()
+                        .on_click(move |_event, window, cx| begin(window, cx)),
+                    )
+                }),
+        )
+        .when(confirming, |this| {
+            this.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(rgb(theme::DANGER))
+                    .child("This only clears local submitted-transaction locks. If the original transaction later confirms, these UTXOs may fail simulation or become spent again."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        app_button(
+                            SharedString::from(format!("{id}-cancel-clear-local-pending-spent")),
+                            "Cancel",
+                        )
+                        .outline()
+                        .small()
+                        .on_click(move |_event, window, cx| cancel(window, cx)),
+                    )
+                    .child(
+                        app_button(
+                            SharedString::from(format!("{id}-confirm-clear-local-pending-spent")),
+                            "Clear local locks",
+                        )
+                        .small()
+                        .danger()
+                        .on_click(move |_event, window, cx| confirm(window, cx)),
+                    ),
+            )
+        })
+}
+
 fn poi_status_indicator(row: &UtxoDisplayRow, row_ix: usize) -> gpui::AnyElement {
     if is_shield_blocked_poi_status(&row.poi_status) {
         return div()
@@ -1578,23 +1626,12 @@ pub(super) fn pending_finality_display(
     } else {
         return None;
     };
-    if block_number == 0 {
-        return None;
-    }
-    let head_block = context.head_block?;
-    let safe_head_block = context.safe_head_block?;
-    let finality_depth = context.finality_depth?;
-    if finality_depth == 0 || safe_head_block > head_block || head_block < block_number {
-        return None;
-    }
-    if safe_head_block >= block_number {
-        return Some(("Indexing".to_string(), indexing_detail.to_string()));
-    }
-
-    let elapsed = head_block - block_number;
-    if elapsed >= finality_depth {
-        return None;
-    }
+    let (elapsed, finality_depth) = match context.progress(block_number)? {
+        BlockFinalityProgress::Safe => {
+            return Some(("Indexing".to_string(), indexing_detail.to_string()));
+        }
+        BlockFinalityProgress::Confirming { elapsed, depth } => (elapsed, depth),
+    };
     Some((
         format!("{elapsed}/{finality_depth} blocks"),
         format!(

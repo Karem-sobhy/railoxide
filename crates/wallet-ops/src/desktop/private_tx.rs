@@ -1,6 +1,7 @@
 use super::*;
 use eyre::eyre;
 use railgun_wallet::TransactionCall;
+use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 
 pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     request: DesktopUnshieldPlanRequest<'_>,
@@ -1202,10 +1203,12 @@ pub fn sponsored_unshield_action_fingerprint(
     keccak256(bytes)
 }
 
+/// Gas in `mode` without the buffer, which [`sponsorship_payment_from_estimate`] adds.
 fn sponsored_approximate_gas(
+    model: &RailgunGasModel,
+    mode: GasEstimateMode,
     request: &MixedPrivateActionRequest,
     preview: &railgun_wallet::tx::MixedPrivateActionPreview,
-    send: bool,
 ) -> u64 {
     let unwrap_count = request.relay_actions.as_ref().map_or(0, |actions| {
         actions
@@ -1214,18 +1217,21 @@ fn sponsored_approximate_gas(
             .filter(|action| matches!(action, CompositeRelayAction::UnwrapBase { .. }))
             .count()
     });
-    approximate_public_broadcaster_gas(ApproximateTransactionShape {
-        transaction_count: preview.shape.transaction_count,
-        input_count: preview.shape.input_count,
-        private_output_count: preview.shape.private_output_count,
-        public_output_count: preview.shape.public_output_count,
-        max_receiver_amount: U256::ZERO,
-        relay_call_count: preview.shape.relay_call_count,
-        uses_relay_adapt: preview.shape.uses_relay_adapt,
-        unwrap_count,
-        executor: false,
-        send,
-    })
+    approximate_public_broadcaster_gas(
+        model,
+        mode,
+        ApproximateTransactionShape {
+            transaction_count: preview.shape.transaction_count,
+            input_count: preview.shape.input_count,
+            private_output_count: preview.shape.private_output_count,
+            public_output_count: preview.shape.public_output_count,
+            max_receiver_amount: U256::ZERO,
+            relay_call_count: preview.shape.relay_call_count,
+            uses_relay_adapt: preview.shape.uses_relay_adapt,
+            unwrap_count,
+            executor: false,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1242,6 +1248,7 @@ fn sponsored_provisional_payment_for_intent(
     max_priority_fee_per_gas: u128,
     signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
+    mode: GasEstimateMode,
 ) -> Result<SponsorshipPayment> {
     let tx_builder = TransactionBuilder {
         chain_type: 0,
@@ -1250,6 +1257,7 @@ fn sponsored_provisional_payment_for_intent(
         relay_adapt_contract: chain.relay_adapt_contract,
     };
     let poi_spendable_wrapped_native = poi_spendable_token_balance(utxos, wrapped_native);
+    let gas_model = RailgunGasModel::for_chain(chain_id);
     let preview_gas = |payment: SponsorshipPayment| -> Result<u64> {
         let authorization = sponsored_authorization(
             intent.action(),
@@ -1276,9 +1284,7 @@ fn sponsored_provisional_payment_for_intent(
         }
         let preview = tx_builder.preview_mixed_private_action_plan(utxos, &request)?;
         Ok(sponsored_approximate_gas(
-            &request,
-            &preview,
-            matches!(intent, SponsoredPrivateIntent::Send { .. }),
+            gas_model, mode, &request, &preview,
         ))
     };
     let initial_payment = sponsorship_payment(
@@ -1339,20 +1345,28 @@ fn quote_sponsored_authorization_limit(
     {
         return Err(SponsorshipError::MissingRelay.into());
     }
-    let payment = sponsored_provisional_payment_for_intent(
-        chain_id,
-        &chain,
-        utxos,
-        wrapped_native,
-        payer,
-        signer,
-        intent,
-        native_top_up,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        signer_native_balance_snapshot,
-        incentive,
-    )?;
+    let provisional_payment = |mode| {
+        sponsored_provisional_payment_for_intent(
+            chain_id,
+            &chain,
+            utxos,
+            wrapped_native,
+            payer,
+            signer,
+            intent,
+            native_top_up,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            signer_native_balance_snapshot,
+            incentive,
+            mode,
+        )
+    };
+    let expected_payment = provisional_payment(GasEstimateMode::Expected)?;
+    // The ceiling bounds the signed gas limit and the wrapped-native spend. Its quote-time
+    // balance check, and admission against the limit, require POI-spendable wrapped native for
+    // the ceiling, so they may refuse sends whose exact cost would fit.
+    let ceiling_payment = provisional_payment(GasEstimateMode::UpperBound)?;
     let action_fingerprint = match intent {
         SponsoredPrivateIntent::Send {
             token,
@@ -1378,7 +1392,7 @@ fn quote_sponsored_authorization_limit(
         wrapped_native,
         payer,
         chain.relay_adapt_contract,
-        payment,
+        ceiling_payment,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         signer,
@@ -1396,9 +1410,9 @@ fn quote_sponsored_authorization_limit(
         })?;
     let max_total_wrapped_native_spend =
         sponsored_total_wrapped_native_spend(intent, public_wrapped_native_spend, wrapped_native)?;
-    sponsored_authorization_limit(
+    let limit = sponsored_authorization_limit(
         action_fingerprint,
-        payment.outer_gas_limit,
+        ceiling_payment.outer_gas_limit,
         intent.action(),
         wrapped_native,
         payer,
@@ -1409,8 +1423,11 @@ fn quote_sponsored_authorization_limit(
         incentive,
         signer,
         max_total_wrapped_native_spend,
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(SponsoredAuthorizationLimit {
+        expected_transaction_gas_limit: expected_payment.outer_gas_limit,
+        ..limit
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,6 +1626,22 @@ fn sponsored_total_wrapped_native_spend(
     }
 }
 
+/// Payment to sign when the first plan needs no rebuild. The request and calldata depend only on
+/// `builder_payment`, so when it is unchanged a higher exact gas limit is signed with gas and
+/// funding fields recomputed for that limit.
+fn sponsored_payment_without_rebuild(
+    provisional: &SponsorshipPayment,
+    required: &SponsorshipPayment,
+) -> SponsorshipPayment {
+    if required.outer_gas_limit > provisional.outer_gas_limit
+        && required.builder_payment == provisional.builder_payment
+    {
+        *required
+    } else {
+        *provisional
+    }
+}
+
 fn sponsored_rebuild_error(error: BuildError) -> Report {
     match error {
         BuildError::PinnedInputUnavailable { .. }
@@ -1693,6 +1726,8 @@ async fn prepare_desktop_sponsored_calldata(
         None
     };
     let poi_spendable_wrapped_native = poi_spendable_token_balance(&utxos, wrapped_native);
+    // Admission requires wrapped native for the approved ceiling, so it may refuse sends whose
+    // exact cost would fit.
     validate_sponsored_admission(SponsoredAdmission {
         action: intent.action(),
         delivery: PrivateDeliveryMode::SelfBroadcast,
@@ -1758,6 +1793,7 @@ async fn prepare_desktop_sponsored_calldata(
         resolved_fee.max_priority_fee_per_gas,
         authorization_limit.signer_native_balance_snapshot,
         incentive,
+        GasEstimateMode::Expected,
     )?;
     let provisional_authorization = sponsored_authorization(
         intent.action(),
@@ -1891,7 +1927,19 @@ async fn prepare_desktop_sponsored_calldata(
             validate_final_sponsorship_payment(first_required_payment, final_required_payment)?;
             (rebuilt_plan, required_authorization)
         } else {
-            (first_plan, provisional_authorization)
+            let payment =
+                sponsored_payment_without_rebuild(&provisional_payment, &first_required_payment);
+            let authorization = sponsored_authorization(
+                intent.action(),
+                wrapped_native,
+                payer,
+                chain.relay_adapt_contract,
+                payment,
+                resolved_fee.max_fee_per_gas,
+                resolved_fee.max_priority_fee_per_gas,
+                signer_address,
+            );
+            (first_plan, authorization)
         };
     drop(signer);
 
@@ -2252,8 +2300,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             )
         })
         .transpose()?;
-    let initial_fee_amount =
-        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+    let initial_fee_amount = initial_public_broadcaster_fee_amount(
+        &broadcaster,
+        chain.gas.gas_limit_buffer,
+        min_gas_price,
+        same_token_fee,
+        || {
             let seed_split = public_broadcaster_amount_split_for_tokens_and_protocol(
                 request.amount,
                 U256::ZERO,
@@ -2292,10 +2344,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                 unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
                     .with_executor(uses_executor),
             )
-        })?;
+        },
+    )?;
 
     let mut estimate = approximate_public_broadcaster_cost(
         broadcaster,
+        chain.gas.gas_limit_buffer,
         request.token,
         request.fee_token,
         request.amount,
@@ -2359,7 +2413,10 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     Ok(estimate)
 }
 
+/// The estimate includes `gas_limit_buffer`, which self-broadcast adds to the RPC estimate.
 pub fn estimate_desktop_send_self_broadcast_cost(
+    chain_id: u64,
+    gas_limit_buffer: u64,
     utxos: &[Utxo],
     token: Address,
     amount: U256,
@@ -2371,6 +2428,8 @@ pub fn estimate_desktop_send_self_broadcast_cost(
         .wrap_err("select POI-verified send notes for self-broadcast estimate")?;
     let shape = send_approximate_shape(&selection, selection.max_spendable);
     Ok(desktop_self_broadcast_cost_estimate(
+        chain_id,
+        gas_limit_buffer,
         shape,
         quote,
         max_fee_per_gas,
@@ -2379,10 +2438,16 @@ pub fn estimate_desktop_send_self_broadcast_cost(
     ))
 }
 
-/// Supplying executor gas settings includes delegation overhead and the configured buffer
-/// before an account is reserved. This estimate does not authorize signing or delivery.
+/// `executor` includes delegation overhead before an account is reserved. The estimate
+/// includes `gas_limit_buffer`, which self-broadcast adds to the RPC estimate. This estimate
+/// does not authorize signing or delivery. The executor quote becomes
+/// `ExecutorUnshieldReview::maximum_gas`, the approved gas ceiling, so its `gas_limit` uses
+/// `UpperBound` gas plus any Arbitrum One data gas allowance; its expected cost uses `Expected`
+/// gas.
 pub fn estimate_desktop_unshield_self_broadcast_cost(
-    executor_gas: Option<&settings::EffectiveChainGasSettings>,
+    chain_id: u64,
+    gas_limit_buffer: u64,
+    executor: bool,
     utxos: &[Utxo],
     token: Address,
     entered_amount: U256,
@@ -2393,7 +2458,7 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
 ) -> Result<DesktopSelfBroadcastCostEstimate> {
-    if executor_gas.is_some() && !unwrap && native_top_up.is_none() {
+    if executor && !unwrap && native_top_up.is_none() {
         return Err(eyre!("executor quote does not match the selected action"));
     }
     let receiver_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode)?;
@@ -2444,41 +2509,45 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
             amount: unshield_protocol_fee_amount_for_fee_mode(entered_amount, fee_mode)?,
         }]
     };
-    let mut cost = desktop_self_broadcast_cost_estimate(
-        shape.with_executor(executor_gas.is_some()),
+    Ok(desktop_self_broadcast_cost_estimate(
+        chain_id,
+        gas_limit_buffer,
+        shape.with_executor(executor),
         quote,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         protocol_fees,
-    );
-    if let Some(gas) = executor_gas {
-        cost.gas_limit = cost.gas_limit.saturating_add(gas.gas_limit_buffer);
-        cost.gas_cost = eip1559_gas_cost_projection(
-            cost.gas_limit,
-            quote,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        );
-    }
-    Ok(cost)
+    ))
 }
 
 fn desktop_self_broadcast_cost_estimate(
+    chain_id: u64,
+    gas_limit_buffer: u64,
     shape: ApproximateTransactionShape,
     quote: SelfBroadcastGasFeeQuote,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     protocol_fees: Vec<DesktopSelfBroadcastProtocolFee>,
 ) -> DesktopSelfBroadcastCostEstimate {
-    let gas_limit = approximate_public_broadcaster_gas(shape);
+    let model = RailgunGasModel::for_chain(chain_id);
+    let expected_gas = approximate_public_broadcaster_gas(model, GasEstimateMode::Expected, shape)
+        .saturating_add(gas_limit_buffer);
+    let gas_limit = if shape.executor {
+        // The executor quote is the approved gas ceiling for the signed transaction.
+        let execution_gas =
+            approximate_public_broadcaster_gas(model, GasEstimateMode::UpperBound, shape);
+        execution_gas
+            .saturating_add(gas_limit_buffer)
+            .saturating_add(arbitrum_data_gas_allowance(chain_id, execution_gas))
+    } else {
+        expected_gas
+    };
+    let mut gas_cost =
+        eip1559_gas_cost_projection(gas_limit, quote, max_fee_per_gas, max_priority_fee_per_gas);
+    gas_cost.expected_cost = U256::from(expected_gas) * U256::from(gas_cost.expected_fee_per_gas);
     DesktopSelfBroadcastCostEstimate {
         gas_limit,
-        gas_cost: eip1559_gas_cost_projection(
-            gas_limit,
-            quote,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        ),
+        gas_cost,
         protocol_fees,
     }
 }
@@ -2522,8 +2591,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;
-    let initial_fee_amount =
-        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+    let initial_fee_amount = initial_public_broadcaster_fee_amount(
+        &broadcaster,
+        chain.gas.gas_limit_buffer,
+        min_gas_price,
+        same_token_fee,
+        || {
             let selection = send_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
@@ -2541,10 +2614,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
-        })?;
+        },
+    )?;
 
     approximate_public_broadcaster_cost(
         broadcaster,
+        chain.gas.gas_limit_buffer,
         request.token,
         request.fee_token,
         request.amount,
@@ -3583,21 +3658,26 @@ mod tests {
             recipient,
             unwrap: false,
         };
-        let expected = sponsored_provisional_payment_for_intent(
-            1,
-            &chain,
-            &utxos,
-            wrapped_native,
-            payer,
-            signer,
-            intent,
-            None,
-            150_000_000,
-            10_000_000,
-            U256::ZERO,
-            SponsoredIncentive::Economy,
-        )
-        .expect("provisional payment");
+        let provisional = |mode| {
+            sponsored_provisional_payment_for_intent(
+                1,
+                &chain,
+                &utxos,
+                wrapped_native,
+                payer,
+                signer,
+                intent,
+                None,
+                150_000_000,
+                10_000_000,
+                U256::ZERO,
+                SponsoredIncentive::Economy,
+                mode,
+            )
+            .expect("provisional payment")
+        };
+        let expected = provisional(GasEstimateMode::Expected);
+        let ceiling = provisional(GasEstimateMode::UpperBound);
 
         let quote = quote_sponsored_unshield_authorization_limit(
             1,
@@ -3617,7 +3697,159 @@ mod tests {
         )
         .expect("sponsored quote");
 
-        assert_eq!(quote.max_transaction_gas_limit, expected.outer_gas_limit);
+        assert_eq!(quote.max_transaction_gas_limit, ceiling.outer_gas_limit);
+        assert!(quote.max_transaction_gas_limit > expected.outer_gas_limit);
+        assert_eq!(
+            quote.expected_transaction_gas_limit,
+            expected.outer_gas_limit
+        );
+
+        // An exact gas limit between the expected quote and the ceiling stays authorized.
+        let exact_gas_limit =
+            expected.outer_gas_limit + (ceiling.outer_gas_limit - expected.outer_gas_limit) / 2;
+        let exact = sponsored_authorization(
+            SponsoredActionKind::Unshield,
+            wrapped_native,
+            payer,
+            effective_chain
+                .require_railgun()
+                .unwrap()
+                .deployment
+                .relay_adapt_contract,
+            sponsorship_payment(
+                exact_gas_limit,
+                quote.max_fee_per_gas,
+                quote.signer_native_balance_snapshot,
+                quote.incentive,
+            )
+            .expect("exact payment"),
+            quote.max_fee_per_gas,
+            quote.max_priority_fee_per_gas,
+            signer,
+        );
+        let exact_request = intent
+            .mixed_request(&exact, None, false, None)
+            .expect("exact request");
+        let exact_total = sponsored_total_wrapped_native_spend(
+            intent,
+            request_public_token_spend(&exact_request, wrapped_native).expect("public spend"),
+            wrapped_native,
+        )
+        .expect("exact total");
+        assert_eq!(
+            validate_sponsored_authorization_limit(
+                quote,
+                sponsored_unshield_action_fingerprint(
+                    1,
+                    wrapped_native,
+                    amount,
+                    recipient,
+                    false,
+                    None,
+                ),
+                exact,
+                exact_total,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sponsored_unchanged_request_signs_the_exact_gas_limit() {
+        let wrapped_native = Address::from([0x91; 20]);
+        let payer = Address::from([0x92; 20]);
+        let relay_adapt = Address::from([0x93; 20]);
+        let signer = Address::from([0x94; 20]);
+        let token = Address::from([0x95; 20]);
+        let recipient = Address::from([0x96; 20]);
+        let amount = U256::from(1_000_000_u64);
+        let max_fee_per_gas = 2_000_000_000;
+        let max_priority_fee_per_gas = 1_000_000_000;
+        // The signer's balance covers both gas caps, so the builder payment stays zero.
+        let snapshot = U256::from(1_000_000_000_000_000_000_u128);
+        let incentive = SponsoredIncentive::Standard;
+        let payment = |gas_limit| {
+            sponsorship_payment(gas_limit, max_fee_per_gas, snapshot, incentive).expect("payment")
+        };
+        let authorization = |payment| {
+            sponsored_authorization(
+                SponsoredActionKind::Unshield,
+                wrapped_native,
+                payer,
+                relay_adapt,
+                payment,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                signer,
+            )
+        };
+        let provisional = payment(400_000);
+        let exact_gas = 450_000;
+        let exact_gas_limit =
+            sponsored_gas_limit_with_buffer(exact_gas, GAS_LIMIT_BUFFER).expect("buffered gas");
+        let required = payment(exact_gas_limit);
+        assert!(provisional.builder_payment.is_zero());
+        assert_eq!(required.builder_payment, provisional.builder_payment);
+        assert!(!sponsored_payment_requires_rebuild(provisional, required));
+
+        let signed = authorization(sponsored_payment_without_rebuild(&provisional, &required));
+        assert!(signed.transaction_gas_limit >= exact_gas_limit);
+
+        let intent = SponsoredPrivateIntent::Unshield {
+            token,
+            amount,
+            recipient,
+            unwrap: false,
+        };
+        let request = |authorization: &SponsoredAuthorization| {
+            format!(
+                "{:?}",
+                intent
+                    .mixed_request(authorization, None, false, None)
+                    .expect("request")
+            )
+        };
+        assert_eq!(request(&signed), request(&authorization(provisional)));
+
+        let fingerprint =
+            sponsored_unshield_action_fingerprint(1, token, amount, recipient, false, None);
+        let limit = |max_transaction_gas_limit| {
+            sponsored_authorization_limit(
+                fingerprint,
+                max_transaction_gas_limit,
+                SponsoredActionKind::Unshield,
+                wrapped_native,
+                payer,
+                relay_adapt,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                snapshot,
+                incentive,
+                signer,
+                U256::ZERO,
+            )
+            .expect("limit")
+        };
+        // Validation recomputes the economics from the signed gas limit and still enforces the
+        // approved ceiling.
+        assert_eq!(
+            validate_sponsored_authorization_limit(
+                limit(signed.transaction_gas_limit),
+                fingerprint,
+                signed,
+                U256::ZERO,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sponsored_authorization_limit(
+                limit(signed.transaction_gas_limit - 1),
+                fingerprint,
+                signed,
+                U256::ZERO,
+            ),
+            Err(SponsorshipError::AuthorizationLimitExceeded)
+        );
     }
 
     #[test]

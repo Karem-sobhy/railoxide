@@ -107,6 +107,10 @@ pub struct SponsoredAuthorization {
 pub struct SponsoredAuthorizationLimit {
     pub action_fingerprint: FixedBytes<32>,
     pub max_transaction_gas_limit: u64,
+    /// Gas limit of the expected payment, for display only. Authorization enforcement uses the
+    /// maximum fields. [`sponsored_authorization_limit`] sets it to the maximum; the quote
+    /// replaces it with its `Expected` estimate.
+    pub expected_transaction_gas_limit: u64,
     pub signer_native_balance_snapshot: U256,
     pub action: SponsoredActionKind,
     pub wrapped_native_token: Address,
@@ -325,6 +329,7 @@ pub fn sponsored_authorization_limit(
     Ok(SponsoredAuthorizationLimit {
         action_fingerprint,
         max_transaction_gas_limit,
+        expected_transaction_gas_limit: max_transaction_gas_limit,
         signer_native_balance_snapshot,
         action,
         wrapped_native_token,

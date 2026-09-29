@@ -19,7 +19,14 @@ use gpui_component::{
     table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow},
     tag::Tag,
 };
-use wallet_ops::{ExecutorAccountOutcome, ExecutorAccountStatus, vault::ExecutorRecordOrigin};
+use wallet_ops::{
+    ExecutorAccountOutcome, ExecutorAccountStatus, SwapOrderState, is_swap_record,
+    vault::ExecutorRecordOrigin,
+};
+
+use crate::root::private_swap::{
+    SwapStage, swap_account_status, swap_sell_amount, swap_stage, swap_tokens,
+};
 
 const ACCOUNTS_PER_PAGE: usize = 25;
 
@@ -160,7 +167,25 @@ impl StealthAccountsView {
     }
 
     pub(super) fn needs_attention(&self, record: &ExecutorRecord) -> bool {
-        self.status(record).needs_attention() || self.holding(record.operation())
+        self.status(record).needs_attention()
+            || self.holding(record.operation())
+            || swap_needs_recovery(record)
+    }
+
+    fn swap_purpose(&self, record: &ExecutorRecord, cx: &App) -> Option<String> {
+        if !is_swap_record(record) {
+            return None;
+        }
+        let (sell, buy) = swap_tokens(record)?;
+        let (sell, buy) = (ExecutorAsset::Erc20(sell), ExecutorAsset::Erc20(buy));
+        let (sell_name, buy_name) = (self.asset_name(sell, cx), self.asset_name(buy, cx));
+        Some(match swap_sell_amount(record) {
+            Some(amount) => format!(
+                "Swap {} {sell_name} → {buy_name}",
+                self.recovery_amount_label(sell, amount, cx)
+            ),
+            None => format!("Swap {sell_name} → {buy_name}"),
+        })
     }
 
     pub(super) fn assets_for(&self, record: &ExecutorRecord) -> Vec<ExecutorAsset> {
@@ -209,7 +234,7 @@ impl StealthAccountsView {
                 let status = self.status(record);
                 let holding = self.holding(record.operation());
                 AccountVisibility {
-                    attention: status.needs_attention() || holding,
+                    attention: status.needs_attention() || holding || swap_needs_recovery(record),
                     unresolved: status.unresolved(),
                     holding,
                 }
@@ -340,15 +365,20 @@ impl StealthAccountsView {
                     cx,
                 )
             }));
+        let purpose_text = self.swap_purpose(record, cx).or_else(|| {
+            record.purpose_summary().map(|purpose| {
+                purpose
+                    .split_once(" → ")
+                    .map_or(purpose, |(intent, _)| intent)
+                    .to_owned()
+            })
+        });
         let purpose = div()
             .w_full()
             .min_w_0()
-            .children(record.purpose_summary().map(|purpose| {
-                let intent = purpose
-                    .split_once(" → ")
-                    .map_or(purpose, |(intent, _)| intent);
-                ui::controls::app_text(intent.to_owned()).whitespace_normal()
-            }))
+            .children(
+                purpose_text.map(|purpose| ui::controls::app_text(purpose).whitespace_normal()),
+            )
             .children(
                 record
                     .created_at()
@@ -361,7 +391,19 @@ impl StealthAccountsView {
                         })
                     }),
             );
-        let status_cell = if has_local_history(record) {
+        let status_cell = if let Some(stage) = record_swap_stage(record) {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_1()
+                .child(
+                    div()
+                        .debug_selector(move || format!("stealth-swap-{}", operation.opaque_id()))
+                        .child(swap_status_tag(stage)),
+                )
+        } else if has_local_history(record) {
             div()
                 .w_full()
                 .flex()
@@ -595,7 +637,7 @@ impl StealthAccountsView {
         };
         let disabled = this.job.is_some() || record.address().is_none();
         let recovery_disabled = this.recovery_disabled_reason(record, cx).is_some();
-        let holding = this.holding(operation);
+        let holding = this.holding(operation) || swap_holds_funds(record);
         let pending_recovery = record.recovery_transactions().iter().any(|transaction| {
             record.recovery_transaction_status(transaction.hash())
                 == Some(wallet_ops::vault::ExecutorPayloadStatus::Uncertain)
@@ -605,6 +647,11 @@ impl StealthAccountsView {
         } else {
             "Add to Public"
         };
+        let swap_view = view.clone();
+        let swaps_available = this
+            .root
+            .upgrade()
+            .is_some_and(|root| root.read(cx).private_swaps_view().is_some());
         let public_view = view.clone();
         let recover_view = view.clone();
         let hide_view = view.clone();
@@ -633,9 +680,33 @@ impl StealthAccountsView {
                 .disabled(recovery_disabled)
                 .on_click(move |_, window, cx| {
                     recover_view.update(cx, |view, cx| {
-                        view.open_recovery(operation, None, window, cx);
+                        view.open_recovery(operation, None, None, window, cx);
                     });
                 }),
+            )
+        })
+        .when(swaps_available, |menu| {
+            menu.item(
+                PopupMenuItem::new("Use for swap…")
+                    .disabled(disabled)
+                    .on_click(move |_, window, cx| {
+                        swap_view.update(cx, |view, cx| {
+                            if !view.session_is_current(cx) || view.job.is_some() {
+                                return;
+                            }
+                            let swaps = view
+                                .root
+                                .upgrade()
+                                .and_then(|root| root.read(cx).private_swaps_view());
+                            if let Some(swaps) = swaps {
+                                window.defer(cx, move |window, cx| {
+                                    swaps.update(cx, |swaps, cx| {
+                                        swaps.open_account_form(operation, window, cx);
+                                    });
+                                });
+                            }
+                        });
+                    }),
             )
         })
         .separator()
@@ -1172,6 +1243,43 @@ fn page_footer(
 
 pub(super) fn account_caption(label: impl Into<SharedString>) -> gpui::Div {
     app_muted_text(label).text_xs()
+}
+
+/// A private swap's stage from its record alone; this view doesn't observe swaps.
+fn record_swap_stage(record: &ExecutorRecord) -> Option<SwapStage> {
+    is_swap_record(record).then(|| swap_stage(record, None, false))
+}
+
+/// Funds a swap left in its stealth account. Recovery stays reachable here after the swap is
+/// dismissed from the Private tab.
+pub(super) fn swap_needs_recovery(record: &ExecutorRecord) -> bool {
+    record_swap_stage(record).is_some_and(SwapStage::needs_recovery)
+}
+
+/// The swap's own record says its stealth account holds the swap's funds, including while
+/// the order can still fill. Recovery then also invalidates the order.
+pub(super) fn swap_holds_funds(record: &ExecutorRecord) -> bool {
+    matches!(
+        record_swap_stage(record),
+        Some(SwapStage::Order(
+            SwapOrderState::PreHookOnly { .. } | SwapOrderState::NotDelivered
+        ))
+    )
+}
+
+/// "Recovery needed" is the only swap status with a semantic color: it is the one that asks
+/// the user to act.
+fn swap_status_tag(stage: SwapStage) -> Tag {
+    let tag = if stage.needs_recovery() {
+        Tag::warning()
+    } else {
+        Tag::secondary()
+    };
+    tag.outline()
+        .small()
+        .rounded_full()
+        .line_height(gpui::relative(ui::theme::APP_TEXT_LINE_HEIGHT))
+        .child(swap_account_status(stage))
 }
 
 fn outcome_tag(outcome: ExecutorAccountOutcome) -> Tag {

@@ -1238,7 +1238,7 @@ fn public_account_identicon_pattern_is_deterministic_and_symmetric() {
 
     assert_eq!(pattern, public_account_identicon_pattern(&address));
     assert!(pattern.iter().any(|active| *active));
-    for row in pattern.chunks_exact(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE) {
+    for row in pattern.as_chunks::<PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE>().0 {
         assert_eq!(row[0], row[4]);
         assert_eq!(row[1], row[3]);
     }

@@ -40,6 +40,8 @@ impl Render for WalletTestWindow {
 
 #[gpui::test]
 fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext) {
+    // Password verification wakes GPUI from Tokio's blocking pool.
+    cx.executor().allow_parking();
     let path = std::env::temp_dir().join(format!(
         "railoxide-public-registration-{}",
         wallet_ops::vault::ExecutorOperationId::random()
@@ -932,7 +934,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                             },
                         );
                 }
-                panel.open_recovery(operations[0], Some(token), window, cx);
+                panel.open_recovery(operations[0], Some(token), None, window, cx);
             });
             window.draw(cx).clear(cx);
         });
@@ -1199,9 +1201,36 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
         Some(operations[0]),
         "Opening the row menu must not collapse the account"
     );
+    root.update(cx, |root, _| {
+        root.spend_authorization_lifetime = SpendAuthorizationLifetime::FiveMinutes;
+    });
     cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_input("wrong password");
+    cx.simulate_keystrokes("enter");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        if cx.debug_bounds("wallet-spend-auth-error").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an incorrect password must leave the authorization dialog open with an inline error"
+        );
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+    }
+    assert!(panel.read_with(cx, |panel, _| panel.job.is_none()
+        && panel.pending_authorization.is_some()));
+    assert!(root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()));
+    assert!(
+        records.records().unwrap()[0]
+            .public_account_uuid()
+            .is_none()
+    );
+    // Retry through the same focused password field and the shared authorization dialog.
     cx.simulate_input(PASSWORD);
     cx.simulate_keystrokes("enter");
 
@@ -1224,6 +1253,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
     }
     assert!(!root.read_with(cx, |root, _| root.stealth_accounts.as_ref().unwrap().open));
     assert!(panel.read_with(cx, |panel, _| panel.job.is_none() && panel.error.is_none()));
+    assert!(root.read_with(cx, |root, _| root.spend_authorization_cache.is_some()));
 
     // A chain switch in the same update must invalidate the queued authorization.
     cx.update(|window, cx| {
@@ -1240,7 +1270,8 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                 SpendAuthorizationLifetime::Once,
                 window,
                 cx,
-            );
+            )
+            .unwrap();
             root.selected_chain = 137;
         });
     });

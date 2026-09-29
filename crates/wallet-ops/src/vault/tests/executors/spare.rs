@@ -2,6 +2,10 @@ use super::*;
 
 pub(super) mod hardware;
 mod public_account;
+mod swap_fork;
+mod swap_observation;
+mod swap_order;
+mod swap_setup;
 use crate::{ExecutorDelivery, ExecutorOwner, HttpContext, WalletSyncTip};
 use alloy::providers::bindings::IMulticall3;
 use alloy::rpc::types::Block;
@@ -610,6 +614,207 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
     );
     restarted.shutdown().await;
     drop(restarted);
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn paid_fee_retry_reuses_only_its_own_unsent_evidence() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let owner = Arc::new(
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            view.clone(),
+            chain(&rpc),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap(),
+    );
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let password = || {
+        crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()))
+    };
+    let input = |position| {
+        Utxo::new(
+            broadcaster_core::notes::Note::new_change(
+                view.scan_keys().master_public_key,
+                Address::repeat_byte(2),
+                U256::from(9),
+                [7; 16],
+            ),
+            0,
+            position,
+            UtxoSource {
+                tx_hash: B256::ZERO,
+                block_number: 0,
+                block_timestamp: 0,
+            },
+            UtxoCommitmentKind::Shield,
+        )
+    };
+    // Each fee round proves a different call under the same execution nonce.
+    let call = |prepared: &crate::PreparedExecutorOperation, input: &Utxo, round: usize| {
+        let executor = prepared.context().executor;
+        railgun_wallet::TransactionCall {
+            to: executor,
+            data: RelayAdapt7702::executeCall {
+                _transactions: vec![Transaction {
+                    proof: SnarkProof::default(),
+                    merkleRoot: B256::ZERO,
+                    nullifiers: vec![B256::from(input.nullifier(view.scan_keys().nullifying_key))],
+                    commitments: vec![B256::repeat_byte(8); round],
+                    boundParams: BoundParams::new_transact(
+                        0,
+                        0,
+                        1,
+                        Vec::new(),
+                        executor,
+                        B256::ZERO,
+                    ),
+                    unshieldPreimage: CommitmentPreimage::empty(),
+                }],
+                _actionData: RelayAdapt7702ActionData {
+                    requireSuccess: true,
+                    minGasLimit: U256::ZERO,
+                    calls: Vec::new(),
+                },
+                _nonce: prepared.context().execution_nonce,
+                _signature: Bytes::new(),
+            }
+            .abi_encode()
+            .into(),
+        }
+    };
+    let requests = || rpc.state.requests.lock().unwrap().len();
+    let record = |operation| {
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    };
+
+    let operation = ExecutorOperationId::random().unwrap();
+    let prepared = owner
+        .prepare_operation(operation, delivery(), &password(), &[], None)
+        .await
+        .unwrap();
+    let spent = input(0);
+    let mut retry = crate::desktop::executors::IssueRetry::default();
+    let first = owner
+        .issue_operation_retrying(
+            &prepared,
+            &call(&prepared, &spent, 0),
+            std::slice::from_ref(&spent),
+            &password(),
+            &mut retry,
+        )
+        .await
+        .unwrap();
+    let before = requests();
+    let repriced = call(&prepared, &spent, 1);
+    let revised = owner
+        .issue_operation_retrying(
+            &prepared,
+            &repriced,
+            std::slice::from_ref(&spent),
+            &password(),
+            &mut retry,
+        )
+        .await
+        .unwrap();
+    assert_eq!(requests(), before, "a repriced round reuses its evidence");
+    assert_ne!(revised.payload_hash(), first.payload_hash());
+    let signed =
+        RelayAdapt7702::executeCall::abi_decode(revised.transaction().input.input().unwrap())
+            .unwrap();
+    assert_eq!(
+        alloy::primitives::Signature::try_from(signed._signature.as_ref())
+            .unwrap()
+            .recover_address_from_prehash(&prepared.context().signing_hash(&repriced).unwrap())
+            .unwrap(),
+        prepared.context().executor
+    );
+    let saved = record(operation);
+    assert_eq!(saved.issued().len(), 2);
+    assert!(saved.issued().iter().any(|payload| {
+        payload.hash() == revised.payload_hash()
+            && payload.context().calldata() == revised.transaction().input.input().unwrap()
+    }));
+    assert!(
+        saved
+            .reserved_inputs()
+            .iter()
+            .any(|reserved| reserved.matches(&spent))
+    );
+    // A payload sent under this context may have executed; recheck the chain.
+    store
+        .record_submission(operation, first.payload_hash(), B256::repeat_byte(0x77))
+        .unwrap();
+    let before = requests();
+    owner
+        .issue_operation_retrying(
+            &prepared,
+            &call(&prepared, &spent, 2),
+            std::slice::from_ref(&spent),
+            &password(),
+            &mut retry,
+        )
+        .await
+        .unwrap();
+    assert!(
+        requests() > before,
+        "a sent payload requires fresh evidence"
+    );
+
+    // History reconciliation may drop the durable observation between rounds.
+    let operation = ExecutorOperationId::random().unwrap();
+    let prepared = owner
+        .prepare_operation(operation, delivery(), &password(), &[], None)
+        .await
+        .unwrap();
+    let spent = input(1);
+    let mut retry = crate::desktop::executors::IssueRetry::default();
+    owner
+        .issue_operation_retrying(
+            &prepared,
+            &call(&prepared, &spent, 0),
+            std::slice::from_ref(&spent),
+            &password(),
+            &mut retry,
+        )
+        .await
+        .unwrap();
+    store.invalidate_observation(operation).unwrap();
+    let before = requests();
+    owner
+        .issue_operation_retrying(
+            &prepared,
+            &call(&prepared, &spent, 1),
+            std::slice::from_ref(&spent),
+            &password(),
+            &mut retry,
+        )
+        .await
+        .unwrap();
+    assert!(
+        requests() > before,
+        "an invalidated observation requires fresh evidence"
+    );
+    assert_eq!(record(operation).issued().len(), 2);
+    owner.shutdown().await;
     drop(owner);
     drop(store);
     drop(view);

@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(replacement.records().unwrap().len(), 1);
         assert_eq!(
             replacement.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Uncertain)
+            Some(vault::ExecutorPayloadStatus::Executed)
         );
         assert_eq!(
             records.records().unwrap()[0].payload_status(payload_hash),

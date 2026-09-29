@@ -26,6 +26,7 @@ mod assets;
 mod broadcaster;
 mod progress;
 mod retry;
+pub(in crate::root) use broadcaster::{RecoveryPickerContext, same_offer};
 
 use crate::root::public_action::PublicActionStepStatus;
 use progress::{RecoveryProgress, RecoveryProgressSource, recovery_execution_status};

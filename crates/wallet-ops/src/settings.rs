@@ -31,6 +31,7 @@ mod network_chains;
 mod poi_broadcaster;
 mod presets;
 mod storage;
+mod swaps;
 mod tokens_gas_waku;
 mod validation;
 mod walletconnect;
@@ -50,6 +51,7 @@ pub use mutation::*;
 pub use network_chains::*;
 pub use poi_broadcaster::*;
 pub use storage::*;
+pub use swaps::*;
 pub use tokens_gas_waku::*;
 pub use walletconnect::*;
 

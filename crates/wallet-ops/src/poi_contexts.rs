@@ -544,7 +544,7 @@ fn pending_output_poi_context_record(
     }
 }
 
-async fn create_pending_output_poi_contexts(
+pub(crate) async fn create_pending_output_poi_contexts(
     session: &WalletSession,
     records: &[PendingOutputPoiContextRecord],
 ) -> Result<usize> {

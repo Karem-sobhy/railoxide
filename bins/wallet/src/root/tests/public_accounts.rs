@@ -29,7 +29,7 @@ impl Render for PublicListWindow {
     }
 }
 
-fn fixture_root(
+pub(in crate::root) fn fixture_root(
     path: &std::path::Path,
     runtime: &tokio::runtime::Runtime,
     window: &mut Window,

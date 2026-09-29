@@ -150,6 +150,11 @@ fn account_status(record: &ExecutorRecord, overdue: bool) -> ExecutorAccountStat
             executed |= winner.purpose() == ExecutorPayloadPurpose::Operation;
             continue;
         }
+        // Swap hooks run inside settlements and never get a direct-call inclusion. A hook
+        // that took this nonce by recorded observations settles the group.
+        if record.swap_hook_winner(payload.nonce()).is_some() {
+            continue;
+        }
         unresolved = true;
         for pending in group() {
             recovery_pending |= pending.purpose() == ExecutorPayloadPurpose::Recovery;
@@ -266,7 +271,7 @@ fn account_status(record: &ExecutorRecord, overdue: bool) -> ExecutorAccountStat
             || recovery_pending
             || reserved_revert
             || (unconfirmed && overdue && rechecked.is_some()),
-        unresolved: unresolved || (rechecked.is_none() && !record.reserved_inputs().is_empty()),
+        unresolved: unresolved || (rechecked.is_none() && record.reserves_inputs_before_release()),
     }
 }
 
@@ -276,8 +281,10 @@ mod tests {
     use crate::vault::{
         ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
         ExecutorPayloadInclusion, IssuedExecutorPayload, IssuedExecutorRecoveryTransaction,
+        SwapDelivery, SwapObservation, SwapOrderObservations, SwapProof, SwapRecipient,
+        SwapShieldObservation, SwapTerms,
     };
-    use alloy::primitives::{Address, B256, Bytes, U256};
+    use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
     use alloy::rpc::types::TransactionRequest;
 
     fn record(
@@ -340,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_winner_resolves_competing_attempts_but_restart_keeps_freshness_separate() {
+    fn canonical_winner_remains_visible_when_an_explicit_check_is_unavailable() {
         let saved = record(
             &[
                 payload(
@@ -358,11 +365,26 @@ mod tests {
         assert_eq!(status.outcome, ExecutorAccountOutcome::RecoveryConfirmed);
         assert!(!status.needs_attention && !status.unresolved);
         assert!(status.rechecked.is_some());
-        let mut restarted = saved;
-        restarted.require_reconciliation();
-        let status = account_status(&restarted, true);
+        let mut unavailable = saved;
+        unavailable.require_reconciliation();
+        let status = account_status(&unavailable, true);
         assert_eq!(status.outcome, ExecutorAccountOutcome::RecoveryConfirmed);
         assert!(status.rechecked.is_none());
+        // A release frees the winner's notes for other operations, but an account whose
+        // explicit check failed stays unresolved.
+        let mut spent = payload(
+            ExecutorPayloadPurpose::Operation,
+            Some(ExecutorExecutionResult::Executed),
+        );
+        spent["context"]["inputs"] =
+            serde_json::json!([{ "tree": 0, "position": 1, "commitment": U256::from(7) }]);
+        let mut released = serde_json::to_value(record(&[spent], &[])).unwrap();
+        released["released_payloads"] = serde_json::json!([B256::repeat_byte(5)]);
+        let mut released: ExecutorRecord = serde_json::from_value(released).unwrap();
+        released.require_reconciliation();
+        assert!(released.reserved_inputs().is_empty());
+        let status = account_status(&released, false);
+        assert!(status.rechecked.is_none() && status.unresolved);
         // Reorg removes the winner; the older signed operation is live again.
         let reorg = record(
             &[
@@ -473,9 +495,9 @@ mod tests {
             ..coverage
         };
         assert!(!behind.is_overdue(&pending, &submissions));
-        let mut restarted = pending;
-        restarted.require_reconciliation();
-        assert!(!account_status(&restarted, true).needs_attention);
+        let mut unavailable = pending;
+        unavailable.require_reconciliation();
+        assert!(!account_status(&unavailable, true).needs_attention);
         let mut newer = payload(ExecutorPayloadPurpose::Operation, None);
         newer["nonce"] = serde_json::json!(U256::ONE);
         newer["hash"] = serde_json::json!(B256::repeat_byte(6));
@@ -495,5 +517,80 @@ mod tests {
             !coverage.is_overdue(&mixed, &submissions),
             "a completed older operation cannot age a newly signed one"
         );
+    }
+
+    #[test]
+    fn swap_hooks_settle_their_nonces_from_recorded_order_observations() {
+        let hook = |nonce: u64, hash: u8, purpose| {
+            let mut hook = payload(purpose, None);
+            hook["nonce"] = serde_json::json!(U256::from(nonce));
+            hook["hash"] = serde_json::json!(B256::repeat_byte(hash));
+            hook
+        };
+        let swap = |observations: SwapOrderObservations| {
+            let mut saved = serde_json::to_value(record(
+                &[
+                    payload(
+                        ExecutorPayloadPurpose::Operation,
+                        Some(ExecutorExecutionResult::Executed),
+                    ),
+                    hook(1, 6, ExecutorPayloadPurpose::SwapPreHook),
+                    hook(2, 7, ExecutorPayloadPurpose::SwapPostHook),
+                ],
+                &[],
+            ))
+            .unwrap();
+            saved["nonce_observation"] = serde_json::json!(ExecutorNonceObservation::new(
+                BlockNumHash::new(20, B256::repeat_byte(20)),
+                U256::from(3),
+            ));
+            saved["swap"] = serde_json::json!({
+                "terms": SwapTerms::new(
+                    Address::repeat_byte(3),
+                    Address::repeat_byte(4),
+                    SwapRecipient::new(U256::ONE, [0; 32]),
+                    B256::repeat_byte(5),
+                ),
+                "proof": SwapProof::new(B256::repeat_byte(9), Vec::new()),
+                "orders": [{
+                    "attempt": 0, "uid": FixedBytes::<56>::repeat_byte(8),
+                    "delivery": SwapDelivery::Reshield,
+                    "bounds": {
+                        "sell_amount": U256::ONE, "buy_amount": U256::ONE,
+                        "private_minimum": U256::ONE, "shield_fee_bps": U256::ZERO,
+                        "slippage_bps": 0, "pre_hook_gas_limit": 0, "post_hook_gas_limit": 0,
+                        "anchors": [],
+                    },
+                    "pre_hook": { "nonce": U256::ONE, "payload": B256::repeat_byte(6) },
+                    "post_hook": { "nonce": U256::from(2), "payload": B256::repeat_byte(7) },
+                    "invalidates": null, "observations": observations,
+                }],
+            });
+            serde_json::from_value::<ExecutorRecord>(saved).unwrap()
+        };
+        let observation = SwapObservation {
+            block: BlockNumHash::new(15, B256::repeat_byte(15)),
+            transaction_hash: None,
+        };
+        let traded = SwapOrderObservations {
+            pre_hook_executed: Some(observation),
+            traded: Some(observation),
+            ..SwapOrderObservations::default()
+        };
+        assert!(
+            account_status(&swap(traded), false).unresolved,
+            "the post-hook has not taken its nonce before its shield is recorded"
+        );
+        let shielded = SwapOrderObservations {
+            shielded: Some(SwapShieldObservation {
+                observation,
+                private_amount: U256::ONE,
+                fee: None,
+            }),
+            ..traded
+        };
+        let status = account_status(&swap(shielded), false);
+        assert_eq!(status.outcome, ExecutorAccountOutcome::Executed);
+        assert!(!status.unresolved);
     }
 }

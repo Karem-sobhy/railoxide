@@ -24,16 +24,12 @@ pub(crate) const GAS_PRICE_BUFFER_DENOMINATOR: u128 = 100;
 pub(crate) const PUBLIC_BROADCASTER_FEE_ATTEMPTS: usize = 5;
 pub(crate) const PUBLIC_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR: U256 = uint!(100_U256);
-pub(crate) const APPROX_BASE_GAS: u64 = 650_000;
-pub(crate) const APPROX_GAS_PER_INPUT: u64 = 155_000;
-pub(crate) const APPROX_GAS_PER_PRIVATE_OUTPUT: u64 = 85_000;
-pub(crate) const APPROX_GAS_PER_PUBLIC_OUTPUT: u64 = 65_000;
-pub(crate) const APPROX_GAS_PER_TRANSACTION: u64 = 120_000;
-pub(crate) const APPROX_SEND_EXTRA_GAS: u64 = 40_000;
-pub(crate) const APPROX_UNWRAP_EXTRA_GAS: u64 = 50_000;
-pub(crate) const APPROX_SAFETY_GAS: u64 = 150_000;
-pub(crate) const APPROX_GAS_UPLIFT_NUMERATOR: u64 = 112;
-pub(crate) const APPROX_GAS_UPLIFT_DENOMINATOR: u64 = 100;
+/// Intrinsic gas of every transaction, which the shared Railgun gas model leaves out.
+pub(crate) const TRANSACTION_INTRINSIC_GAS: u64 = 21_000;
+/// One native unwrap inside a relay call: the wrapped token's `withdraw` and the native
+/// transfer out, which can pay the 25,000 new-account charge. The public wallet's unwrap units
+/// are a whole transaction's and include the intrinsic gas instead.
+pub(crate) const RELAY_NATIVE_UNWRAP_GAS: u64 = 50_000;
 pub(crate) const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str =
     "public broadcaster max entered amount: ";
 pub(crate) const PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR: &str =

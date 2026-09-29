@@ -75,6 +75,8 @@ pub(super) enum BroadcasterPickerTarget {
         key: UnshieldAssetKey,
     },
     Recovery(WeakEntity<super::stealth_accounts::StealthAccountsView>),
+    /// The broadcaster that sets up a private swap's stealth account.
+    Swap(WeakEntity<super::private_swap::PrivateSwapsView>),
 }
 
 impl BroadcasterPickerTarget {
@@ -88,6 +90,7 @@ impl BroadcasterPickerTarget {
                 super::private_action::delivery_element_id(*key, *kind, suffix)
             }
             Self::Recovery(_) => format!("stealth-recovery-broadcaster-{suffix}").into(),
+            Self::Swap(_) => format!("swap-setup-broadcaster-{suffix}").into(),
         }
     }
 }
@@ -764,6 +767,11 @@ impl WalletRoot {
                     view.set_recovery_allow_out_of_range(checked, cx);
                 });
             }),
+            BroadcasterPickerTarget::Swap(view) => cx.defer(move |cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.set_setup_allow_out_of_range(checked, cx);
+                });
+            }),
         }
     }
 
@@ -1090,6 +1098,17 @@ impl WalletRoot {
             cx.notify();
             return;
         }
+        if let BroadcasterPickerTarget::Swap(view) = target {
+            self.broadcaster_picker = None;
+            window.close_dialog(cx);
+            window.defer(cx, move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.choose_setup_broadcaster(railgun_address, window, cx);
+                });
+            });
+            cx.notify();
+            return;
+        }
         let BroadcasterPickerTarget::Private { kind, key } = target else {
             return;
         };
@@ -1150,6 +1169,9 @@ impl WalletRoot {
             BroadcasterPickerTarget::Recovery(view) => {
                 Some(view.upgrade()?.read(cx).recovery_picker_context()?)
             }
+            BroadcasterPickerTarget::Swap(view) => {
+                Some(view.upgrade()?.read(cx).setup_picker_context()?)
+            }
             BroadcasterPickerTarget::Private { .. } => None,
         };
         let (
@@ -1201,21 +1223,23 @@ impl WalletRoot {
                     form.estimating_cost,
                 )
             }),
-            BroadcasterPickerTarget::Recovery(_) => recovery.as_ref().map(|data| {
-                (
-                    data.chain_id,
-                    data.token,
-                    false,
-                    data.choice.clone(),
-                    data.busy,
-                    data.allow_out_of_range,
-                    data.favorites_only,
-                    false,
-                    None,
-                    data.estimating,
-                    false,
-                )
-            }),
+            BroadcasterPickerTarget::Recovery(_) | BroadcasterPickerTarget::Swap(_) => {
+                recovery.as_ref().map(|data| {
+                    (
+                        data.chain_id,
+                        data.token,
+                        false,
+                        data.choice.clone(),
+                        data.busy,
+                        data.allow_out_of_range,
+                        data.favorites_only,
+                        false,
+                        None,
+                        data.estimating,
+                        false,
+                    )
+                })
+            }
         })?;
         let query = picker
             .query_input

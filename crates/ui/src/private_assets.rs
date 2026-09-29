@@ -218,6 +218,36 @@ pub fn private_pending_status(
     detail: Option<SharedString>,
     action: impl IntoElement,
 ) -> gpui::Div {
+    pending_status_card(
+        Icon::empty().path("railgun/icons/clock.svg"),
+        title,
+        detail,
+        action,
+    )
+}
+
+/// The pending-status card for work that needs the user's decision. The icon pairs with a
+/// title that names the condition, so the state isn't carried by color alone.
+#[must_use]
+pub fn private_attention_status(
+    title: impl Into<SharedString>,
+    detail: Option<SharedString>,
+    action: impl IntoElement,
+) -> gpui::Div {
+    pending_status_card(
+        Icon::new(gpui_component::IconName::TriangleAlert),
+        title,
+        detail,
+        action,
+    )
+}
+
+fn pending_status_card(
+    icon: Icon,
+    title: impl Into<SharedString>,
+    detail: Option<SharedString>,
+    action: impl IntoElement,
+) -> gpui::Div {
     let mut background = rgb(theme::WARNING);
     background.a = 0.08;
     div()
@@ -230,12 +260,7 @@ pub fn private_pending_status(
         .border_color(rgb(theme::BORDER))
         .bg(background)
         .p_3()
-        .child(
-            Icon::empty()
-                .path("railgun/icons/clock.svg")
-                .small()
-                .text_color(rgb(theme::WARNING)),
-        )
+        .child(icon.small().text_color(rgb(theme::WARNING)))
         .child(
             div()
                 .flex_1()

@@ -358,6 +358,7 @@ impl Render for WalletRoot {
         self.sync_walletconnect_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
         self.ensure_stealth_accounts(window, cx);
+        self.ensure_private_swaps(window, cx);
         if should_apply_background_focus(window.has_active_dialog(cx)) {
             self.focus_vault_input_if_requested(window, cx);
             self.focus_utxo_table_if_requested(window, cx);
@@ -1237,7 +1238,7 @@ impl WalletRoot {
         cx: &gpui::App,
     ) -> gpui::AnyElement {
         match self.active_wallet_tab {
-            WalletTab::Private => self.render_private_assets_body(root),
+            WalletTab::Private => self.render_private_assets_body(root, cx),
             WalletTab::Public => self.render_public_wallet_body(root, window, cx),
             WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
         }

@@ -6,22 +6,24 @@ use std::time::{Duration, Instant};
 use super::DeliveryMode;
 use alloy::primitives::U256;
 use gpui::{
-    AnyElement, App, AppContext, Axis, ClickEvent, Context, Entity, Focusable, InteractiveElement,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
-    prelude::FluentBuilder as _, px, rgb,
+    prelude::FluentBuilder as _, px, relative, rgb,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
     alert::Alert,
-    button::{Button, ButtonGroup, ButtonVariants},
+    button::ButtonVariants,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList},
     input::{InputEvent, InputState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text, app_text};
+use ui::private_action::asset_row;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
 #[cfg(feature = "hardware")]
@@ -32,11 +34,9 @@ use wallet_ops::hardware::{
     trezor::{TrezorHardwareDerivationClient, TrezorPinMatrixProvider},
 };
 #[cfg(feature = "hardware")]
+use wallet_ops::vault::{DesktopVaultStore, DesktopViewSession, HardwareProfileSession};
 use wallet_ops::vault::{
-    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, VaultError,
-};
-use wallet_ops::vault::{
-    PublicAccountSource, SoftwareSeedSessionBinding, WalletSoftwareContextKind,
+    PublicAccountSource, SoftwareSeedSessionBinding, VaultError, WalletSoftwareContextKind,
 };
 use wallet_ops::{
     BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, SponsoredAuthorizationLimit,
@@ -58,6 +58,8 @@ const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "Spending remains authorized f
 const SUMMARY_RECIPIENT_PREFIX_CHARS: usize = 8;
 const SUMMARY_RECIPIENT_SUFFIX_CHARS: usize = 8;
 const SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS: usize = 28;
+/// Wide enough for the longest lifetime label, "Until vault locks/app closes".
+const SPEND_AUTHORIZATION_LIFETIME_SELECT_WIDTH: gpui::Pixels = px(248.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationLifetime {
@@ -67,7 +69,28 @@ pub(super) enum SpendAuthorizationLifetime {
     UntilVaultLock,
 }
 
+type SpendAuthorizationLifetimeSelect = SelectState<SearchableVec<SpendAuthorizationLifetime>>;
+
+impl SelectItem for SpendAuthorizationLifetime {
+    type Value = Self;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.label())
+    }
+
+    fn value(&self) -> &Self::Value {
+        self
+    }
+}
+
 impl SpendAuthorizationLifetime {
+    const ALL: [Self; 4] = [
+        Self::Once,
+        Self::FiveMinutes,
+        Self::FifteenMinutes,
+        Self::UntilVaultLock,
+    ];
+
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Once => "Just this spend",
@@ -168,6 +191,10 @@ pub(super) enum SpendAuthorizationIntent {
         Entity<super::stealth_accounts::StealthAccountsView>,
         Arc<super::stealth_accounts::StealthAuthorization>,
     ),
+    PrivateSwap(
+        Entity<super::private_swap::PrivateSwapsView>,
+        Arc<super::private_swap::SwapAuthorization>,
+    ),
     PrepareExecutorUnshield(
         UnshieldAssetKey,
         Arc<super::private_action::ExecutorUnshieldApproval>,
@@ -226,6 +253,7 @@ impl SpendAuthorizationIntent {
                 return Some(HardwareExecutorAction::Execute(review.prepared.operation()));
             }
             Self::StealthAccounts(_, command) => return Some(command.hardware_executor_action()),
+            Self::PrivateSwap(_, command) => return Some(command.hardware_executor_action()),
             Self::PrivateSend(key, ..) | Self::PrivateUnshield(key, ..) => {
                 let (delivery, uuid) = if let Self::PrivateSend(..) = self {
                     let form = root.send_forms.get(key)?;
@@ -337,6 +365,9 @@ impl SpendAuthorizationIntent {
         if let Self::StealthAccounts(_, command) = self {
             return root.stealth_session_is_current(command.session());
         }
+        if let Self::PrivateSwap(_, command) = self {
+            return root.stealth_session_is_current(command.session());
+        }
         if let Self::ExecutorUnshield(key, review, _) = self
             && !root
                 .unshield_forms
@@ -380,6 +411,7 @@ impl SpendAuthorizationIntent {
             self,
             Self::PrivateSend(..)
                 | Self::StealthAccounts(..)
+                | Self::PrivateSwap(..)
                 | Self::PrivateUnshield(..)
                 | Self::PrepareExecutorUnshield(..)
                 | Self::ExecutorUnshield(..)
@@ -481,11 +513,16 @@ pub(super) struct SpendAuthorizationSummary {
     title: Arc<str>,
     detail: Arc<str>,
     confirm_label: Arc<str>,
-    context: Option<Arc<str>>,
+    context: Option<SpendAuthorizationContext>,
+    asset_pair: Option<[SpendAuthorizationAsset; 2]>,
     rows: Vec<SpendAuthorizationSummaryRow>,
     warnings: Vec<Arc<str>>,
     payload: Option<SpendAuthorizationPayload>,
     requires_explicit_review: bool,
+    progress: Option<SpendAuthorizationProgress>,
+    title_chip: Option<Arc<str>>,
+    details: Option<SpendAuthorizationDetails>,
+    once_lifetime_note: Option<Arc<str>>,
 }
 
 impl SpendAuthorizationSummary {
@@ -499,10 +536,15 @@ impl SpendAuthorizationSummary {
             detail: detail.into(),
             confirm_label: "Authorize and continue".into(),
             context: None,
+            asset_pair: None,
             rows,
             warnings: Vec::new(),
             payload: None,
             requires_explicit_review: false,
+            progress: None,
+            title_chip: None,
+            details: None,
+            once_lifetime_note: None,
         }
     }
 
@@ -512,12 +554,84 @@ impl SpendAuthorizationSummary {
     }
 
     pub(super) fn with_context(mut self, context: impl Into<Arc<str>>) -> Self {
-        self.context = Some(context.into());
+        self.context = Some(SpendAuthorizationContext::Text(context.into()));
+        self
+    }
+
+    pub(super) fn with_info_context(
+        mut self,
+        title: impl Into<Arc<str>>,
+        message: impl Into<Arc<str>>,
+    ) -> Self {
+        self.context = Some(SpendAuthorizationContext::Info {
+            title: title.into(),
+            message: message.into(),
+        });
+        self
+    }
+
+    pub(super) fn with_asset_pair(
+        mut self,
+        sell: SpendAuthorizationAsset,
+        buy: SpendAuthorizationAsset,
+    ) -> Self {
+        self.asset_pair = Some([sell, buy]);
         self
     }
 
     pub(super) fn with_warnings(mut self, warnings: Vec<Arc<str>>) -> Self {
         self.warnings = warnings;
+        self
+    }
+
+    /// A step indicator under the title: `step` of `total` dots filled, then `note`.
+    pub(super) fn with_progress(
+        mut self,
+        step: usize,
+        total: usize,
+        note: impl Into<Arc<str>>,
+    ) -> Self {
+        self.progress = Some(SpendAuthorizationProgress {
+            step,
+            total,
+            note: note.into(),
+        });
+        self
+    }
+
+    /// A small chip beside the title, such as the chain.
+    pub(super) fn with_title_chip(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.title_chip = Some(label.into());
+        self
+    }
+
+    /// A collapsed disclosure under the rows. With it, the rows and the disclosure share a card.
+    pub(super) fn with_details<L, V>(
+        mut self,
+        title: impl Into<Arc<str>>,
+        collapsed_summary: impl Into<Arc<str>>,
+        rows: Vec<(L, V)>,
+        note: Option<&str>,
+    ) -> Self
+    where
+        L: Into<Arc<str>>,
+        V: Into<Arc<str>>,
+    {
+        self.details = Some(SpendAuthorizationDetails {
+            title: title.into(),
+            collapsed_summary: collapsed_summary.into(),
+            rows: rows
+                .into_iter()
+                .map(|(label, value)| (label.into(), value.into()))
+                .collect(),
+            note: note.map(Arc::from),
+        });
+        self
+    }
+
+    /// A hint under the lifetime select while it offers only this spend.
+    pub(super) fn with_once_lifetime_note(mut self, note: impl Into<Arc<str>>) -> Self {
+        self.once_lifetime_note = Some(note.into());
         self
     }
 
@@ -561,6 +675,42 @@ impl SpendAuthorizationSummary {
     }
 }
 
+#[derive(Clone)]
+struct SpendAuthorizationProgress {
+    step: usize,
+    total: usize,
+    note: Arc<str>,
+}
+
+#[derive(Clone)]
+struct SpendAuthorizationDetails {
+    title: Arc<str>,
+    collapsed_summary: Arc<str>,
+    rows: Vec<(Arc<str>, Arc<str>)>,
+    note: Option<Arc<str>>,
+}
+
+#[derive(Clone)]
+enum SpendAuthorizationContext {
+    Text(Arc<str>),
+    Info { title: Arc<str>, message: Arc<str> },
+}
+
+#[derive(Clone)]
+pub(super) struct SpendAuthorizationAsset {
+    label: Arc<str>,
+    icon: Option<WalletIconSource>,
+}
+
+impl SpendAuthorizationAsset {
+    pub(super) fn new(label: impl Into<Arc<str>>, icon: Option<WalletIconSource>) -> Self {
+        Self {
+            label: label.into(),
+            icon,
+        }
+    }
+}
+
 pub(in crate::root) const fn spend_authorization_can_use_cached_password(
     summary: &SpendAuthorizationSummary,
 ) -> bool {
@@ -601,6 +751,35 @@ impl gpui::Render for SpendAuthorizationPayloadDisclosure {
     }
 }
 
+/// The details disclosure for a dialog without its own content entity.
+struct SpendAuthorizationDetailsDisclosure {
+    details: SpendAuthorizationDetails,
+    open: bool,
+}
+
+impl SpendAuthorizationDetailsDisclosure {
+    const fn new(details: SpendAuthorizationDetails) -> Self {
+        Self {
+            details,
+            open: false,
+        }
+    }
+
+    fn toggle(&mut self, cx: &mut Context<'_, Self>) {
+        self.open = !self.open;
+        cx.notify();
+    }
+}
+
+impl gpui::Render for SpendAuthorizationDetailsDisclosure {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let disclosure = cx.entity();
+        render_spend_authorization_details(&self.details, self.open, move |_, _, cx| {
+            disclosure.update(cx, Self::toggle);
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SpendAuthorizationSummaryRow {
     label: Arc<str>,
@@ -608,6 +787,7 @@ pub(super) struct SpendAuthorizationSummaryRow {
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
     delta: Option<SpendAuthorizationAmountDelta>,
+    note: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -624,7 +804,14 @@ impl SpendAuthorizationSummaryRow {
             icon_path: None,
             shortened_copyable: false,
             delta: None,
+            note: None,
         }
+    }
+
+    /// A muted line under the value. Shown for plain and icon values.
+    pub(super) fn with_note(mut self, note: impl Into<Arc<str>>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     pub(super) fn with_icon(mut self, icon_path: Option<WalletIconSource>) -> Self {
@@ -671,8 +858,12 @@ struct SpendAuthorizationDialogContent {
     summary: SpendAuthorizationSummary,
     password_input: Entity<InputState>,
     lifetime: SpendAuthorizationLifetime,
+    lifetime_select: Entity<SpendAuthorizationLifetimeSelect>,
     payload_open: bool,
+    details_open: bool,
     error: Option<Arc<str>>,
+    pending: bool,
+    cancelled: bool,
     review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
     review_focus: gpui::FocusHandle,
 }
@@ -702,6 +893,7 @@ struct HardwareSpendAuthorizationDialogContent {
     cancelled: bool,
     completed: bool,
     payload_open: bool,
+    details_open: bool,
     error: Option<Arc<str>>,
 }
 
@@ -724,6 +916,7 @@ impl HardwareSpendAuthorizationDialogContent {
             cancelled: false,
             completed: false,
             payload_open: false,
+            details_open: false,
             error: None,
         }
     }
@@ -747,6 +940,11 @@ impl HardwareSpendAuthorizationDialogContent {
 
     fn toggle_payload(&mut self, cx: &mut Context<'_, Self>) {
         self.payload_open = !self.payload_open;
+        cx.notify();
+    }
+
+    fn toggle_details(&mut self, cx: &mut Context<'_, Self>) {
+        self.details_open = !self.details_open;
         cx.notify();
     }
 
@@ -939,14 +1137,28 @@ impl SpendAuthorizationDialogContent {
             },
         )
         .detach();
+        let lifetime_select = new_spend_authorization_lifetime_select(initial_lifetime, window, cx);
+        cx.subscribe(
+            &lifetime_select,
+            |this, _select, event: &SelectEvent<SearchableVec<SpendAuthorizationLifetime>>, cx| {
+                if let SelectEvent::Confirm(Some(lifetime)) = event {
+                    this.set_lifetime(*lifetime, cx);
+                }
+            },
+        )
+        .detach();
         Self {
             root,
             intent,
             summary,
             password_input,
             lifetime: initial_lifetime,
+            lifetime_select,
             payload_open: false,
+            details_open: false,
             error: None,
+            pending: false,
+            cancelled: false,
             review_authorization: None,
             review_focus: cx.focus_handle(),
         }
@@ -964,6 +1176,9 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.pending || self.cancelled {
+            return;
+        }
         if let Some((scope, authorization)) = self.review_authorization.take() {
             let intent = self.intent.clone();
             self.root.update(cx, |root, cx| {
@@ -989,16 +1204,81 @@ impl SpendAuthorizationDialogContent {
             return;
         }
 
-        let intent = self.intent.clone();
+        let root = self.root.read(cx);
+        let Some(store) = root.vault_store.clone() else {
+            self.error = Some("Wallet vault storage is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let approved_scope = root.current_spend_authorization_scope();
+        let approved_generation = root.active_wallet_generation;
         let lifetime = self.lifetime;
-        let root = self.root.clone();
-        root.update(cx, |root, cx| {
-            root.finish_spend_authorization(intent, password, lifetime, window, cx);
+        // Check the password before dismissing the review or starting an operation.
+        // The operation still obtains its own scoped spend grant when it runs.
+        let join = root.runtime.spawn_blocking(move || {
+            store.create_spend_grant(&password).map(drop)?;
+            Ok::<_, VaultError>(password)
         });
+        self.pending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result.map_err(|error| match error {
+                    VaultError::UnlockFailed => Arc::from("Incorrect vault password. Try again."),
+                    error => error.to_string().into(),
+                }),
+                Err(_) => Err("Password check failed. Try again.".into()),
+            };
+            let _ = this.update_in(cx, |dialog, window, cx| {
+                dialog.pending = false;
+                if dialog.cancelled {
+                    return;
+                }
+                let root = dialog.root.clone();
+                if root.read(cx).active_wallet_generation != approved_generation
+                    || root.read(cx).current_spend_authorization_scope() != approved_scope
+                {
+                    dialog.cancel(cx);
+                    dialog.error = Some(
+                        "The wallet session changed. Close this dialog and authorize the action again."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(password) => {
+                        let intent = dialog.intent.clone();
+                        if let Err(error) = root.update(cx, |root, cx| {
+                            root.finish_spend_authorization(intent, password, lifetime, window, cx)
+                        }) {
+                            dialog.error = Some(error);
+                            dialog.focus_password(window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        root.update(cx, WalletRoot::clear_spend_authorization);
+                        dialog.error = Some(error);
+                        dialog.focus_password(window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel(&mut self, cx: &mut Context<'_, Self>) {
+        self.cancelled = true;
+        self.root.update(cx, |root, cx| {
+            root.cancel_spend_authorization(&self.intent, cx);
+        });
+        cx.notify();
     }
 
     fn set_lifetime(&mut self, lifetime: SpendAuthorizationLifetime, cx: &mut Context<'_, Self>) {
-        if self.lifetime != lifetime {
+        if !self.pending && self.lifetime != lifetime {
             self.lifetime = lifetime;
             cx.notify();
         }
@@ -1008,31 +1288,53 @@ impl SpendAuthorizationDialogContent {
         self.payload_open = !self.payload_open;
         cx.notify();
     }
+
+    fn toggle_details(&mut self, cx: &mut Context<'_, Self>) {
+        self.details_open = !self.details_open;
+        cx.notify();
+    }
 }
 
 impl gpui::Render for SpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
-        let lifetime_dialog = dialog.clone();
-        let cancel_root = self.root.clone();
-        let cancel_intent = self.intent.clone();
+        let cancel_dialog = dialog.clone();
         let payload_dialog = dialog.clone();
+        let details_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
             })
         });
+        let details = self.summary.details.as_ref().map(|details| {
+            render_spend_authorization_details(details, self.details_open, move |_, _, cx| {
+                details_dialog.update(cx, Self::toggle_details);
+            })
+            .into_any_element()
+        });
+        let once_lifetime_note = self
+            .summary
+            .once_lifetime_note
+            .as_ref()
+            .filter(|_| self.lifetime == SpendAuthorizationLifetime::Once);
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
+            .when_some(self.summary.progress.as_ref(), |this, progress| {
+                this.child(render_spend_authorization_progress(progress))
+            })
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
-            .child(render_spend_authorization_summary(&self.summary, cx))
+            .child(render_spend_authorization_summary(
+                &self.summary,
+                details,
+                cx,
+            ))
             .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(app_muted_text(context.to_string()).whitespace_normal())
+                this.child(render_spend_authorization_context(context))
             })
             .children(
                 self.summary
@@ -1049,15 +1351,21 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             )
             .children(payload)
             .when(self.review_authorization.is_none(), |this| {
-                this.child(app_masked_input(&self.password_input, false))
-                    .child(app_muted_text("Remember authorization"))
-                    .child(render_spend_authorization_lifetime_buttons(
-                        self.lifetime,
-                        move |lifetime, cx| {
-                            lifetime_dialog
-                                .update(cx, |dialog, cx| dialog.set_lifetime(lifetime, cx));
-                        },
-                    ))
+                this.child(app_masked_input(
+                    &self.password_input,
+                    self.pending || self.cancelled,
+                ))
+                .child(render_spend_authorization_lifetime_row(
+                    &self.lifetime_select,
+                    self.pending || self.cancelled,
+                ))
+                .when_some(once_lifetime_note, |this, note| {
+                    this.child(
+                        app_muted_text(note.to_string())
+                            .text_xs()
+                            .whitespace_normal(),
+                    )
+                })
             })
             .when(
                 self.review_authorization.is_none()
@@ -1073,7 +1381,12 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                 },
             )
             .when_some(self.error.as_ref(), |this, error| {
-                this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
+                this.child(
+                    app_muted_text(error.to_string())
+                        .whitespace_normal()
+                        .text_color(rgb(theme::DANGER))
+                        .debug_selector(|| "wallet-spend-auth-error".into()),
+                )
             })
             .child(
                 div()
@@ -1086,9 +1399,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         app_button("wallet-spend-auth-cancel", "Cancel")
                             .flex_none()
                             .on_click(move |_event, window, cx| {
-                                cancel_root.update(cx, |root, cx| {
-                                    root.cancel_spend_authorization(&cancel_intent, cx);
-                                });
+                                cancel_dialog.update(cx, Self::cancel);
                                 window.close_dialog(cx);
                             }),
                     )
@@ -1100,6 +1411,8 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         .track_focus(&self.review_focus)
                         .primary()
                         .flex_none()
+                        .loading(self.pending)
+                        .disabled(self.pending || self.cancelled)
                         .on_click(move |_event, window, cx| {
                             dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
                         }),
@@ -1112,10 +1425,17 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
         let payload_dialog = dialog.clone();
+        let details_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
             })
+        });
+        let details = self.summary.details.as_ref().map(|details| {
+            render_spend_authorization_details(details, self.details_open, move |_, _, cx| {
+                details_dialog.update(cx, Self::toggle_details);
+            })
+            .into_any_element()
         });
         let pending = self.pending;
         let device = self.device_label;
@@ -1149,12 +1469,15 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
+            .when_some(self.summary.progress.as_ref(), |this, progress| {
+                this.child(render_spend_authorization_progress(progress))
+            })
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
-            .child(render_spend_authorization_summary(&self.summary, cx))
+            .child(render_spend_authorization_summary(&self.summary, details, cx))
             .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(app_muted_text(context.to_string()).whitespace_normal())
+                this.child(render_spend_authorization_context(context))
             })
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(
@@ -1240,11 +1563,14 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     }
 }
 
+/// The summary's asset pair and rows. With `details`, the rows and the details disclosure
+/// share a card.
 fn render_spend_authorization_summary(
     summary: &SpendAuthorizationSummary,
+    details: Option<AnyElement>,
     cx: &App,
-) -> DescriptionList {
-    DescriptionList::vertical()
+) -> gpui::Div {
+    let rows = DescriptionList::vertical()
         .large()
         .bordered(false)
         .columns(1)
@@ -1254,7 +1580,209 @@ fn render_spend_authorization_summary(
                 .iter()
                 .enumerate()
                 .map(|(row_index, row)| spend_authorization_summary_item(row_index, row, cx)),
+        );
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .when_some(summary.asset_pair.as_ref(), |this, [sell, buy]| {
+            this.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .text_size(theme::APP_TEXT_SIZE)
+                    .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
+                    .child(asset_row(
+                        sell.label.to_string(),
+                        sell.icon.clone().map(Into::into),
+                    ))
+                    .child(app_text("→"))
+                    .child(asset_row(
+                        buy.label.to_string(),
+                        buy.icon.clone().map(Into::into),
+                    )),
+            )
+        })
+        .map(|this| match details {
+            Some(details) => this.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_SUBTLE))
+                    .bg(rgb(theme::SETTINGS_INPUT_SURFACE))
+                    .child(rows)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER_SUBTLE))
+                            .child(details),
+                    ),
+            ),
+            None => this.child(rows),
+        })
+}
+
+/// A dialog title, with the summary's chip beside it when it has one.
+fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
+    let title = app_strong_text(title.to_owned());
+    let Some(chip) = chip else {
+        return title;
+    };
+    div()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(title)
+        .child(
+            app_muted_text(chip.to_owned())
+                .flex_none()
+                .text_xs()
+                .px_2()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(theme::BORDER)),
         )
+}
+
+fn render_spend_authorization_progress(progress: &SpendAuthorizationProgress) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children((0..progress.total).map(|index| {
+                    div()
+                        .size(px(8.0))
+                        .rounded_full()
+                        .bg(rgb(if index < progress.step {
+                            theme::PRIMARY
+                        } else {
+                            theme::BORDER
+                        }))
+                })),
+        )
+        .child(
+            app_text(progress.note.to_string())
+                .min_w_0()
+                .text_xs()
+                .text_color(rgb(theme::PRIMARY))
+                .whitespace_normal(),
+        )
+}
+
+fn render_spend_authorization_details(
+    details: &SpendAuthorizationDetails,
+    open: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Collapsible {
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .child(
+            div()
+                .id("wallet-spend-auth-details-toggle")
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(on_toggle)
+                .child(app_text(details.title.to_string()).flex_none())
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(!open, |this| {
+                            this.child(
+                                app_muted_text(details.collapsed_summary.to_string())
+                                    .min_w_0()
+                                    .truncate(),
+                            )
+                        })
+                        .child(
+                            gpui_component::Icon::new(if open {
+                                gpui_component::IconName::ChevronUp
+                            } else {
+                                gpui_component::IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .flex_none(),
+                        ),
+                ),
+        )
+        .content(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pt_2()
+                .children(details.rows.iter().map(|(label, value)| {
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            app_muted_text(label.to_string())
+                                .flex_none()
+                                .whitespace_nowrap(),
+                        )
+                        .child(
+                            app_text(value.to_string())
+                                .flex_1()
+                                .min_w_0()
+                                .text_right()
+                                .text_color(rgb(theme::TEXT))
+                                .whitespace_normal(),
+                        )
+                }))
+                .when_some(details.note.as_ref(), |this, note| {
+                    this.child(app_muted_text(note.to_string()).pt_1().whitespace_normal())
+                }),
+        )
+}
+
+fn render_spend_authorization_context(context: &SpendAuthorizationContext) -> AnyElement {
+    match context {
+        SpendAuthorizationContext::Text(message) => app_muted_text(message.to_string())
+            .whitespace_normal()
+            .into_any_element(),
+        SpendAuthorizationContext::Info { title, message } => {
+            Alert::info("wallet-spend-auth-context", message.to_string())
+                .title(title.to_string())
+                .small()
+                .into_any_element()
+        }
+    }
 }
 
 fn render_spend_authorization_payload(
@@ -1329,22 +1857,24 @@ fn spend_authorization_summary_value(
     cx: &App,
 ) -> AnyElement {
     if let Some(icon_path) = row.icon_path.clone() {
-        return div()
-            .w_full()
-            .min_w(px(0.0))
-            .flex()
-            .items_center()
-            .gap_1()
-            .py(px(2.0))
-            .text_color(rgb(theme::TEXT))
-            .child(img(icon_path).size(px(20.0)).rounded_full().flex_none())
-            .child(
-                app_text(row.value.to_string())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .whitespace_normal(),
-            )
-            .into_any_element();
+        return spend_authorization_value_with_note(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap_1()
+                .py(px(2.0))
+                .text_color(rgb(theme::TEXT))
+                .child(img(icon_path).size(px(20.0)).rounded_full().flex_none())
+                .child(
+                    app_text(row.value.to_string())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .whitespace_normal(),
+                ),
+            row.note.as_deref(),
+        );
     }
 
     if row.shortened_copyable {
@@ -1401,12 +1931,32 @@ fn spend_authorization_summary_value(
             .into_any_element();
     }
 
-    app_text(row.value.to_string())
+    spend_authorization_value_with_note(
+        app_text(row.value.to_string())
+            .w_full()
+            .min_w(px(0.0))
+            .py(px(2.0))
+            .text_color(rgb(theme::TEXT))
+            .whitespace_normal(),
+        row.note.as_deref(),
+    )
+}
+
+fn spend_authorization_value_with_note(value: gpui::Div, note: Option<&str>) -> AnyElement {
+    let Some(note) = note else {
+        return value.into_any_element();
+    };
+    div()
         .w_full()
         .min_w(px(0.0))
-        .py(px(2.0))
-        .text_color(rgb(theme::TEXT))
-        .whitespace_normal()
+        .flex()
+        .flex_col()
+        .child(value)
+        .child(
+            app_muted_text(note.to_owned())
+                .min_w(px(0.0))
+                .whitespace_normal(),
+        )
         .into_any_element()
 }
 
@@ -1424,62 +1974,55 @@ pub(in crate::root) fn spend_authorization_recipient_display(value: &str) -> Str
     format!("{prefix}...{suffix}")
 }
 
-fn render_spend_authorization_lifetime_buttons(
-    selected: SpendAuthorizationLifetime,
-    on_select: impl Fn(SpendAuthorizationLifetime, &mut App) + 'static,
-) -> ButtonGroup {
-    let on_select = Rc::new(on_select);
-    ButtonGroup::new("wallet-spend-auth-lifetime")
-        .w_full()
-        .outline()
-        .warning()
-        .small()
-        .layout(Axis::Vertical)
-        .children(
-            [
-                (SpendAuthorizationLifetime::Once, "wallet-spend-auth-once"),
-                (
-                    SpendAuthorizationLifetime::FiveMinutes,
-                    "wallet-spend-auth-five-minutes",
-                ),
-                (
-                    SpendAuthorizationLifetime::FifteenMinutes,
-                    "wallet-spend-auth-fifteen-minutes",
-                ),
-                (
-                    SpendAuthorizationLifetime::UntilVaultLock,
-                    "wallet-spend-auth-until-lock",
-                ),
-            ]
-            .map(|(lifetime, id)| {
-                let on_select = Rc::clone(&on_select);
-                let on_confirm = Rc::clone(&on_select);
-                spend_authorization_lifetime_button(lifetime, selected, id)
-                    .on_click(move |_, _, cx| on_select(lifetime, cx))
-                    .on_action(move |_: &gpui_kit::base::actions::Confirm, _, cx| {
-                        on_confirm(lifetime, cx);
-                    })
-            }),
+fn new_spend_authorization_lifetime_select<T: 'static>(
+    initial: SpendAuthorizationLifetime,
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+) -> Entity<SpendAuthorizationLifetimeSelect> {
+    let selected = SpendAuthorizationLifetime::ALL
+        .iter()
+        .position(|lifetime| *lifetime == initial)
+        .map(IndexPath::new);
+    cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(SpendAuthorizationLifetime::ALL),
+            selected,
+            window,
+            cx,
         )
+    })
 }
 
-fn spend_authorization_lifetime_button(
-    lifetime: SpendAuthorizationLifetime,
-    selected: SpendAuthorizationLifetime,
-    id: &'static str,
-) -> Button {
-    let button = app_button(id, lifetime.label());
+/// "Remember authorization" and its select on one row. The select drops under the label when
+/// the row is too narrow for both.
+fn render_spend_authorization_lifetime_row(
+    select: &Entity<SpendAuthorizationLifetimeSelect>,
+    disabled: bool,
+) -> gpui::Div {
+    let control = div()
+        .flex_none()
+        .w(SPEND_AUTHORIZATION_LIFETIME_SELECT_WIDTH)
+        .max_w_full()
+        .child(
+            Select::new(select)
+                .small()
+                .w_full()
+                .menu_width(SPEND_AUTHORIZATION_LIFETIME_SELECT_WIDTH)
+                .disabled(disabled),
+        );
     #[cfg(test)]
-    let button = button.debug_selector(move || id.to_owned());
-    button
-        .accessibility_label(lifetime.label())
-        .selected(lifetime == selected)
-        .when(lifetime != SpendAuthorizationLifetime::Once, |button| {
-            button
-                .pt(px(1.0))
-                .focus_visible(|style| style.border_t_1().pt_0())
-        })
+    let control = control.debug_selector(|| "wallet-spend-auth-lifetime-select".to_owned());
+    div()
         .w_full()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_x_3()
+        .gap_y_1()
+        .child(app_muted_text("Remember authorization").whitespace_nowrap())
+        .child(control)
 }
 
 impl WalletRoot {
@@ -1616,12 +2159,11 @@ impl WalletRoot {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
-        let content_root = root.clone();
-        let content_intent = intent.clone();
+        let title_chip = summary.title_chip.clone();
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
-                content_root,
-                content_intent,
+                root,
+                intent,
                 summary,
                 initial_lifetime,
                 window,
@@ -1636,17 +2178,17 @@ impl WalletRoot {
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let close_root = root.clone();
-            let close_intent = intent.clone();
+            let close_content = content.clone();
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
-                .title(app_strong_text(dialog_title.clone()))
+                .title(spend_authorization_title(
+                    &dialog_title,
+                    title_chip.as_deref(),
+                ))
                 .on_close(move |_event, _window, cx| {
-                    close_root.update(cx, |root, cx| {
-                        root.cancel_spend_authorization(&close_intent, cx);
-                    });
+                    close_content.update(cx, SpendAuthorizationDialogContent::cancel);
                 })
                 .child(div().w(content_width).child(content.clone()))
         });
@@ -1670,6 +2212,10 @@ impl WalletRoot {
             .payload
             .clone()
             .map(|payload| cx.new(|_cx| SpendAuthorizationPayloadDisclosure::new(payload)));
+        let details_disclosure = summary
+            .details
+            .clone()
+            .map(|details| cx.new(|_cx| SpendAuthorizationDetailsDisclosure::new(details)));
         let handed_off = Rc::new(Cell::new(false));
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -1719,9 +2265,16 @@ impl WalletRoot {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(app_strong_text(summary.title.to_string()))
+                    .child(spend_authorization_title(&summary.title, summary.title_chip.as_deref()))
+                    .when_some(summary.progress.as_ref(), |this, progress| {
+                        this.child(render_spend_authorization_progress(progress))
+                    })
                     .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
-                    .child(render_spend_authorization_summary(&summary, cx))
+                    .child(render_spend_authorization_summary(
+                        &summary,
+                        details_disclosure.clone().map(IntoElement::into_any_element),
+                        cx,
+                    ))
                     .children(summary.warnings.iter().enumerate().map(|(index, warning)| {
                         Alert::warning(
                             SharedString::from(format!(
@@ -1837,6 +2390,7 @@ impl WalletRoot {
         let content_width = secondary_dialog_content_width(dialog_width);
         let gas_review = self.hardware_gas_payment_review(&completion, cx);
         let dialog_title = summary.title.to_string();
+        let title_chip = summary.title_chip.clone();
         let content = cx.new(|_cx| {
             HardwareSpendAuthorizationDialogContent::new(
                 root.clone(),
@@ -1852,7 +2406,10 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(app_strong_text(dialog_title.clone()))
+                .title(spend_authorization_title(
+                    &dialog_title,
+                    title_chip.as_deref(),
+                ))
                 .on_ok({
                     let content = content.clone();
                     move |_event, window, cx| {
@@ -2031,6 +2588,13 @@ impl WalletRoot {
                 view.update(cx, |view, cx| view.cancel_authorization(&command, cx));
             });
         }
+        if let SpendAuthorizationIntent::PrivateSwap(view, command) = intent {
+            let view = view.clone();
+            let command = command.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |view, cx| view.cancel_authorization(&command, cx));
+            });
+        }
     }
 
     pub(super) fn finish_spend_authorization(
@@ -2040,17 +2604,11 @@ impl WalletRoot {
         lifetime: SpendAuthorizationLifetime,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
-        let authorization = match self.desktop_spend_authorization(password.clone()) {
-            Ok(authorization) => authorization,
-            Err(message) => {
-                self.set_vault_error(message, cx);
-                return;
-            }
-        };
+    ) -> Result<(), Arc<str>> {
+        let authorization = self.desktop_spend_authorization(password.clone())?;
         if !intent.approve_gateway_review(self) {
             window.close_dialog(cx);
-            return;
+            return Ok(());
         }
         self.spend_authorization_lifetime = lifetime;
         self.spend_authorization_cache = SpendAuthorizationCache::new(
@@ -2061,6 +2619,7 @@ impl WalletRoot {
         );
         window.close_dialog(cx);
         self.continue_authorized_spend(intent, authorization, window, cx);
+        Ok(())
     }
 
     pub(super) fn clear_spend_authorization(&mut self, cx: &mut Context<'_, Self>) {
@@ -2178,6 +2737,14 @@ impl WalletRoot {
                 window.defer(cx, move |window, cx| {
                     view.update(cx, |view, cx| {
                         view.continue_authorized(command, authorization, window, cx);
+                    });
+                });
+            }
+            SpendAuthorizationIntent::PrivateSwap(view, command) => {
+                // The swap view reads WalletRoot to validate its session. Release this update first.
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.continue_authorized(&command, authorization, window, cx);
                     });
                 });
             }
@@ -2520,6 +3087,87 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn password_check_cannot_authorize_after_cancel_or_wallet_change(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Password verification wakes GPUI from Tokio's blocking pool.
+        cx.executor().allow_parking();
+        let path = std::env::temp_dir().join(format!(
+            "spend-auth-ui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let wallet =
+                crate::root::tests::public_accounts::fixture_root(&path, &runtime, window, cx);
+            root = Some(wallet.clone());
+            gpui_component::Root::new(wallet, window, cx)
+        });
+        let root = root.unwrap();
+        for cancel in [true, false] {
+            let dialog = cx.update(|window, cx| {
+                cx.new(|cx| {
+                    SpendAuthorizationDialogContent::new(
+                        root.clone(),
+                        // A removed request cannot submit a transaction. The remembered
+                        // authorization would still be populated if the stale check ran.
+                        SpendAuthorizationIntent::WalletConnectRequest {
+                            request_key: "removed-request".into(),
+                            review_token: 0,
+                            reviewed_fee: None,
+                        },
+                        SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                        SpendAuthorizationLifetime::FiveMinutes,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.update(|window, cx| {
+                dialog.update(cx, |dialog, cx| {
+                    dialog.password_input.update(cx, |input, cx| {
+                        input.set_value("public list test password", window, cx);
+                    });
+                    dialog.submit(window, cx);
+                    assert!(dialog.pending);
+                    if cancel {
+                        dialog.cancel(cx);
+                    } else {
+                        root.update(cx, |root, _| root.advance_active_wallet_generation());
+                    }
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+                assert!(Instant::now() < deadline, "password check did not finish");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+            assert!(root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()));
+            if !cancel {
+                assert!(dialog.read_with(cx, |dialog, _| dialog.error.is_some()));
+            }
+        }
+        cx.update(|window, _| window.remove_window());
+        drop(host);
+        drop(root);
+        cx.run_until_parked();
+        drop(entered);
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn executor_quote_deltas_preserve_small_changes_and_distinguish_adverse_direction() {
         let approved = U256::from(100);
@@ -2553,14 +3201,12 @@ mod tests {
     struct LifetimePickerProbe {
         focus: gpui::FocusHandle,
         password_input: Entity<InputState>,
+        lifetime_select: Entity<SpendAuthorizationLifetimeSelect>,
         width: gpui::Pixels,
-        selected: SpendAuthorizationLifetime,
-        changes: Vec<SpendAuthorizationLifetime>,
     }
 
     impl gpui::Render for LifetimePickerProbe {
         fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-            let probe = cx.entity();
             gpui_kit::base::Dialog::new(cx)
                 .focus_handle(self.focus.clone())
                 .on_ok(|_, _, _| false)
@@ -2570,30 +3216,19 @@ mod tests {
                         .flex()
                         .flex_col()
                         .gap_3()
+                        .debug_selector(|| "lifetime-content".to_owned())
                         .child(
                             div()
                                 .debug_selector(|| "lifetime-password".to_owned())
                                 .child(app_masked_input(&self.password_input, false)),
                         )
                         .child(
-                            app_muted_text("Remember authorization")
-                                .debug_selector(|| "lifetime-label".to_owned()),
-                        )
-                        .child(
                             div()
                                 .w_full()
-                                .flex()
-                                .flex_col()
-                                .debug_selector(|| "lifetime-group".to_owned())
-                                .child(render_spend_authorization_lifetime_buttons(
-                                    self.selected,
-                                    move |lifetime, cx| {
-                                        probe.update(cx, |probe, cx| {
-                                            probe.selected = lifetime;
-                                            probe.changes.push(lifetime);
-                                            cx.notify();
-                                        });
-                                    },
+                                .debug_selector(|| "lifetime-row".to_owned())
+                                .child(render_spend_authorization_lifetime_row(
+                                    &self.lifetime_select,
+                                    false,
                                 )),
                         )
                         .child(
@@ -2616,15 +3251,18 @@ mod tests {
     }
 
     #[gpui::test]
-    fn lifetime_rows_stay_between_password_and_footer(cx: &mut gpui::TestAppContext) {
+    fn lifetime_select_stays_between_password_and_footer(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         cx.update(ui::theme::apply_zenburn_component_theme);
         let (probe, cx) = cx.add_window_view(|window, cx| LifetimePickerProbe {
             focus: cx.focus_handle(),
             password_input: new_masked_input(window, cx, "Vault password"),
+            lifetime_select: new_spend_authorization_lifetime_select(
+                SpendAuthorizationLifetime::UntilVaultLock,
+                window,
+                cx,
+            ),
             width: px(400.0),
-            selected: SpendAuthorizationLifetime::Once,
-            changes: Vec::new(),
         });
         for width in [400.0, 280.0] {
             probe.update(cx, |probe, cx| {
@@ -2632,87 +3270,96 @@ mod tests {
                 cx.notify();
             });
             cx.update(|window, cx| window.draw(cx).clear(cx));
+            let content = cx.debug_bounds("lifetime-content").expect("dialog content");
             let password = cx
                 .debug_bounds("lifetime-password")
                 .expect("password input");
-            let label = cx.debug_bounds("lifetime-label").expect("lifetime label");
-            let group = cx.debug_bounds("lifetime-group").expect("lifetime group");
+            let row = cx.debug_bounds("lifetime-row").expect("lifetime row");
+            let select = cx
+                .debug_bounds("wallet-spend-auth-lifetime-select")
+                .expect("lifetime select");
             let footer = cx.debug_bounds("lifetime-footer").expect("dialog footer");
-            assert!(password.bottom() <= label.top());
-            let mut previous_bottom = label.bottom();
-            for id in [
-                "wallet-spend-auth-once",
-                "wallet-spend-auth-five-minutes",
-                "wallet-spend-auth-fifteen-minutes",
-                "wallet-spend-auth-until-lock",
-            ] {
-                let row = cx.debug_bounds(id).expect("lifetime row");
-                assert!(row.size.height > px(0.0), "{id} collapsed at width {width}");
-                assert!(
-                    row.top() >= previous_bottom,
-                    "{id} overlaps preceding content at width {width}"
-                );
-                assert!(
-                    row.bottom() <= footer.top(),
-                    "{id} overlaps footer at width {width}"
-                );
-                assert!(
-                    row.top() >= group.top() && row.bottom() <= group.bottom(),
-                    "group does not contain {id} at width {width}"
-                );
-                assert!(
-                    row.left() >= group.left() && row.right() <= group.right(),
-                    "{id} overflows group width {width}"
-                );
-                previous_bottom = row.bottom();
-            }
+            assert!(
+                password.bottom() <= row.top(),
+                "row overlaps password at {width}"
+            );
+            assert!(
+                row.bottom() <= footer.top(),
+                "row overlaps footer at {width}"
+            );
+            assert!(select.size.height > px(0.0), "select collapsed at {width}");
+            assert!(
+                select.top() >= row.top() && select.bottom() <= row.bottom(),
+                "row does not contain the select at {width}"
+            );
+            assert!(
+                select.left() >= content.left() && select.right() <= content.right(),
+                "select overflows the dialog at {width}"
+            );
         }
     }
 
     #[gpui::test]
-    fn lifetime_choices_activate_once_with_space_and_enter(cx: &mut gpui::TestAppContext) {
+    fn choosing_a_lifetime_in_the_select_updates_the_dialog(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "spend-auth-lifetime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
         cx.update(gpui_component::init);
-        cx.update(ui::theme::apply_zenburn_component_theme);
-        let (probe, cx) = cx.add_window_view(|window, cx| LifetimePickerProbe {
-            focus: cx.focus_handle(),
-            password_input: new_masked_input(window, cx, "Vault password"),
-            width: px(400.0),
-            selected: SpendAuthorizationLifetime::Once,
-            changes: Vec::new(),
+        let mut root = None;
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let wallet =
+                crate::root::tests::public_accounts::fixture_root(&path, &runtime, window, cx);
+            root = Some(wallet.clone());
+            gpui_component::Root::new(wallet, window, cx)
         });
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            let focus = probe.read(cx).focus.clone();
-            window.focus(&focus, cx);
-            window.focus_next(cx);
-            window.focus_next(cx);
+        let root = root.unwrap();
+        let dialog = cx.update(|window, cx| {
+            cx.new(|cx| {
+                SpendAuthorizationDialogContent::new(
+                    root.clone(),
+                    SpendAuthorizationIntent::WalletConnectRequest {
+                        request_key: "lifetime-request".into(),
+                        review_token: 0,
+                        reviewed_fee: None,
+                    },
+                    SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                    SpendAuthorizationLifetime::Once,
+                    window,
+                    cx,
+                )
+            })
         });
-        for (key, expected) in [
-            ("space", SpendAuthorizationLifetime::FiveMinutes),
-            ("enter", SpendAuthorizationLifetime::FifteenMinutes),
-        ] {
-            cx.update(Window::focus_next);
-            let keystroke = gpui::Keystroke::parse(key).expect("activation key");
-            cx.simulate_event(gpui::KeyDownEvent {
-                keystroke: keystroke.clone(),
-                is_held: false,
-                prefer_character_input: false,
-            });
-            cx.simulate_event(gpui::KeyUpEvent { keystroke });
-            cx.update(|window, cx| {
-                assert_eq!(probe.read(cx).selected, expected);
-                window.draw(cx).clear(cx);
-            });
-        }
-        cx.update(|_, cx| {
-            assert_eq!(
-                probe.read(cx).changes,
-                [
-                    SpendAuthorizationLifetime::FiveMinutes,
+        let select = dialog.read_with(cx, |dialog, _| dialog.lifetime_select.clone());
+        select.update(cx, |_, cx| {
+            cx.emit(
+                SelectEvent::<SearchableVec<SpendAuthorizationLifetime>>::Confirm(Some(
                     SpendAuthorizationLifetime::FifteenMinutes,
-                ]
+                )),
             );
         });
+        cx.run_until_parked();
+        assert_eq!(
+            dialog.read_with(cx, |dialog, _| dialog.lifetime),
+            SpendAuthorizationLifetime::FifteenMinutes
+        );
+        cx.update(|window, _| window.remove_window());
+        drop(dialog);
+        drop(host);
+        drop(root);
+        cx.run_until_parked();
+        drop(entered);
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

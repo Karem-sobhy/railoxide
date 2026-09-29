@@ -46,10 +46,8 @@ impl ExecutorOwner {
             .relay_adapt_7702_contract = record.delegate();
         chain.enabled = true;
         let mut assets = vec![prepared.asset];
-        if prepared.asset == ExecutorAsset::Native {
-            assets.push(ExecutorAsset::Erc20(
-                prepared.shield.preimage.token.tokenAddress,
-            ));
+        if let (ExecutorAsset::Native, Some(shield)) = (prepared.asset, &prepared.shield) {
+            assets.push(ExecutorAsset::Erc20(shield.preimage.token.tokenAddress));
         }
         let (inspection, nonce) = self
             .while_active(inspect_for_recovery_signing(
@@ -162,10 +160,6 @@ impl ExecutorOwner {
         nonce: Option<crate::vault::ExecutorNonceObservation>,
     ) -> Result<ExecutorRecord> {
         let operation = record.operation();
-        self.reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?
-            .remove(&operation);
         self.store.invalidate_observation(operation)?;
         let number = nonce.map_or_else(
             || {
@@ -179,8 +173,8 @@ impl ExecutorOwner {
         let history = self
             .while_active(
                 crate::desktop::executor_observation::observe_executor_history(
+                    &self.endpoints,
                     chain,
-                    &self.http,
                     record,
                     number..number + 1,
                     nonce,
@@ -199,10 +193,6 @@ impl ExecutorOwner {
             history.block,
             &history.recovery_inclusions,
         )?;
-        self.reconciled
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?
-            .insert(operation);
         self.notify_change();
         Ok(record)
     }
@@ -278,10 +268,11 @@ fn require_remaining_funding(
             "insufficient native balance for the remaining recovery gas; fund this executor or review another funding route"
         ));
     }
-    let source_asset = if prepared.asset == ExecutorAsset::Native && values.is_zero() {
-        ExecutorAsset::Erc20(prepared.shield.preimage.token.tokenAddress)
-    } else {
-        prepared.asset
+    let source_asset = match (prepared.asset, &prepared.shield) {
+        (ExecutorAsset::Native, Some(shield)) if values.is_zero() => {
+            ExecutorAsset::Erc20(shield.preimage.token.tokenAddress)
+        }
+        _ => prepared.asset,
     };
     if inspection
         .balances()

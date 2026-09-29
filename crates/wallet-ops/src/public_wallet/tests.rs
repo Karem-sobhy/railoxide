@@ -13,6 +13,7 @@ use alloy::sol_types::{Revert, SolCall, SolError};
 use alloy::uint;
 use eyre::eyre;
 use local_db::{DbConfig, DbStore};
+use railgun_wallet::tx::{ETHEREUM_GAS_MODEL, GasEstimateMode};
 use reqwest::Url;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -1324,11 +1325,11 @@ fn refresh_coordinator_prevents_overlap_and_releases() {
 fn public_native_action_gas_reserve_uses_buffered_units() {
     let send_steps = [PublicActionProgressStep::Send];
     assert_eq!(
-        public_native_action_gas_units(&send_steps),
+        public_native_action_gas_units(1, &send_steps),
         PUBLIC_NATIVE_SEND_GAS_UNITS + GAS_LIMIT_BUFFER,
     );
     assert_eq!(
-        public_native_action_gas_reserve(2, &send_steps),
+        public_native_action_gas_reserve(1, 2, &send_steps),
         U256::from((PUBLIC_NATIVE_SEND_GAS_UNITS + GAS_LIMIT_BUFFER) * 2),
     );
 
@@ -1337,15 +1338,19 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
         PublicActionProgressStep::Shield,
     ];
     assert_eq!(
-        public_native_action_gas_units(&shield_steps),
-        PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER,
+        public_native_action_gas_units(1, &shield_steps),
+        public_native_relay_adapt_shield_gas_units(
+            &ETHEREUM_GAS_MODEL,
+            GasEstimateMode::UpperBound
+        ) + GAS_LIMIT_BUFFER,
     );
     assert_eq!(
-        public_native_action_gas_units_with_buffer(&send_steps, 7),
+        public_native_action_gas_units_with_buffer(&ETHEREUM_GAS_MODEL, &send_steps, 7),
         PUBLIC_NATIVE_SEND_GAS_UNITS + 7,
     );
     assert_eq!(
         public_native_action_gas_reserve_with_profile(
+            &ETHEREUM_GAS_MODEL,
             7,
             &shield_steps,
             PublicShieldTransactionProfile::Railway,
@@ -1413,11 +1418,19 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
     .expect("native shield estimate");
     assert_eq!(
         native_shield.expected_cost,
-        U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS)
+        U256::from(public_native_relay_adapt_shield_gas_units(
+            &ETHEREUM_GAS_MODEL,
+            GasEstimateMode::Expected
+        ))
     );
     assert_eq!(
         native_shield.maximum_cost,
-        U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER)
+        U256::from(
+            public_native_relay_adapt_shield_gas_units(
+                &ETHEREUM_GAS_MODEL,
+                GasEstimateMode::UpperBound
+            ) + GAS_LIMIT_BUFFER
+        )
     );
     let erc20_shield = estimate_public_action_gas_cost(
         1,
@@ -1433,13 +1446,16 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
     .expect("erc20 shield estimate");
     assert_eq!(
         erc20_shield.expected_cost,
-        U256::from(PUBLIC_NATIVE_APPROVE_GAS_UNITS + PUBLIC_NATIVE_SHIELD_GAS_UNITS)
+        U256::from(
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                + public_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected)
+        )
     );
     assert_eq!(
         erc20_shield.maximum_cost,
         U256::from(
             PUBLIC_NATIVE_APPROVE_GAS_UNITS
-                + PUBLIC_NATIVE_SHIELD_GAS_UNITS
+                + public_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::UpperBound)
                 + (2 * GAS_LIMIT_BUFFER),
         )
     );
@@ -1999,7 +2015,9 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
         Some(quote),
     )
     .expect("Railway native shield estimate");
-    assert_eq!(native.expected_cost, U256::from(900_000_u64));
+    let expected_native_shield =
+        public_native_relay_adapt_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected);
+    assert_eq!(native.expected_cost, U256::from(expected_native_shield));
     assert_eq!(native.maximum_cost, U256::from(6_000_000_u64));
     let native_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
         1,
@@ -2015,7 +2033,10 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
         }),
     )
     .expect("Railway native shield estimate with ceiling");
-    assert_eq!(native_with_ceiling.expected_cost, U256::from(900_000_u64));
+    assert_eq!(
+        native_with_ceiling.expected_cost,
+        U256::from(expected_native_shield)
+    );
     assert_eq!(
         native_with_ceiling.maximum_cost,
         U256::from(6_000_000_u64 * 2)
@@ -2032,8 +2053,23 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
         Some(quote),
     )
     .expect("Railway ERC-20 shield estimate");
-    assert_eq!(erc20.expected_cost, U256::from(715_000_u64));
-    assert_eq!(erc20.maximum_cost, U256::from(858_000_u64));
+    assert_eq!(
+        erc20.expected_cost,
+        U256::from(
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                + public_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected)
+        )
+    );
+    assert_eq!(
+        erc20.maximum_cost,
+        U256::from(
+            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS)
+                + railway_gas_limit(public_shield_gas_units(
+                    &ETHEREUM_GAS_MODEL,
+                    GasEstimateMode::UpperBound
+                ))
+        )
+    );
 }
 
 #[test]
@@ -2088,9 +2124,14 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
         Some(quote),
     )
     .expect("Railway BNB gas projection");
+    let expected_native_shield =
+        public_native_relay_adapt_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected);
     assert_eq!(projection.expected_fee_per_gas, 7);
     assert_eq!(projection.maximum_fee_per_gas, 7);
-    assert_eq!(projection.expected_cost, U256::from(900_000_u64 * 7));
+    assert_eq!(
+        projection.expected_cost,
+        U256::from(expected_native_shield * 7)
+    );
     assert_eq!(projection.maximum_cost, U256::from(6_000_000_u64 * 7));
     let projection_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
         56,
@@ -2108,7 +2149,7 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
     .expect("Railway BNB gas projection with ceiling");
     assert_eq!(
         projection_with_ceiling.expected_cost,
-        U256::from(900_000_u64 * 7)
+        U256::from(expected_native_shield * 7)
     );
     assert_eq!(
         projection_with_ceiling.maximum_cost,

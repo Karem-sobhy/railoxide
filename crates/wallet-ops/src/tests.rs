@@ -2,6 +2,7 @@
 
 mod amounts;
 mod blocked_shield_rescue;
+pub(crate) mod cow_fork;
 mod helpers;
 mod native_topup;
 mod poi_contexts;
