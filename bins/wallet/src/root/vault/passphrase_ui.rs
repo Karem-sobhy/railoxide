@@ -17,6 +17,10 @@ use ui::{icons, theme};
 use wallet_ops::vault::{SoftwareContextSyncIntent, WalletMetadataBundle};
 use zeroize::Zeroizing;
 
+use super::super::touch_id::{
+    TOUCH_ID_REASON_PASSPHRASE_WALLET, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
+    touch_id_button,
+};
 use super::super::{
     WalletRoot, labeled_field, new_masked_input, new_text_input, secondary_dialog_content_width,
     vault_ui::vault_dialog_body,
@@ -29,6 +33,8 @@ pub(in crate::root) struct OpenPassphraseWalletAuthorizationUi {
     target_label: Arc<str>,
     password_input: Entity<InputState>,
     error: Option<Arc<str>>,
+    touch_id: Option<TouchIdPrompt>,
+    touch_id_pending: bool,
 }
 
 impl OpenPassphraseWalletAuthorizationUi {
@@ -36,6 +42,7 @@ impl OpenPassphraseWalletAuthorizationUi {
         root: Entity<WalletRoot>,
         target_base_profile_uuid: Arc<str>,
         target_label: Arc<str>,
+        touch_id: Option<TouchIdPrompt>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -63,6 +70,8 @@ impl OpenPassphraseWalletAuthorizationUi {
             target_label,
             password_input,
             error: None,
+            touch_id,
+            touch_id_pending: false,
         }
     }
 
@@ -74,6 +83,9 @@ impl OpenPassphraseWalletAuthorizationUi {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.touch_id_pending {
+            return;
+        }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
         self.password_input
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -84,7 +96,44 @@ impl OpenPassphraseWalletAuthorizationUi {
             cx.notify();
             return;
         }
+        self.submit_password(password, window, cx);
+    }
 
+    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
+            return;
+        };
+        self.touch_id_pending = true;
+        self.error = None;
+        cx.notify();
+        prompt.run(
+            TOUCH_ID_REASON_PASSPHRASE_WALLET,
+            window,
+            cx,
+            |dialog, outcome, window, cx| {
+                dialog.touch_id_pending = false;
+                match outcome {
+                    TouchIdPassword::Password(password) => {
+                        dialog.submit_password(password, window, cx);
+                    }
+                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
+                    TouchIdPassword::Failed(message) => {
+                        dialog.touch_id = None;
+                        dialog.error = Some(message);
+                        dialog.focus_password(window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn submit_password(
+        &mut self,
+        password: Zeroizing<String>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.error = None;
         let target_base_profile_uuid = self.target_base_profile_uuid.clone();
         self.root.update(cx, |root, cx| {
@@ -104,6 +153,7 @@ impl OpenPassphraseWalletAuthorizationUi {
 impl Render for OpenPassphraseWalletAuthorizationUi {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let touch_id_dialog = dialog.clone();
         div()
             .w_full()
             .flex()
@@ -120,7 +170,22 @@ impl Render for OpenPassphraseWalletAuthorizationUi {
                 "Enter your vault password to continue. You'll enter the mnemonic passphrase for \"{}\" on the next screen.",
                 self.target_label.as_ref()
             )))
-            .child(app_masked_input(&self.password_input, false))
+            .child(masked_input_with_touch_id(
+                &self.password_input,
+                self.touch_id_pending,
+                self.touch_id.is_some().then(|| {
+                    touch_id_button(
+                        "open-passphrase-wallet-touch-id",
+                        "Touch ID",
+                        self.touch_id_pending,
+                        false,
+                    )
+                    .on_click(move |_event, window, cx| {
+                        touch_id_dialog
+                            .update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
+                    })
+                }),
+            ))
             .children(self.render_error(cx))
             .child(
                 div()
@@ -162,12 +227,14 @@ impl WalletRoot {
         }
         let target_label: Arc<str> = Arc::from(eligible.label.clone());
         self.vault_error = None;
+        let touch_id = self.touch_id_prompt();
         let root = cx.entity();
         let content = cx.new(|cx| {
             OpenPassphraseWalletAuthorizationUi::new(
                 root.clone(),
                 target_base_profile_uuid,
                 target_label,
+                touch_id,
                 window,
                 cx,
             )

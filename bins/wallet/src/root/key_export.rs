@@ -6,13 +6,17 @@ use gpui::{
 };
 use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, input::InputEvent};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::vault::{
     VaultError, WalletMetadataBundle, WalletSoftwareContextKind, WalletSource,
 };
 use zeroize::Zeroizing;
 
+use super::touch_id::{
+    TOUCH_ID_REASON_KEY_EXPORT, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
+    touch_id_button,
+};
 use super::{
     APP_TEXT_SIZE, WalletRoot, dialog_max_height, new_masked_input, secondary_dialog_content_width,
     vault_error_kind,
@@ -73,12 +77,15 @@ struct KeyExportPasswordDialogContent {
     kind: KeyExportSecretKind,
     password_input: Entity<gpui_component::input::InputState>,
     error: Option<Arc<str>>,
+    touch_id: Option<TouchIdPrompt>,
+    touch_id_pending: bool,
 }
 
 impl KeyExportPasswordDialogContent {
     fn new(
         root: Entity<WalletRoot>,
         kind: KeyExportSecretKind,
+        touch_id: Option<TouchIdPrompt>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -101,6 +108,8 @@ impl KeyExportPasswordDialogContent {
             kind,
             password_input,
             error: None,
+            touch_id,
+            touch_id_pending: false,
         }
     }
 
@@ -112,16 +121,56 @@ impl KeyExportPasswordDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.touch_id_pending {
+            return;
+        }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
         if password.trim().is_empty() {
             self.error = Some(Arc::from(key_export_password_empty_message(self.kind)));
             cx.notify();
             return;
         }
+        self.submit_password(&password, window, cx);
+    }
 
+    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
+            return;
+        };
+        self.touch_id_pending = true;
+        self.error = None;
+        cx.notify();
+        prompt.run(
+            TOUCH_ID_REASON_KEY_EXPORT,
+            window,
+            cx,
+            |dialog, outcome, window, cx| {
+                dialog.touch_id_pending = false;
+                match outcome {
+                    TouchIdPassword::Password(password) => {
+                        dialog.submit_password(&password, window, cx);
+                    }
+                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
+                    TouchIdPassword::Failed(message) => {
+                        dialog.touch_id = None;
+                        dialog.error = Some(message);
+                        dialog.focus_password(window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn submit_password(
+        &mut self,
+        password: &Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let kind = self.kind;
         let result = self.root.update(cx, |root, cx| {
-            root.reveal_key_export_secret(kind, &password, cx)
+            root.reveal_key_export_secret(kind, password, cx)
         });
         match result {
             Ok(()) => {
@@ -140,13 +189,29 @@ impl KeyExportPasswordDialogContent {
 impl Render for KeyExportPasswordDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let touch_id_dialog = dialog.clone();
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
             .child(app_muted_text(key_export_password_prompt_copy(self.kind)).whitespace_normal())
-            .child(app_masked_input(&self.password_input, false))
+            .child(masked_input_with_touch_id(
+                &self.password_input,
+                self.touch_id_pending,
+                self.touch_id.is_some().then(|| {
+                    touch_id_button(
+                        "wallet-key-export-password-touch-id",
+                        "Touch ID",
+                        self.touch_id_pending,
+                        false,
+                    )
+                    .on_click(move |_event, window, cx| {
+                        touch_id_dialog
+                            .update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
+                    })
+                }),
+            ))
             .when_some(self.error.as_ref(), |this, error| {
                 this.child(
                     app_muted_text(error.to_string())
@@ -226,14 +291,17 @@ impl WalletRoot {
     }
 
     fn open_key_export_password_dialog(
+        &mut self,
         kind: KeyExportSecretKind,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
         let content_root = root;
-        let content =
-            cx.new(|cx| KeyExportPasswordDialogContent::new(content_root, kind, window, cx));
+        let touch_id = self.touch_id_prompt();
+        let content = cx.new(|cx| {
+            KeyExportPasswordDialogContent::new(content_root, kind, touch_id, window, cx)
+        });
         let focus_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(KEY_EXPORT_PASSWORD_DIALOG_WIDTH);
@@ -464,8 +532,8 @@ fn render_key_export_reveal_row(
                     .small()
                     .flex_none()
                     .on_click(move |_event, window, cx| {
-                        reveal_root.update(cx, |_root, cx| {
-                            WalletRoot::open_key_export_password_dialog(kind, window, cx);
+                        reveal_root.update(cx, |root, cx| {
+                            root.open_key_export_password_dialog(kind, window, cx);
                         });
                     }),
             ),

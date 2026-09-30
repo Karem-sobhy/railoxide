@@ -33,9 +33,9 @@ use wallet_ops::{
     },
     subscribe_prover_cache_build,
     vault::{
-        BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial,
-        PrivateAddressBookEntry, ProtectedSoftwareSeedSession, PublicAccountMetadata,
-        PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
+        BiometricUnlockStatus, BroadcasterPreferences, DesktopVaultStore, DesktopViewSession,
+        GeneratedSeedMaterial, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
+        PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -83,6 +83,7 @@ mod startup;
 mod stealth_accounts;
 mod submission_progress;
 mod tokens;
+mod touch_id;
 mod ui_helpers;
 mod utxo;
 mod vault;
@@ -528,6 +529,17 @@ pub(crate) struct WalletRoot {
     executor_locked_note_count: usize,
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_vault_input_on_render: bool,
+    /// Whether this Mac has usable Touch ID, independent of the vault setting.
+    touch_id_supported: bool,
+    touch_id_status: BiometricUnlockStatus,
+    touch_id_in_progress: bool,
+    touch_id_unlock_on_render: bool,
+    enable_touch_id_on_create: bool,
+    /// The vault password Touch ID supplied for the add-wallet form, if any.
+    add_wallet_touch_id_password: Option<Zeroizing<String>>,
+    /// The vault password Touch ID supplied for the hardware profile dialog.
+    #[cfg(feature = "hardware")]
+    hardware_profile_touch_id_password: Option<Zeroizing<String>>,
     focus_utxo_table_on_render: bool,
     focus_public_account_search_on_render: bool,
     wallet_focus: FocusHandle,
@@ -1153,6 +1165,13 @@ impl WalletRoot {
             vault_state,
             VaultState::CreateVault | VaultState::UnlockVault
         );
+        let touch_id_supported = wallet_ops::biometric::biometric_unlock_available();
+        let touch_id_status = vault_store
+            .as_ref()
+            .and_then(|store| store.biometric_unlock_status().ok())
+            .unwrap_or(BiometricUnlockStatus::Disabled);
+        let touch_id_unlock_on_render = matches!(vault_state, VaultState::UnlockVault)
+            && touch_id_status == BiometricUnlockStatus::Enabled;
         let unlock_password_input = new_masked_input(window, cx, "vault password");
         let new_password_input = new_masked_input(window, cx, "new vault password");
         let confirm_password_input = new_masked_input(window, cx, "confirm vault password");
@@ -1547,6 +1566,14 @@ impl WalletRoot {
             executor_locked_note_count: 0,
             utxo_table,
             focus_vault_input_on_render,
+            touch_id_supported,
+            touch_id_status,
+            touch_id_in_progress: false,
+            touch_id_unlock_on_render,
+            enable_touch_id_on_create: true,
+            add_wallet_touch_id_password: None,
+            #[cfg(feature = "hardware")]
+            hardware_profile_touch_id_password: None,
             focus_utxo_table_on_render: false,
             focus_public_account_search_on_render: false,
             wallet_focus: cx.focus_handle(),

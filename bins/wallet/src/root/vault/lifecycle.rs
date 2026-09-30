@@ -212,8 +212,7 @@ impl WalletRoot {
         });
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);
-            root.add_wallet_password_input
-                .update(cx, |input, cx| input.set_value("", window, cx));
+            root.clear_add_wallet_password(window, cx);
         });
     }
 
@@ -851,8 +850,7 @@ impl WalletRoot {
             self.hardware_wallet_creation_generation.wrapping_add(1);
         self.hardware_wallet_creation_intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
-        self.add_wallet_password_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.clear_add_wallet_password(window, cx);
         self.import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
@@ -1270,6 +1268,7 @@ impl WalletRoot {
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
+        self.add_wallet_touch_id_password = None;
         self.vault_view_unlock = None;
         self.auto_lock.disarm();
         self.generated_seed = None;
@@ -1290,6 +1289,7 @@ impl WalletRoot {
         self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = true;
+        self.refresh_touch_id_status();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }

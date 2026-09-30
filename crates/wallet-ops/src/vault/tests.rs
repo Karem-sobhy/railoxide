@@ -1,4 +1,5 @@
 mod address_book;
+mod biometric_unlock;
 mod broadcaster_preferences;
 mod core_crypto;
 mod derivation_compatibility;

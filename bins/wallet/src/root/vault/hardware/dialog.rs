@@ -64,8 +64,10 @@ impl WalletRoot {
             }
         }
 
-        let password =
-            Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx);
+        let password = match self.hardware_profile_touch_id_password.take() {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx),
+        };
         if password.trim().is_empty() {
             self.hardware_profile_unlock.error =
                 Some(Arc::from("Enter the vault password to continue"));

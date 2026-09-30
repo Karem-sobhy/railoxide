@@ -6,6 +6,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::alert::Alert;
+use gpui_component::checkbox::Checkbox;
 use gpui_component::progress::Progress as UiProgress;
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants, tooltip::Tooltip};
@@ -31,6 +32,9 @@ use wallet_ops::vault::TrezorPassphraseMode;
 use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
+#[cfg(feature = "hardware")]
+use super::touch_id::masked_input_with_touch_id;
+use super::touch_id::touch_id_button;
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
@@ -241,8 +245,23 @@ impl WalletRoot {
             body = body.child(error);
         }
 
+        let touch_id_root = root.clone();
         body.child(app_masked_input(&self.new_password_input, false))
             .child(app_masked_input(&self.confirm_password_input, false))
+            .when(self.touch_id_supported, |this| {
+                this.child(
+                    Checkbox::new("create-wallet-vault-touch-id")
+                        .label("Also unlock with Touch ID on this Mac")
+                        .checked(self.enable_touch_id_on_create)
+                        .small()
+                        .on_click(move |checked, _window, cx| {
+                            let checked = *checked;
+                            touch_id_root.update(cx, |root, cx| {
+                                root.set_enable_touch_id_on_create(checked, cx);
+                            });
+                        }),
+                )
+            })
             .child(
                 app_button("create-wallet-vault", "Create vault")
                     .primary()
@@ -342,29 +361,48 @@ impl WalletRoot {
     }
 
     fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::Div {
-        let submit_root = root;
-        let mut body =
-            vault_dialog_body("Enter the vault password to view wallet balances and history.");
+        let submit_root = root.clone();
+        let touch_id_root = root;
+        let touch_id = self.touch_id_prompt_cached().is_some();
+        let busy = self.unlock_in_progress || self.touch_id_in_progress;
+        let mut body = vault_dialog_body(if touch_id {
+            "Use Touch ID or enter the vault password to view wallet balances and history."
+        } else {
+            "Enter the vault password to view wallet balances and history."
+        });
         if let Some(error) = self.render_vault_error() {
             body = body.child(error);
         }
 
-        body.child(app_masked_input(
-            &self.unlock_password_input,
-            self.unlock_in_progress,
-        ))
-        .child(
-            app_button("unlock-wallet-vault", "Unlock vault")
-                .primary()
-                .w_full()
-                .loading(self.unlock_in_progress)
-                .disabled(self.unlock_in_progress)
-                .on_click(move |_event, window, cx| {
-                    submit_root.update(cx, |root, cx| {
-                        root.unlock_vault_from_input(window, cx);
-                    });
-                }),
-        )
+        body.child(app_masked_input(&self.unlock_password_input, busy))
+            .child(
+                app_button("unlock-wallet-vault", "Unlock vault")
+                    .primary()
+                    .w_full()
+                    .loading(self.unlock_in_progress)
+                    .disabled(busy)
+                    .on_click(move |_event, window, cx| {
+                        submit_root.update(cx, |root, cx| {
+                            root.unlock_vault_from_input(window, cx);
+                        });
+                    }),
+            )
+            .when(touch_id, |this| {
+                this.child(
+                    touch_id_button(
+                        "unlock-wallet-vault-touch-id",
+                        "Unlock with Touch ID",
+                        self.touch_id_in_progress,
+                        self.unlock_in_progress,
+                    )
+                    .w_full()
+                    .on_click(move |_event, window, cx| {
+                        touch_id_root.update(cx, |root, cx| {
+                            root.unlock_vault_with_touch_id(window, cx);
+                        });
+                    }),
+                )
+            })
     }
 
     fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::AnyElement {
@@ -451,6 +489,7 @@ impl WalletRoot {
 
     fn render_generated_wallet_review(&self, root: Entity<Self>) -> gpui::AnyElement {
         let confirm_root = root.clone();
+        let password_root = root.clone();
         let back_root = root;
         let phrase = self
             .generated_seed
@@ -466,7 +505,7 @@ impl WalletRoot {
 
         body = body.child(app_input(&self.wallet_name_input));
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
-            body = body.child(app_masked_input(&self.add_wallet_password_input, false));
+            body = body.child(self.render_add_wallet_password(password_root, false));
         }
 
         body.child(
@@ -529,6 +568,7 @@ impl WalletRoot {
 
     fn render_import_wallet(&self, root: Entity<Self>) -> gpui::AnyElement {
         let import_root = root.clone();
+        let password_root = root.clone();
         let back_root = root;
         let mut body = vault_dialog_body(
             "Paste the recovery phrase. The phrase is validated, converted to canonical entropy, and cleared from the input.",
@@ -540,7 +580,7 @@ impl WalletRoot {
         body.child(app_input(&self.wallet_name_input))
             .when(
                 matches!(self.vault_state, VaultState::ViewUnlocked),
-                |this| this.child(app_masked_input(&self.add_wallet_password_input, false)),
+                |this| this.child(self.render_add_wallet_password(password_root, false)),
             )
             .child(
                 gpui_component::input::Textarea::new(&self.import_mnemonic_input)
@@ -578,6 +618,7 @@ impl WalletRoot {
     ) -> gpui::AnyElement {
         let create_root = root.clone();
         let recover_root = root.clone();
+        let password_root = root.clone();
         let back_root = root;
         let device_label = hardware_device_label(device_kind);
         let create_button_id = hardware_create_button_id(device_kind);
@@ -601,12 +642,10 @@ impl WalletRoot {
         .when(
             matches!(self.vault_state, VaultState::ViewUnlocked),
             |this| {
-                this.child(
-                    app_masked_input(
-                        &self.add_wallet_password_input,
-                        self.hardware_wallet_creation_in_progress,
-                    ),
-                )
+                this.child(self.render_add_wallet_password(
+                    password_root,
+                    self.hardware_wallet_creation_in_progress,
+                ))
             },
         )
         .child(labeled_field(
@@ -748,12 +787,24 @@ impl WalletRoot {
 
         content = content
             .when(requires_password, |this| {
-                this.child(
-                    app_masked_input(
-                        &self.hardware_profile_password_input,
-                        self.hardware_profile_unlock.in_progress,
-                    ),
-                )
+                let touch_id_root = root.clone();
+                this.child(masked_input_with_touch_id(
+                    &self.hardware_profile_password_input,
+                    self.hardware_profile_unlock.in_progress || self.touch_id_in_progress,
+                    self.touch_id_prompt_cached().is_some().then(|| {
+                        touch_id_button(
+                            "hardware-profile-unlock-touch-id",
+                            "Touch ID",
+                            self.touch_id_in_progress,
+                            self.hardware_profile_unlock.in_progress,
+                        )
+                        .on_click(move |_event, window, cx| {
+                            touch_id_root.update(cx, |root, cx| {
+                                root.unlock_hardware_profile_with_touch_id(window, cx);
+                            });
+                        })
+                    }),
+                ))
             })
             .when(device_kind == HardwareDeviceKind::Trezor, |this| {
                 let mode = self.hardware_profile_unlock.trezor_passphrase_mode;

@@ -10,7 +10,7 @@ use gpui::{
 use gpui_component::{
     Disableable, Sizable, WindowExt,
     alert::Alert,
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     menu::{DropdownMenu, PopupMenuItem},
 };
@@ -65,6 +65,9 @@ pub(super) use ui::public_address::{
 use super::dialogs::PublicAccountDialogKind;
 use super::participant::{remove_global_participant, remove_scoped_participant};
 use super::public_action::{PublicActionMode, PublicSendKind};
+use super::touch_id::{
+    TOUCH_ID_REASON_PUBLIC_ACCOUNT, TouchIdPassword, masked_input_with_touch_id, touch_id_button,
+};
 use super::{
     ConfirmationDialogProps, PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH,
     WalletRoot, confirmation_dialog, dialog_max_height, public_account_visible_balances_for_chain,
@@ -645,6 +648,15 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.add_public_derived_account(None, window, cx);
+    }
+
+    fn add_public_derived_account(
+        &mut self,
+        touch_id_password: Option<Zeroizing<String>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.public_form.adding_account
             || self.public_form.hardware_derivation_status
                 == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation
@@ -692,7 +704,10 @@ impl WalletRoot {
             );
             return;
         }
-        let password = Self::read_and_clear_input(&self.public_form.add_password_input, window, cx);
+        let password = match touch_id_password {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.public_form.add_password_input, window, cx),
+        };
         if password.trim().is_empty() {
             self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
             cx.notify();
@@ -870,6 +885,15 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.import_public_account(None, window, cx);
+    }
+
+    fn import_public_account(
+        &mut self,
+        touch_id_password: Option<Zeroizing<String>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.public_form.importing_account {
             return;
         }
@@ -897,8 +921,10 @@ impl WalletRoot {
         }
         let private_key =
             Self::read_and_clear_input(&self.public_form.import_private_key_input, window, cx);
-        let password =
-            Self::read_and_clear_input(&self.public_form.import_password_input, window, cx);
+        let password = match touch_id_password {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.public_form.import_password_input, window, cx),
+        };
         if private_key.trim().is_empty() || password.trim().is_empty() {
             self.public_form.error = Some(Arc::from(
                 "Enter a private key and vault password to import an account",
@@ -1198,6 +1224,98 @@ impl WalletRoot {
             })
     }
 
+    /// Runs the add or import form with the vault password from Touch ID.
+    fn submit_public_account_with_touch_id(
+        &mut self,
+        kind: PublicAccountDialogKind,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.touch_id_in_progress
+            || self.public_form.adding_account
+            || self.public_form.importing_account
+        {
+            return;
+        }
+        let (label_input, missing_input_error) = match kind {
+            PublicAccountDialogKind::Derive => (&self.public_form.add_label_input, None),
+            PublicAccountDialogKind::Import => (
+                &self.public_form.import_label_input,
+                self.public_form
+                    .import_private_key_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .is_empty()
+                    .then_some("Enter a private key to import an account"),
+            ),
+            PublicAccountDialogKind::EditLabel => return,
+        };
+        // Check the other fields first so Touch ID is not asked for a form that
+        // cannot be submitted.
+        let error = if label_input.read(cx).value().trim().is_empty() {
+            Some("Enter an account label")
+        } else {
+            missing_input_error
+        };
+        if let Some(error) = error {
+            self.public_form.error = Some(Arc::from(error));
+            cx.notify();
+            return;
+        }
+        let Some(prompt) = self.touch_id_prompt() else {
+            cx.notify();
+            return;
+        };
+        self.touch_id_in_progress = true;
+        self.public_form.error = None;
+        cx.notify();
+        prompt.run(
+            TOUCH_ID_REASON_PUBLIC_ACCOUNT,
+            window,
+            cx,
+            move |root, outcome, window, cx| {
+                root.touch_id_in_progress = false;
+                match outcome {
+                    TouchIdPassword::Password(password) => match kind {
+                        PublicAccountDialogKind::Derive => {
+                            root.add_public_derived_account(Some(password), window, cx);
+                        }
+                        PublicAccountDialogKind::Import => {
+                            root.import_public_account(Some(password), window, cx);
+                        }
+                        PublicAccountDialogKind::EditLabel => {}
+                    },
+                    TouchIdPassword::Cancelled => {}
+                    TouchIdPassword::Failed(message) => {
+                        root.refresh_touch_id_status();
+                        root.public_form.error = Some(message);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn public_account_touch_id_button(
+        &self,
+        root: Entity<Self>,
+        kind: PublicAccountDialogKind,
+        id: &'static str,
+        busy: bool,
+    ) -> Option<Button> {
+        self.touch_id_prompt_cached()?;
+        Some(
+            touch_id_button(id, "Touch ID", self.touch_id_in_progress, busy).on_click(
+                move |_event, window, cx| {
+                    root.update(cx, |root, cx| {
+                        root.submit_public_account_with_touch_id(kind, window, cx);
+                    });
+                },
+            ),
+        )
+    }
+
     pub(super) fn render_public_account_dialog_content(
         &self,
         root: Entity<Self>,
@@ -1368,9 +1486,15 @@ impl WalletRoot {
                     ))
                     .child(app_muted_text(next_index))
                     .child(app_input(&self.public_form.add_label_input))
-                    .child(app_masked_input(
+                    .child(masked_input_with_touch_id(
                         &self.public_form.add_password_input,
-                        false,
+                        self.touch_id_in_progress,
+                        self.public_account_touch_id_button(
+                            add_root.clone(),
+                            PublicAccountDialogKind::Derive,
+                            "wallet-public-add-derived-touch-id",
+                            self.public_form.adding_account,
+                        ),
                     ))
                     .children(self.public_form.error.as_ref().map(|message| {
                         Alert::error("wallet-public-add-derived-error", message.to_string()).small()
@@ -1411,9 +1535,15 @@ impl WalletRoot {
                         &self.public_form.import_private_key_input,
                         false,
                     ))
-                    .child(app_masked_input(
+                    .child(masked_input_with_touch_id(
                         &self.public_form.import_password_input,
-                        false,
+                        self.touch_id_in_progress,
+                        self.public_account_touch_id_button(
+                            import_root.clone(),
+                            PublicAccountDialogKind::Import,
+                            "wallet-public-import-touch-id",
+                            self.public_form.importing_account,
+                        ),
                     ))
                     .child(
                         Checkbox::new("wallet-public-import-global")

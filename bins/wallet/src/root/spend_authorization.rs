@@ -22,7 +22,9 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text, app_text};
+#[cfg(feature = "hardware")]
+use ui::controls::app_masked_input;
+use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
 use ui::private_action::asset_row;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
@@ -49,6 +51,10 @@ use crate::root::ui_helpers::dialog_footer;
 use super::governance_action::GovernanceSpendDraft;
 use super::private_action::UnshieldAssetKey;
 use super::public_action::{PublicSendDraft, PublicShieldDraft};
+use super::touch_id::{
+    TOUCH_ID_REASON_SPEND, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
+    touch_id_button,
+};
 use super::vault::hardware_device_label;
 use super::walletconnect::WalletConnectReviewedFeeProjection;
 use super::{WalletRoot, dialog_max_height, new_masked_input, secondary_dialog_content_width};
@@ -912,6 +918,8 @@ struct SpendAuthorizationDialogContent {
     cancelled: bool,
     review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
     review_focus: gpui::FocusHandle,
+    touch_id: Option<TouchIdPrompt>,
+    touch_id_pending: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1207,6 +1215,8 @@ impl SpendAuthorizationDialogContent {
             cancelled: false,
             review_authorization: None,
             review_focus: cx.focus_handle(),
+            touch_id: None,
+            touch_id_pending: false,
         }
     }
 
@@ -1222,7 +1232,7 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.cancelled {
+        if self.pending || self.cancelled || self.touch_id_pending {
             return;
         }
         if let Some((scope, authorization)) = self.review_authorization.take() {
@@ -1249,7 +1259,54 @@ impl SpendAuthorizationDialogContent {
             cx.notify();
             return;
         }
+        self.submit_password(password, window, cx);
+    }
 
+    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if self.pending
+            || self.cancelled
+            || self.touch_id_pending
+            || self.review_authorization.is_some()
+        {
+            return;
+        }
+        let Some(prompt) = self.touch_id.clone() else {
+            return;
+        };
+        self.touch_id_pending = true;
+        self.error = None;
+        cx.notify();
+        prompt.run(
+            TOUCH_ID_REASON_SPEND,
+            window,
+            cx,
+            |dialog, outcome, window, cx| {
+                dialog.touch_id_pending = false;
+                if dialog.cancelled {
+                    return;
+                }
+                match outcome {
+                    TouchIdPassword::Password(password) => {
+                        dialog.submit_password(password, window, cx);
+                    }
+                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
+                    TouchIdPassword::Failed(message) => {
+                        dialog.touch_id = None;
+                        dialog.error = Some(message);
+                        dialog.focus_password(window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn submit_password(
+        &mut self,
+        password: Zeroizing<String>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let root = self.root.read(cx);
         let Some(store) = root.vault_store.clone() else {
             self.error = Some("Wallet vault storage is unavailable".into());
@@ -1263,6 +1320,7 @@ impl SpendAuthorizationDialogContent {
         // The operation still obtains its own scoped spend grant when it runs.
         let join = root.runtime.spawn_blocking(move || {
             store.create_spend_grant(&password).map(drop)?;
+            WalletRoot::renew_touch_id(&store, &password);
             Ok::<_, VaultError>(password)
         });
         self.pending = true;
@@ -1347,6 +1405,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
         let cancel_dialog = dialog.clone();
         let payload_dialog = dialog.clone();
         let details_dialog = dialog.clone();
+        let touch_id_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
@@ -1397,9 +1456,22 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             )
             .children(payload)
             .when(self.review_authorization.is_none(), |this| {
-                this.child(app_masked_input(
+                let touch_id_dialog = touch_id_dialog.clone();
+                this.child(masked_input_with_touch_id(
                     &self.password_input,
-                    self.pending || self.cancelled,
+                    self.pending || self.cancelled || self.touch_id_pending,
+                    self.touch_id.is_some().then(|| {
+                        touch_id_button(
+                            "wallet-spend-auth-touch-id",
+                            "Touch ID",
+                            self.touch_id_pending,
+                            self.pending || self.cancelled,
+                        )
+                        .on_click(move |_event, window, cx| {
+                            touch_id_dialog
+                                .update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
+                        })
+                    }),
                 ))
                 .child(render_spend_authorization_lifetime_row(
                     &self.lifetime_select,
@@ -1458,7 +1530,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         .primary()
                         .flex_none()
                         .loading(self.pending)
-                        .disabled(self.pending || self.cancelled)
+                        .disabled(self.pending || self.cancelled || self.touch_id_pending)
                         .on_click(move |_event, window, cx| {
                             dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
                         }),
@@ -2256,6 +2328,7 @@ impl WalletRoot {
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
         let title_chip = summary.title_chip.clone();
+        let touch_id = self.touch_id_prompt_cached();
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
                 root,
@@ -2266,6 +2339,7 @@ impl WalletRoot {
                 cx,
             );
             content.review_authorization = review_authorization;
+            content.touch_id = touch_id;
             content
         });
         let focus_content = content.clone();
@@ -3182,6 +3256,8 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "hardware"))]
+    use ui::controls::app_masked_input;
 
     #[gpui::test]
     fn password_check_cannot_authorize_after_cancel_or_wallet_change(
