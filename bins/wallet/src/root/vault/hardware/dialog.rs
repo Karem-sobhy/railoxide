@@ -30,7 +30,7 @@ impl WalletRoot {
     #[cfg(feature = "hardware")]
     pub(in crate::root::vault) fn hardware_profile_vault_view_unlock(
         &mut self,
-        store: &DesktopVaultStore,
+        store: &Arc<DesktopVaultStore>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Option<Arc<ViewUnlock>> {
@@ -80,6 +80,20 @@ impl WalletRoot {
                 self.install_vault_view_unlock(Arc::clone(&vault_view_unlock));
                 self.hardware_profile_unlock.vault_view_unlock =
                     Some(Arc::clone(&vault_view_unlock));
+                let store = Arc::clone(store);
+                let join = self
+                    .runtime
+                    .spawn_blocking(move || Self::renew_touch_id(&store, password.as_str()));
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = join.await {
+                        tracing::warn!(%error, "Touch ID renewal task failed");
+                    }
+                    let _ = this.update(cx, |root, cx| {
+                        root.refresh_touch_id_status();
+                        cx.notify();
+                    });
+                })
+                .detach();
                 Some(vault_view_unlock)
             }
             Err(error) => {
@@ -788,5 +802,92 @@ impl WalletRoot {
         }
 
         self.unlock_hardware_profile_from_dialog(window, cx);
+    }
+}
+
+#[cfg(all(test, feature = "hardware"))]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, IntoElement, Render, TestAppContext, div};
+    use wallet_ops::vault::BiometricUnlockStatus;
+
+    struct TestWindow;
+
+    impl Render for TestWindow {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn hardware_password_unlock_refreshes_touch_id_after_dialog_closes(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| TestWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.executor().allow_parking();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.lock_vault(window, cx);
+                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+                let store = root.vault_store.clone().unwrap();
+                // Completion must replace this stale cache with the fixture's actual status.
+                root.touch_id_status = BiometricUnlockStatus::NeedsReenrollment;
+                root.hardware_profile_password_input
+                    .update(cx, |input, cx| {
+                        input.set_value("public list test password", window, cx);
+                    });
+                assert!(
+                    root.hardware_profile_vault_view_unlock(&store, window, cx)
+                        .is_some()
+                );
+                window.close_all_dialogs(cx);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while root.read_with(cx, |root, _| root.touch_id_status)
+            == BiometricUnlockStatus::NeedsReenrollment
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Touch ID status stayed stale"
+            );
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            cx.run_until_parked();
+        }
+        root.read_with(cx, |root, _| {
+            assert_eq!(
+                root.touch_id_status,
+                root.vault_store
+                    .as_ref()
+                    .unwrap()
+                    .biometric_unlock_status()
+                    .unwrap()
+            );
+            assert!(root.vault_view_unlock.is_some());
+        });
+        cx.update(|window, _| window.remove_window());
     }
 }
