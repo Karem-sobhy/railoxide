@@ -342,7 +342,14 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.touch_id_in_progress || self.hardware_profile_unlock.in_progress {
+        if self.touch_id_in_progress
+            || self.hardware_profile_unlock.in_progress
+            || !self
+                .hardware_profile_unlock
+                .dialog_lease
+                .upgrade()
+                .is_some_and(|open| open.get())
+        {
             return;
         }
         let Some(prompt) = self.touch_id_prompt() else {
@@ -352,13 +359,16 @@ impl WalletRoot {
         self.touch_id_in_progress = true;
         self.hardware_profile_unlock.error = None;
         let generation = self.hardware_wallet_creation_generation;
+        let lease = self.hardware_profile_unlock.dialog_lease.clone();
         cx.notify();
         prompt.run(
             TOUCH_ID_REASON_UNLOCK,
             window,
             cx,
             move |root, outcome, window, cx| {
-                root.finish_hardware_profile_touch_id_unlock(generation, outcome, window, cx);
+                root.finish_hardware_profile_touch_id_unlock(
+                    &lease, generation, outcome, window, cx,
+                );
             },
         );
     }
@@ -366,6 +376,7 @@ impl WalletRoot {
     #[cfg(feature = "hardware")]
     fn finish_hardware_profile_touch_id_unlock(
         &mut self,
+        lease: &Weak<Cell<bool>>,
         generation: u64,
         outcome: TouchIdPassword,
         window: &mut Window,
@@ -376,7 +387,9 @@ impl WalletRoot {
             self.refresh_touch_id_status();
         }
         cx.notify();
-        if self.hardware_wallet_creation_generation != generation {
+        if !lease.upgrade().is_some_and(|open| open.get())
+            || self.hardware_wallet_creation_generation != generation
+        {
             return;
         }
         match outcome {

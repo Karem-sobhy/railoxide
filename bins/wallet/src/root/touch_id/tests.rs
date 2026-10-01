@@ -141,60 +141,75 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
     cx.simulate_resize(gpui::size(px(1000.), px(800.)));
     cx.update(|window, cx| root.update(cx, |root, cx| root.lock_vault(window, cx)));
 
-    for outcome in [
-        TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
-        TouchIdPassword::Failed(Arc::from("old prompt failure")),
-    ] {
-        cx.update(|window, cx| {
-            root.update(cx, |root, cx| {
-                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+    for replacement in ["hardware", "settings"] {
+        for outcome in [
+            TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+            TouchIdPassword::Failed(Arc::from("old prompt failure")),
+        ] {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+                });
             });
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let generation = root.update(cx, |root, _| {
-            root.touch_id_in_progress = true;
-            root.hardware_wallet_creation_generation
-        });
-        cx.simulate_keystrokes("escape");
-        cx.update(|window, cx| {
-            assert!(!window.has_active_dialog(cx));
-            root.update(cx, |root, cx| {
-                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let (lease, generation) = root.update(cx, |root, _| {
+                root.touch_id_in_progress = true;
+                (
+                    root.hardware_profile_unlock.dialog_lease.clone(),
+                    root.hardware_wallet_creation_generation,
+                )
             });
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            root.update(cx, |root, cx| {
-                root.hardware_profile_password_input
-                    .update(cx, |input, cx| {
-                        input.set_value("replacement typed password", window, cx);
+            if replacement == "hardware" {
+                cx.simulate_keystrokes("escape");
+                cx.update(|window, cx| {
+                    assert!(!window.has_active_dialog(cx));
+                    root.update(cx, |root, cx| {
+                        root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
                     });
-                root.hardware_profile_unlock.error = Some(Arc::from("replacement error"));
-                root.finish_hardware_profile_touch_id_unlock(generation, outcome, window, cx);
-                assert!(!root.touch_id_in_progress);
-                assert!(!root.hardware_profile_unlock.in_progress);
-                assert!(root.hardware_profile_unlock.vault_view_unlock.is_none());
-                assert!(root.vault_view_unlock.is_none());
-                assert_eq!(
-                    root.hardware_profile_unlock.error.as_deref(),
-                    Some("replacement error")
-                );
-                assert_eq!(
-                    root.hardware_profile_password_input.read(cx).value(),
-                    "replacement typed password"
-                );
-                assert!(window.has_active_dialog(cx));
-                window.close_all_dialogs(cx);
+                });
+            } else {
+                cx.update(|window, cx| {
+                    root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                });
+            }
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.hardware_profile_password_input
+                        .update(cx, |input, cx| {
+                            input.set_value("replacement typed password", window, cx);
+                        });
+                    root.hardware_profile_unlock.error = Some(Arc::from("replacement error"));
+                    root.finish_hardware_profile_touch_id_unlock(
+                        &lease, generation, outcome, window, cx,
+                    );
+                    assert!(!root.touch_id_in_progress);
+                    assert!(!root.hardware_profile_unlock.in_progress);
+                    assert!(root.hardware_profile_unlock.vault_view_unlock.is_none());
+                    assert!(root.vault_view_unlock.is_none());
+                    assert_eq!(
+                        root.hardware_profile_unlock.error.as_deref(),
+                        Some("replacement error")
+                    );
+                    assert_eq!(
+                        root.hardware_profile_password_input.read(cx).value(),
+                        "replacement typed password"
+                    );
+                    assert!(window.has_active_dialog(cx));
+                    window.close_all_dialogs(cx);
+                });
             });
-        });
+        }
     }
 
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
             root.touch_id_in_progress = true;
+            let lease = root.hardware_profile_unlock.dialog_lease.clone();
             root.finish_hardware_profile_touch_id_unlock(
+                &lease,
                 root.hardware_wallet_creation_generation,
                 TouchIdPassword::Failed(Arc::from("current prompt failure")),
                 window,

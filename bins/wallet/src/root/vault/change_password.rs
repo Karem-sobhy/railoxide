@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use gpui::{
     AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Styled, Window,
@@ -32,6 +36,8 @@ struct ChangeVaultPasswordDialogContent {
     error: Option<Arc<str>>,
     touch_id: Option<TouchIdPrompt>,
     touch_id_pending: bool,
+    lease: Weak<Cell<bool>>,
+    wallet_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -42,9 +48,50 @@ enum ChangeVaultPasswordEnterAction {
 }
 
 impl ChangeVaultPasswordDialogContent {
+    fn open(
+        root: &mut WalletRoot,
+        window: &mut Window,
+        cx: &mut Context<'_, WalletRoot>,
+    ) -> Entity<Self> {
+        window.close_all_dialogs(cx);
+        let entity = cx.entity();
+        let touch_id = root.touch_id_prompt();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
+        let wallet_generation = root.active_wallet_generation;
+        let content =
+            cx.new(|cx| Self::new(entity, touch_id, identity, wallet_generation, window, cx));
+        let focus_content = content.clone();
+        let dialog_content = content.clone();
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(CHANGE_VAULT_PASSWORD_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let identity = Rc::downgrade(&lease);
+            dialog
+                .w(dialog_width)
+                .on_ok(|_, _, _| false)
+                .title(app_strong_text("Change vault password"))
+                .on_close(move |_, _, _| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
+                })
+                .child(div().w(content_width).child(dialog_content.clone()))
+        });
+        cx.defer_in(window, move |_root, window, cx| {
+            focus_content.update(cx, |content, cx| {
+                content.focus_current_password(window, cx);
+            });
+        });
+        content
+    }
+
     fn new(
         root: Entity<WalletRoot>,
         touch_id: Option<TouchIdPrompt>,
+        lease: Weak<Cell<bool>>,
+        wallet_generation: u64,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -91,7 +138,16 @@ impl ChangeVaultPasswordDialogContent {
             error: None,
             touch_id,
             touch_id_pending: false,
+            lease,
+            wallet_generation,
         }
+    }
+
+    fn is_current(&self, cx: &Context<'_, Self>) -> bool {
+        let root = self.root.read(cx);
+        self.lease.upgrade().is_some_and(|open| open.get())
+            && root.active_wallet_generation == self.wallet_generation
+            && matches!(root.vault_state, VaultState::ViewUnlocked)
     }
 
     fn focus_current_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -107,7 +163,7 @@ impl ChangeVaultPasswordDialogContent {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.pending || self.touch_id_pending {
+        if self.pending || self.touch_id_pending || !self.is_current(cx) {
             return;
         }
         match enter_action {
@@ -128,7 +184,7 @@ impl ChangeVaultPasswordDialogContent {
     }
 
     fn submit(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.touch_id_pending {
+        if self.pending || self.touch_id_pending || !self.is_current(cx) {
             return;
         }
         let current_password =
@@ -143,7 +199,7 @@ impl ChangeVaultPasswordDialogContent {
 
     /// Uses Touch ID for the current password once the new password is valid.
     fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.touch_id_pending {
+        if self.pending || self.touch_id_pending || !self.is_current(cx) {
             return;
         }
         let Some(prompt) = self.touch_id.clone() else {
@@ -162,21 +218,33 @@ impl ChangeVaultPasswordDialogContent {
             window,
             cx,
             |dialog, outcome, window, cx| {
-                dialog.touch_id_pending = false;
-                match outcome {
-                    TouchIdPassword::Password(current_password) => {
-                        dialog.submit_with_current_password(current_password, window, cx);
-                    }
-                    TouchIdPassword::Cancelled => {}
-                    TouchIdPassword::Failed(message) => {
-                        dialog.touch_id = None;
-                        dialog.error = Some(message);
-                        dialog.focus_current_password(window, cx);
-                    }
-                }
-                cx.notify();
+                dialog.finish_touch_id(outcome, window, cx);
             },
         );
+    }
+
+    fn finish_touch_id(
+        &mut self,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_pending = false;
+        cx.notify();
+        if !self.is_current(cx) {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(current_password) => {
+                self.submit_with_current_password(current_password, window, cx);
+            }
+            TouchIdPassword::Cancelled => {}
+            TouchIdPassword::Failed(message) => {
+                self.touch_id = None;
+                self.error = Some(message);
+                self.focus_current_password(window, cx);
+            }
+        }
     }
 
     fn new_password(&self, cx: &Context<'_, Self>) -> Result<Zeroizing<String>, Arc<str>> {
@@ -198,6 +266,9 @@ impl ChangeVaultPasswordDialogContent {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.is_current(cx) {
+            return;
+        }
         let new_password = match self.new_password(cx) {
             Ok(new_password) => new_password,
             Err(message) => {
@@ -375,27 +446,7 @@ impl WalletRoot {
             self.set_vault_error("Unlock the wallet vault before changing its password", cx);
             return;
         }
-        window.close_all_dialogs(cx);
-        let root = cx.entity();
-        let touch_id = self.touch_id_prompt();
-        let content =
-            cx.new(|cx| ChangeVaultPasswordDialogContent::new(root, touch_id, window, cx));
-        let focus_content = content.clone();
-        let dialog_width =
-            (window.viewport_size().width * 0.92).min(CHANGE_VAULT_PASSWORD_DIALOG_WIDTH);
-        let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(dialog_width)
-                .on_ok(|_, _, _| false)
-                .title(app_strong_text("Change vault password"))
-                .child(div().w(content_width).child(content.clone()))
-        });
-        cx.defer_in(window, move |_root, window, cx| {
-            focus_content.update(cx, |content, cx| {
-                content.focus_current_password(window, cx);
-            });
-        });
+        ChangeVaultPasswordDialogContent::open(self, window, cx);
     }
 }
 
@@ -421,5 +472,151 @@ fn change_vault_password_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::VaultNotFound => Arc::from("Wallet vault storage was not found."),
         _ => Arc::from(format!("Failed to change vault password: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct DialogWindow;
+
+    impl Render for DialogWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(crate::root::startup::render_wallet_overlay_layers(
+                    window, cx,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn change_password_touch_id_ignores_closed_dialogs_and_wallet_changes(cx: &mut TestAppContext) {
+        const PASSWORD: &str = "public list test password";
+        const NEW_PASSWORD: &str = "replacement vault password";
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.executor().allow_parking();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        let store = root.read_with(cx, |root, _| root.vault_store.clone().unwrap());
+        let wait_for_change = |dialog: &Entity<ChangeVaultPasswordDialogContent>,
+                               cx: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "password change timed out"
+                );
+                runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                });
+                cx.run_until_parked();
+            }
+        };
+
+        for invalidate in ["cancel", "settings", "generation", "lock"] {
+            let content = cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    ChangeVaultPasswordDialogContent::open(root, window, cx)
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                content.update(cx, |dialog, cx| {
+                    dialog
+                        .new_password_input
+                        .update(cx, |input, cx| input.set_value(NEW_PASSWORD, window, cx));
+                    dialog
+                        .confirm_password_input
+                        .update(cx, |input, cx| input.set_value(NEW_PASSWORD, window, cx));
+                });
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            content.update(cx, |dialog, cx| {
+                dialog.touch_id_pending = true;
+                cx.notify();
+            });
+            // Model the entity ownership of callbacks retained by the rendered frame.
+            let retained = content;
+            let retained = cx.update(|window, cx| {
+                match invalidate {
+                    "cancel" => window.close_dialog(cx),
+                    "settings" => {
+                        root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                    }
+                    "generation" => {
+                        root.update(cx, |root, _| root.advance_active_wallet_generation());
+                    }
+                    "lock" => root.update(cx, |root, cx| root.lock_vault(window, cx)),
+                    _ => unreachable!(),
+                }
+                // Deliver before another draw can drop the rendered button callbacks.
+                retained.update(cx, |dialog, cx| {
+                    dialog.finish_touch_id(
+                        TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                        window,
+                        cx,
+                    );
+                });
+                retained
+            });
+            wait_for_change(&retained, cx);
+            assert!(
+                store.unlock_view(PASSWORD).is_ok(),
+                "dismissed authentication changed the vault password"
+            );
+            assert!(store.unlock_view(NEW_PASSWORD).is_err());
+            cx.update(WindowExt::close_all_dialogs);
+        }
+
+        let content = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.vault_state = VaultState::ViewUnlocked;
+                root.view_session = Some(Arc::new(
+                    store.load_view_session(PASSWORD, "preview").unwrap(),
+                ));
+                ChangeVaultPasswordDialogContent::open(root, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            content.update(cx, |dialog, cx| {
+                dialog
+                    .new_password_input
+                    .update(cx, |input, cx| input.set_value(NEW_PASSWORD, window, cx));
+                dialog
+                    .confirm_password_input
+                    .update(cx, |input, cx| input.set_value(NEW_PASSWORD, window, cx));
+                dialog.touch_id_pending = true;
+                dialog.finish_touch_id(
+                    TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                    window,
+                    cx,
+                );
+            });
+        });
+        wait_for_change(&content, cx);
+        assert!(store.unlock_view(NEW_PASSWORD).is_ok());
+        assert!(store.unlock_view(PASSWORD).is_err());
+        cx.update(|window, _| window.remove_window());
     }
 }

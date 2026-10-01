@@ -1,4 +1,7 @@
 #[cfg(feature = "hardware")]
+use std::{cell::Cell, rc::Rc};
+
+#[cfg(feature = "hardware")]
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
 #[cfg(feature = "hardware")]
@@ -634,6 +637,8 @@ impl WalletRoot {
         self.next_hardware_profile_action_generation();
         self.hardware_profile_unlock
             .reset_for_device(device_kind, wallet_id, purpose);
+        let lease = Rc::new(Cell::new(true));
+        self.hardware_profile_unlock.dialog_lease = Rc::downgrade(&lease);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
         self.hardware_profile_label_input.update(cx, |input, cx| {
             input.set_value(default_hardware_profile_label(device_kind), window, cx);
@@ -653,6 +658,7 @@ impl WalletRoot {
         let content_focus = cx.focus_handle();
         let dialog_content_focus = content_focus.clone();
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let identity = Rc::downgrade(&lease);
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -661,6 +667,9 @@ impl WalletRoot {
                 .max_h(dialog_max_height)
                 .title(app_strong_text(format!("{device_label} wallet")))
                 .on_close(move |_event, window, cx| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
                     close_root.update(cx, |root, cx| {
                         root.dismiss_hardware_profile_unlock_dialog(gateway_unlock, window, cx);
                     });
