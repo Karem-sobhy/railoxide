@@ -10,8 +10,8 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, WindowExt,
-    button::{Button, ButtonVariants},
-    input::{InputEvent, InputState},
+    button::ButtonVariants,
+    input::{InputEvent, InputGroupButton, InputState},
 };
 use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme;
@@ -454,7 +454,7 @@ fn password_field(
     label: &'static str,
     input: &Entity<InputState>,
     disabled: bool,
-    touch_id: Option<Button>,
+    touch_id: Option<InputGroupButton>,
 ) -> gpui::Div {
     div()
         .w_full()

@@ -3306,6 +3306,127 @@ mod tests {
     }
 
     #[gpui::test]
+    fn spend_touch_id_is_inside_the_password_field_and_activates_from_the_keyboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use wallet_ops::vault::BiometricUnlockStatus;
+
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.executor().allow_parking();
+        cx.update(gpui_component::init);
+        cx.update(crate::root::install_wallet_action_bindings);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+
+        for key in ["space", "enter"] {
+            let dialog = cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_spend_authorization_dialog_with_review(
+                        SpendAuthorizationIntent::WalletConnectRequest {
+                            request_key: "removed-request".into(),
+                            review_token: 0,
+                            reviewed_fee: None,
+                        },
+                        SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.update(|window, cx| {
+                let prompt = root.update(cx, |root, _| {
+                    // Show the action without enrolling or opening a native biometric prompt.
+                    root.touch_id_supported = true;
+                    root.touch_id_status = BiometricUnlockStatus::Enabled;
+                    root.touch_id_prompt_cached()
+                });
+                dialog.update(cx, |dialog, cx| {
+                    dialog.touch_id = prompt;
+                    dialog.password_input.update(cx, |input, cx| {
+                        input.set_value("unsubmitted password", window, cx);
+                    });
+                    dialog.focus_password(window, cx);
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                let input_id = dialog.read(cx).password_input.entity_id();
+                let group_id = ("vault-password-touch-id", input_id);
+                let group = window.find(group_id).bounds();
+                let button = window.within(group_id).find("wallet-spend-auth-touch-id");
+                let bounds = button.bounds();
+                assert!(
+                    group.left() <= bounds.left()
+                        && group.top() <= bounds.top()
+                        && bounds.right() <= group.right()
+                        && bounds.bottom() <= group.bottom()
+                );
+                assert_eq!(
+                    bounds.size.width, bounds.size.height,
+                    "the action is icon-only"
+                );
+                window.press("tab", cx);
+                assert_eq!(
+                    window.find("wallet-spend-auth-touch-id").focused(),
+                    Some(true)
+                );
+            });
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            cx.run_until_parked();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.touch_id_pending) {
+                assert!(Instant::now() < deadline, "Touch ID did not finish");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+            cx.update(|window, cx| {
+                let dialog = dialog.read(cx);
+                // The fixture has no sealed password, so activation takes the failure path.
+                assert!(
+                    dialog.touch_id.is_none(),
+                    "Touch ID did not activate with {key}"
+                );
+                assert!(dialog.error.is_some());
+                assert_eq!(
+                    dialog.password_input.read(cx).value(),
+                    "unsubmitted password"
+                );
+                assert!(!dialog.pending);
+                assert!(root.read(cx).spend_authorization_cache.is_none());
+                assert!(window.has_active_dialog(cx));
+                window.close_all_dialogs(cx);
+            });
+        }
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
     fn spend_touch_id_cannot_authorize_after_settings_closes_review(cx: &mut gpui::TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()

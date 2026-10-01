@@ -1,7 +1,7 @@
 //! Touch ID as an alternative to typing the vault password.
 //!
 //! Every prompt keeps its password field. When Touch ID unlock is on, a Touch
-//! ID button beside the field reads the sealed vault password and hands it to
+//! ID icon inside the field reads the sealed vault password and hands it to
 //! the same submit path a typed password takes, so every vault check still runs
 //! against the password itself.
 
@@ -18,18 +18,21 @@ use gpui::{
 };
 use gpui_component::{
     Disableable as _, Icon, Sizable as _, WindowExt as _,
-    button::{Button, ButtonVariants as _},
+    button::ButtonVariants as _,
     dialog::Cancel,
-    input::{InputEvent, InputState},
+    input::{InputEvent, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, InputState},
     notification::Notification,
 };
 use tokio::runtime::Handle;
-use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_input, app_input_group, app_masked_input, app_muted_text, app_strong_text,
+};
 use ui::theme;
 use wallet_ops::biometric::{BiometricError, biometric_unlock_supported};
 use wallet_ops::vault::{BiometricUnlockStatus, DesktopVaultStore, VaultError};
 use zeroize::Zeroizing;
 
+use super::actions::TOUCH_ID_BUTTON_KEY_CONTEXT;
 use super::{VaultState, WalletRoot, new_masked_input, secondary_dialog_content_width};
 use crate::assets::RailgunActionIcon;
 
@@ -110,41 +113,47 @@ fn touch_id_failure(error: &VaultError) -> TouchIdPassword {
     }
 }
 
-/// A button that asks for Touch ID instead of the typed vault password.
+/// An input-group icon that asks for Touch ID instead of the typed vault password.
 pub(in crate::root) fn touch_id_button(
     id: impl Into<ElementId>,
     label: &'static str,
     pending: bool,
     disabled: bool,
-) -> Button {
-    app_button(id, label)
+) -> InputGroupButton {
+    InputGroupButton::new(id)
+        .key_context(TOUCH_ID_BUTTON_KEY_CONTEXT)
         .icon(Icon::new(RailgunActionIcon::Fingerprint))
-        .outline()
-        .flex_none()
+        .accessibility_label(label)
         .tooltip("Use Touch ID instead of the vault password")
         .loading(pending)
         .disabled(disabled || pending)
 }
 
-/// A vault password field with an optional Touch ID button beside it.
+/// A vault password field with an optional Touch ID icon inside it.
 pub(in crate::root) fn masked_input_with_touch_id(
     input: &Entity<InputState>,
     disabled: bool,
-    touch_id: Option<Button>,
+    touch_id: Option<InputGroupButton>,
 ) -> gpui::Div {
     match touch_id {
-        Some(button) => div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .child(app_masked_input(input, disabled)),
+        Some(button) => div().w_full().child(
+            app_input_group(
+                ("vault-password-touch-id", input.entity_id()),
+                input,
+                "Vault password",
             )
-            .child(button),
+            .input(
+                app_input(input)
+                    .role(gpui::accesskit::Role::PasswordInput)
+                    .bg(gpui::transparent_black()),
+            )
+            .disabled(disabled)
+            .addon(
+                InputGroupAddon::new(("vault-password-touch-id-actions", input.entity_id()))
+                    .align(InputGroupAddonAlignment::InlineEnd)
+                    .child(button),
+            ),
+        ),
         None => app_masked_input(input, disabled),
     }
 }

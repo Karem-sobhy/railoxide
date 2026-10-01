@@ -32,9 +32,7 @@ use wallet_ops::vault::TrezorPassphraseMode;
 use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
-#[cfg(feature = "hardware")]
-use super::touch_id::masked_input_with_touch_id;
-use super::touch_id::touch_id_button;
+use super::touch_id::{masked_input_with_touch_id, touch_id_button};
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
@@ -52,6 +50,9 @@ use crate::assets::{
 mod trezor;
 #[cfg(feature = "hardware")]
 use trezor::trezor_pin_matrix_title;
+
+#[cfg(test)]
+mod tests;
 
 impl WalletRoot {
     pub(super) const fn titlebar_color(&self) -> u32 {
@@ -374,35 +375,36 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body.child(app_masked_input(&self.unlock_password_input, busy))
-            .child(
-                app_button("unlock-wallet-vault", "Unlock vault")
-                    .primary()
-                    .w_full()
-                    .loading(self.unlock_in_progress)
-                    .disabled(busy)
-                    .on_click(move |_event, window, cx| {
-                        submit_root.update(cx, |root, cx| {
-                            root.unlock_vault_from_input(window, cx);
-                        });
-                    }),
-            )
-            .when(touch_id, |this| {
-                this.child(
-                    touch_id_button(
-                        "unlock-wallet-vault-touch-id",
-                        "Unlock with Touch ID",
-                        self.touch_id_in_progress,
-                        self.unlock_in_progress,
-                    )
-                    .w_full()
-                    .on_click(move |_event, window, cx| {
-                        touch_id_root.update(cx, |root, cx| {
-                            root.unlock_vault_with_touch_id(window, cx);
-                        });
-                    }),
+        let password = masked_input_with_touch_id(
+            &self.unlock_password_input,
+            busy,
+            touch_id.then(|| {
+                touch_id_button(
+                    "unlock-wallet-vault-touch-id",
+                    "Unlock with Touch ID",
+                    self.touch_id_in_progress,
+                    self.unlock_in_progress,
                 )
-            })
+                .on_click(move |_event, window, cx| {
+                    touch_id_root.update(cx, |root, cx| {
+                        root.unlock_vault_with_touch_id(window, cx);
+                    });
+                })
+            }),
+        );
+
+        body.child(password).child(
+            app_button("unlock-wallet-vault", "Unlock vault")
+                .primary()
+                .w_full()
+                .loading(self.unlock_in_progress)
+                .disabled(busy)
+                .on_click(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.unlock_vault_from_input(window, cx);
+                    });
+                }),
+        )
     }
 
     fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::AnyElement {

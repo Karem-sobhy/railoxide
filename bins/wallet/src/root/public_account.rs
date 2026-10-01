@@ -14,8 +14,9 @@ use gpui::{
 use gpui_component::{
     Disableable, Sizable, WindowExt,
     alert::Alert,
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
     checkbox::Checkbox,
+    input::InputGroupButton,
     menu::{DropdownMenu, PopupMenuItem},
 };
 use railgun_ui::{chain_name, short_address};
@@ -1347,7 +1348,7 @@ impl WalletRoot {
         id: &'static str,
         busy: bool,
         lease: Weak<Cell<bool>>,
-    ) -> Option<Button> {
+    ) -> Option<InputGroupButton> {
         self.touch_id_prompt_cached()?;
         Some(
             touch_id_button(id, "Touch ID", self.touch_id_in_progress, busy).on_click(
