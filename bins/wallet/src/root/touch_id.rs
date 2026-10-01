@@ -5,15 +5,21 @@
 //! the same submit path a typed password takes, so every vault check still runs
 //! against the password itself.
 
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use gpui::{
-    AppContext as _, Context, ElementId, Entity, Focusable as _, IntoElement, ParentElement as _,
-    Pixels, Render, Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb,
+    AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _, Window,
+    div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::Cancel,
     input::{InputEvent, InputState},
     notification::Notification,
 };
@@ -29,6 +35,9 @@ use crate::assets::RailgunActionIcon;
 
 const ENABLE_TOUCH_ID_DIALOG_WIDTH: Pixels = px(420.0);
 const TOUCH_ID_FAILED: &str = "Touch ID failed. Enter the vault password instead.";
+
+#[cfg(test)]
+mod tests;
 
 /// Each reason finishes the "… is trying to" sentence of the system Touch ID prompt.
 pub(in crate::root) const TOUCH_ID_REASON_UNLOCK: &str = "unlock the wallet vault";
@@ -433,21 +442,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let root = cx.entity();
-        let content = cx.new(|cx| EnableTouchIdDialogContent::new(root, window, cx));
-        let focus_content = content.clone();
-        let dialog_width = (window.viewport_size().width * 0.92).min(ENABLE_TOUCH_ID_DIALOG_WIDTH);
-        let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(dialog_width)
-                .on_ok(|_, _, _| false)
-                .title(app_strong_text("Turn on Touch ID"))
-                .child(div().w(content_width).child(content.clone()))
-        });
-        cx.defer_in(window, move |_root, window, cx| {
-            focus_content.update(cx, |content, cx| content.focus_password(window, cx));
-        });
+        EnableTouchIdDialogContent::open(window, cx);
     }
 
     /// Seals the password that just created the vault when the user opted in.
@@ -497,10 +492,51 @@ struct EnableTouchIdDialogContent {
     password_input: Entity<InputState>,
     error: Option<Arc<str>>,
     pending: bool,
+    lease: Weak<Cell<bool>>,
+    dialog_focus: Option<FocusHandle>,
 }
 
 impl EnableTouchIdDialogContent {
-    fn new(root: Entity<WalletRoot>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    fn open(window: &mut Window, cx: &mut Context<'_, WalletRoot>) -> Entity<Self> {
+        let root = cx.entity();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
+        let content = cx.new(|cx| Self::new(root, identity, window, cx));
+        let dialog_content = content.clone();
+        let dialog_width = (window.viewport_size().width * 0.92).min(ENABLE_TOUCH_ID_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let identity = Rc::downgrade(&lease);
+            let cancel_content = dialog_content.clone();
+            let pending = dialog_content.read(cx).pending;
+            dialog
+                .w(dialog_width)
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, _, cx| !cancel_content.read(cx).pending)
+                .on_close(move |_, _, _| {
+                    if let Some(lease) = identity.upgrade() {
+                        lease.set(false);
+                    }
+                })
+                .close_button(!pending)
+                .overlay_closable(!pending)
+                .title(app_strong_text("Turn on Touch ID"))
+                .child(div().w(content_width).child(dialog_content.clone()))
+        });
+        content.update(cx, |content, cx| content.dialog_focus = window.focused(cx));
+        let focus_content = content.clone();
+        cx.defer_in(window, move |_root, window, cx| {
+            focus_content.update(cx, |content, cx| content.focus_password(window, cx));
+        });
+        content
+    }
+
+    fn new(
+        root: Entity<WalletRoot>,
+        lease: Weak<Cell<bool>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         let password_input = new_masked_input(window, cx, "vault password");
         cx.subscribe_in(
             &password_input,
@@ -520,6 +556,8 @@ impl EnableTouchIdDialogContent {
             password_input,
             error: None,
             pending: false,
+            lease,
+            dialog_focus: None,
         }
     }
 
@@ -551,37 +589,75 @@ impl EnableTouchIdDialogContent {
         let join = root
             .runtime
             .spawn_blocking(move || store.enable_biometric_unlock(password.as_str()));
-        self.pending = true;
-        self.error = None;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = join.await;
-            let _ = this.update_in(cx, |dialog, window, cx| {
-                dialog.pending = false;
-                dialog.root.update(cx, |root, cx| {
-                    root.refresh_touch_id_status();
-                    cx.notify();
-                });
-                match result {
-                    Ok(Ok(())) => {
-                        window.close_dialog(cx);
-                        window.push_notification(
-                            Notification::success(
-                                "Touch ID unlock turned on. The vault password still works.",
-                            ),
-                            cx,
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        dialog.error = Some(enable_touch_id_error_message(&error));
-                        dialog.focus_password(window, cx);
-                    }
+        self.observe_enrollment(
+            async move {
+                match join.await {
+                    Ok(result) => result.map_err(|error| enable_touch_id_error_message(&error)),
                     Err(error) => {
                         tracing::warn!(%error, "turn on Touch ID task failed");
-                        dialog.error = Some(Arc::from("Failed to turn on Touch ID. Try again."));
+                        Err(Arc::from("Failed to turn on Touch ID. Try again."))
                     }
                 }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn observe_enrollment(
+        &mut self,
+        completion: impl Future<Output = Result<(), Arc<str>>> + 'static,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.pending = true;
+        self.error = None;
+        let root = self.root.downgrade();
+        let lease = self.lease.clone();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = completion.await;
+            // Enrollment commits in the worker even if locking forcibly closes its dialog.
+            let _ = root.update(cx, |root, cx| {
+                root.refresh_touch_id_status();
                 cx.notify();
+            });
+            let original_open = lease.upgrade().is_some_and(|open| open.get());
+            let _ = cx.update(|window, cx| match &result {
+                Ok(()) => window.push_notification(
+                    Notification::success(
+                        "Touch ID unlock turned on. The vault password still works.",
+                    ),
+                    cx,
+                ),
+                Err(error) if !original_open => {
+                    window.push_notification(Notification::error(error.to_string()), cx);
+                }
+                Err(_) => {}
+            });
+            let _ = this.update_in(cx, |dialog, window, cx| {
+                dialog.pending = false;
+                cx.notify();
+                if !original_open {
+                    return;
+                }
+                let focused = dialog
+                    .dialog_focus
+                    .as_ref()
+                    .is_some_and(|focus| focus.contains_focused(window, cx));
+                match result {
+                    Ok(()) => {
+                        if focused {
+                            window.close_dialog(cx);
+                        }
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error);
+                        if focused {
+                            dialog.focus_password(window, cx);
+                        }
+                    }
+                }
             });
         })
         .detach();
@@ -634,9 +710,11 @@ impl Render for EnableTouchIdDialogContent {
                     .gap_2()
                     .child(
                         app_button("wallet-enable-touch-id-cancel", "Cancel")
+                            .debug_selector(|| "wallet-enable-touch-id-cancel".into())
                             .flex_none()
+                            .disabled(self.pending)
                             .on_click(move |_event, window, cx| {
-                                window.close_dialog(cx);
+                                window.dispatch_action(Box::new(Cancel), cx);
                             }),
                     )
                     .child(
