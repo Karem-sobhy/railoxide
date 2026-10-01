@@ -89,7 +89,7 @@ impl DesktopVaultStore {
         let metadata = self.metadata()?;
         let metadata = reencrypt_metadata(&metadata, current_password, new_password)?;
         self.put_metadata(&metadata)?;
-        self.reseal_biometric_unlock_after_password_change(new_password);
+        self.reseal_device_auth_after_password_change(new_password);
         Ok(())
     }
 

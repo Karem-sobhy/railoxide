@@ -14,7 +14,7 @@ impl Render for DialogWindow {
 }
 
 #[gpui::test]
-fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut TestAppContext) {
+fn vault_device_auth_ignores_results_after_password_unlock_and_relock(cx: &mut TestAppContext) {
     const PASSWORD: &str = "public list test password";
     let directory = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -61,13 +61,13 @@ fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut Test
     };
 
     for outcome in [
-        TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
-        TouchIdPassword::Failed(Arc::from("old prompt failure")),
+        DeviceAuthPassword::Password(Zeroizing::new(PASSWORD.into())),
+        DeviceAuthPassword::Failed(Arc::from("old prompt failure")),
     ] {
         let generation = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 root.lock_vault(window, cx);
-                root.touch_id_in_progress = true;
+                root.device_auth_in_progress = true;
                 let generation = root.active_wallet_generation;
                 // The gateway uses this password path while Touch ID is pending.
                 root.unlock_vault_with_password(Zeroizing::new(PASSWORD.into()), None, window, cx);
@@ -80,8 +80,8 @@ fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut Test
                 root.lock_vault(window, cx);
                 root.vault_error = Some(Arc::from("current unlock error"));
                 root.focus_vault_input_on_render = false;
-                root.finish_vault_touch_id_unlock(generation, outcome, window, cx);
-                assert!(!root.touch_id_in_progress);
+                root.finish_vault_device_auth_unlock(generation, outcome, window, cx);
+                assert!(!root.device_auth_in_progress);
                 assert!(
                     !root.unlock_in_progress,
                     "stale result restarted vault unlock"
@@ -101,10 +101,10 @@ fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut Test
 
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
-            root.touch_id_in_progress = true;
-            root.finish_vault_touch_id_unlock(
+            root.device_auth_in_progress = true;
+            root.finish_vault_device_auth_unlock(
                 root.active_wallet_generation,
-                TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                DeviceAuthPassword::Password(Zeroizing::new(PASSWORD.into())),
                 window,
                 cx,
             );
@@ -116,7 +116,7 @@ fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut Test
 
 #[cfg(feature = "hardware")]
 #[gpui::test]
-fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppContext) {
+fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAppContext) {
     use wallet_ops::hardware::HardwareDeviceKind;
 
     let directory = tempfile::tempdir().unwrap();
@@ -143,8 +143,8 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
 
     for replacement in ["hardware", "settings"] {
         for outcome in [
-            TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
-            TouchIdPassword::Failed(Arc::from("old prompt failure")),
+            DeviceAuthPassword::Password(Zeroizing::new("public list test password".into())),
+            DeviceAuthPassword::Failed(Arc::from("old prompt failure")),
         ] {
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
@@ -154,7 +154,7 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let (lease, generation) = root.update(cx, |root, _| {
-                root.touch_id_in_progress = true;
+                root.device_auth_in_progress = true;
                 (
                     root.hardware_profile_unlock.dialog_lease.clone(),
                     root.hardware_wallet_creation_generation,
@@ -181,10 +181,10 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
                             input.set_value("replacement typed password", window, cx);
                         });
                     root.hardware_profile_unlock.error = Some(Arc::from("replacement error"));
-                    root.finish_hardware_profile_touch_id_unlock(
+                    root.finish_hardware_profile_device_auth_unlock(
                         &lease, generation, outcome, window, cx,
                     );
-                    assert!(!root.touch_id_in_progress);
+                    assert!(!root.device_auth_in_progress);
                     assert!(!root.hardware_profile_unlock.in_progress);
                     assert!(root.hardware_profile_unlock.vault_view_unlock.is_none());
                     assert!(root.vault_view_unlock.is_none());
@@ -206,12 +206,12 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
-            root.touch_id_in_progress = true;
+            root.device_auth_in_progress = true;
             let lease = root.hardware_profile_unlock.dialog_lease.clone();
-            root.finish_hardware_profile_touch_id_unlock(
+            root.finish_hardware_profile_device_auth_unlock(
                 &lease,
                 root.hardware_wallet_creation_generation,
-                TouchIdPassword::Failed(Arc::from("current prompt failure")),
+                DeviceAuthPassword::Failed(Arc::from("current prompt failure")),
                 window,
                 cx,
             );
@@ -226,7 +226,7 @@ fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_change(
+fn add_wallet_device_auth_ignores_results_after_dismissal_reopening_or_wallet_change(
     cx: &mut TestAppContext,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -252,10 +252,10 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
 
     for invalidate in ["dismiss", "reopen", "wallet"] {
         for outcome in [
-            TouchIdPassword::Password(Zeroizing::new("old authentication".into())),
-            TouchIdPassword::Failed(Arc::from("old prompt failure")),
+            DeviceAuthPassword::Password(Zeroizing::new("old authentication".into())),
+            DeviceAuthPassword::Failed(Arc::from("old prompt failure")),
         ] {
-            let failed = matches!(&outcome, TouchIdPassword::Failed(_));
+            let failed = matches!(&outcome, DeviceAuthPassword::Failed(_));
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
                     root.open_add_wallet_dialog(window, cx);
@@ -264,7 +264,7 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let (lease, generation) = root.update(cx, |root, _| {
-                root.touch_id_in_progress = true;
+                root.device_auth_in_progress = true;
                 (
                     root.add_wallet_dialog_lease.clone(),
                     root.active_wallet_generation,
@@ -289,11 +289,11 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
                         input.set_value("current typed password", window, cx);
                     });
                     root.vault_error = Some(Arc::from("current form error"));
-                    root.touch_id_status = BiometricUnlockStatus::Enabled;
-                    root.finish_add_wallet_touch_id(&lease, generation, outcome, window, cx);
-                    assert!(!root.touch_id_in_progress);
+                    root.touch_id_status = DeviceAuthStatus::Enabled;
+                    root.finish_add_wallet_device_auth(&lease, generation, outcome, window, cx);
+                    assert!(!root.device_auth_in_progress);
                     assert!(
-                        root.add_wallet_touch_id_password.is_none(),
+                        root.add_wallet_device_auth_password.is_none(),
                         "stale result authorized the current form"
                     );
                     assert_eq!(
@@ -307,7 +307,9 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
                             root.vault_store
                                 .as_ref()
                                 .unwrap()
-                                .biometric_unlock_status()
+                                .device_auth_status(
+                                    wallet_ops::device_auth::DeviceAuthMethod::TouchId
+                                )
                                 .unwrap()
                         );
                     }
@@ -323,20 +325,20 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             let lease = root.add_wallet_dialog_lease.clone();
-            root.touch_id_in_progress = true;
-            root.finish_add_wallet_touch_id(
+            root.device_auth_in_progress = true;
+            root.finish_add_wallet_device_auth(
                 &lease,
                 root.active_wallet_generation,
-                TouchIdPassword::Password(Zeroizing::new("current authentication".into())),
+                DeviceAuthPassword::Password(Zeroizing::new("current authentication".into())),
                 window,
                 cx,
             );
             assert!(
-                root.add_wallet_touch_id_password
+                root.add_wallet_device_auth_password
                     .as_ref()
                     .is_some_and(|password| password.as_str() == "current authentication")
             );
-            assert!(!root.touch_id_in_progress);
+            assert!(!root.device_auth_in_progress);
             window.close_all_dialogs(cx);
         });
     });
@@ -344,7 +346,7 @@ fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_chang
 }
 
 #[gpui::test]
-fn touch_id_enrollment_vetoes_cancel_until_completion(cx: &mut TestAppContext) {
+fn device_auth_enrollment_vetoes_cancel_until_completion(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -368,7 +370,9 @@ fn touch_id_enrollment_vetoes_cancel_until_completion(cx: &mut TestAppContext) {
 
     for result in [Err(Arc::from("enrollment failed")), Ok(())] {
         let dialog = cx.update(|window, cx| {
-            root.update(cx, |_, cx| EnableTouchIdDialogContent::open(window, cx))
+            root.update(cx, |_, cx| {
+                EnableDeviceAuthDialogContent::open(DeviceAuthMethod::TouchId, window, cx)
+            })
         });
         cx.run_until_parked();
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -401,7 +405,7 @@ fn touch_id_enrollment_vetoes_cancel_until_completion(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn touch_id_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog(
+fn device_auth_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog(
     cx: &mut TestAppContext,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -434,8 +438,8 @@ fn touch_id_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog
         let dialog = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 // Deliberately stale cache: completion must reread the disabled test vault.
-                root.touch_id_status = BiometricUnlockStatus::Enabled;
-                EnableTouchIdDialogContent::open(window, cx)
+                root.touch_id_status = DeviceAuthStatus::Enabled;
+                EnableDeviceAuthDialogContent::open(DeviceAuthMethod::TouchId, window, cx)
             })
         });
         cx.run_until_parked();
@@ -462,7 +466,7 @@ fn touch_id_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog
         cx.run_until_parked();
         assert_eq!(
             root.read_with(cx, |root, _| root.touch_id_status),
-            BiometricUnlockStatus::Disabled
+            DeviceAuthStatus::Disabled
         );
         cx.update(|window, cx| {
             assert!(window.has_active_dialog(cx));
@@ -477,7 +481,7 @@ fn touch_id_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog
 }
 
 #[gpui_kit::test]
-fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppContext) {
+fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppContext) {
     use crate::root::settings::WalletSettingsEditor;
     use gpui_kit::test::TestWindowExt as _;
 
@@ -506,7 +510,12 @@ fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppConte
             window,
             cx,
         );
-        wallet.update(cx, |root, _| root.touch_id_supported = true);
+        wallet.update(cx, |root, _| {
+            root.touch_id_supported = true;
+            root.apple_watch_supported = true;
+            root.touch_id_available = false;
+            root.apple_watch_available = false;
+        });
         let editor = wallet.read(cx).settings_editor.clone().unwrap();
         editor.update(cx, |editor, cx| {
             editor.draft.runtime.auto_lock_timeout_secs = Some(600);
@@ -520,64 +529,90 @@ fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppConte
     let editor = root.read_with(cx, |root, _| root.settings_editor.clone().unwrap());
     let draft = editor.read_with(cx, |editor, _| editor.draft.clone());
     cx.simulate_resize(gpui::size(px(1000.), px(800.)));
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        assert_eq!(
-            window.find("wallet-settings-touch-id").checked(),
-            Some(false)
-        );
-        window.click("wallet-settings-touch-id", cx);
-        assert!(window.has_active_dialog(cx));
-    });
-    cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        assert!(window.find("wallet-enable-touch-id-submit").visible());
-        assert_eq!(
-            window.find("wallet-settings-touch-id").checked(),
-            Some(false)
-        );
-        window.click("wallet-enable-touch-id-cancel", cx);
-    });
-    cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        assert!(!window.has_active_dialog(cx));
-        assert_eq!(
-            window.find("wallet-settings-touch-id").focused(),
-            Some(true)
-        );
-    });
-    let keystroke = gpui::Keystroke::parse("space").unwrap();
-    cx.simulate_event(gpui::KeyDownEvent {
-        keystroke: keystroke.clone(),
-        is_held: false,
-        prefer_character_input: false,
-    });
-    cx.simulate_event(gpui::KeyUpEvent { keystroke });
-    cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        // Invalid enrollment must leave both the setting and the draft unchanged.
-        window.click("wallet-enable-touch-id-submit", cx);
-        assert!(window.has_active_dialog(cx));
-        assert_eq!(
-            window.find("wallet-settings-touch-id").checked(),
-            Some(false)
-        );
-        window.click("wallet-enable-touch-id-cancel", cx);
-        assert_eq!(editor.read(cx).draft, draft);
-    });
+    for (method, switch_id, submit_id, cancel_id) in [
+        (
+            DeviceAuthMethod::TouchId,
+            "wallet-settings-touch-id",
+            "wallet-enable-touch-id-submit",
+            "wallet-enable-touch-id-cancel",
+        ),
+        (
+            DeviceAuthMethod::AppleWatch,
+            "wallet-settings-apple-watch",
+            "wallet-enable-apple-watch-submit",
+            "wallet-enable-apple-watch-cancel",
+        ),
+    ] {
+        // Supported hardware may be temporarily unusable. Do not ask for the
+        // vault password until macOS reports that the method can authenticate.
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(switch_id, cx);
+            assert!(!window.has_active_dialog(cx));
+            assert_ne!(window.find(switch_id).focused(), Some(true));
+            assert_eq!(editor.read(cx).draft, draft);
+            root.update(cx, |root, cx| {
+                match method {
+                    DeviceAuthMethod::TouchId => root.touch_id_available = true,
+                    DeviceAuthMethod::AppleWatch => root.apple_watch_available = true,
+                }
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find(switch_id).checked(), Some(false));
+            window.click(switch_id, cx);
+            assert!(window.has_active_dialog(cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(submit_id).visible());
+            assert_eq!(window.find(switch_id).checked(), Some(false));
+            window.click(cancel_id, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+            assert_eq!(window.find(switch_id).focused(), Some(true));
+        });
+        let keystroke = gpui::Keystroke::parse("space").unwrap();
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            // Invalid enrollment must leave both the setting and the draft unchanged.
+            window.click(submit_id, cx);
+            assert!(window.has_active_dialog(cx));
+            assert_eq!(window.find(switch_id).checked(), Some(false));
+            window.click(cancel_id, cx);
+            assert_eq!(editor.read(cx).draft, draft);
+        });
+    }
 
     // Completion notifies the wallet root. Settings must observe that owner without
     // copying the enrollment flag into its Save/Discard draft.
     for status in [
-        BiometricUnlockStatus::Enabled,
-        BiometricUnlockStatus::NeedsReenrollment,
+        DeviceAuthStatus::Enabled,
+        DeviceAuthStatus::NeedsReenrollment,
     ] {
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
                 root.touch_id_status = status;
+                root.apple_watch_status = status;
+                // Saved settings remain visible while either device is unavailable.
+                root.touch_id_supported = false;
+                root.apple_watch_supported = false;
+                root.touch_id_available = false;
+                root.apple_watch_available = false;
                 cx.notify();
             });
         });
@@ -586,6 +621,10 @@ fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppConte
             window.render_frame(cx);
             assert_eq!(
                 window.find("wallet-settings-touch-id").checked(),
+                Some(true)
+            );
+            assert_eq!(
+                window.find("wallet-settings-apple-watch").checked(),
                 Some(true)
             );
             assert_eq!(editor.read(cx).draft, draft);
@@ -600,10 +639,7 @@ fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppConte
         );
         window.click("wallet-settings-touch-id", cx);
         assert!(!window.has_active_dialog(cx));
-        assert_eq!(
-            root.read(cx).touch_id_status,
-            BiometricUnlockStatus::Disabled
-        );
+        assert_eq!(root.read(cx).touch_id_status, DeviceAuthStatus::Disabled);
         assert!(!editor.read(cx).is_dirty());
         window.remove_window();
     });

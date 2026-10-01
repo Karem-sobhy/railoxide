@@ -36,12 +36,12 @@ use zeroize::Zeroizing;
 mod assets;
 mod commands;
 mod components;
+#[cfg(test)]
+mod device_auth_tests;
 mod hardware;
 mod identicon;
 pub(super) mod list;
 mod qr;
-#[cfg(test)]
-mod touch_id_tests;
 mod types;
 
 pub(super) use components::{
@@ -69,12 +69,13 @@ pub(super) use ui::public_address::{
     PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, public_address_qr_module_range,
 };
 
+use super::device_auth::{
+    DEVICE_AUTH_REASON_PUBLIC_ACCOUNT, DeviceAuthMethod, DeviceAuthPassword, device_auth_buttons,
+    masked_input_with_device_auth,
+};
 use super::dialogs::PublicAccountDialogKind;
 use super::participant::{remove_global_participant, remove_scoped_participant};
 use super::public_action::{PublicActionMode, PublicSendKind};
-use super::touch_id::{
-    TOUCH_ID_REASON_PUBLIC_ACCOUNT, TouchIdPassword, masked_input_with_touch_id, touch_id_button,
-};
 use super::{
     ConfirmationDialogProps, PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH,
     WalletRoot, confirmation_dialog, dialog_max_height, public_account_visible_balances_for_chain,
@@ -666,7 +667,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.touch_id_in_progress {
+        if self.device_auth_in_progress {
             return;
         }
         self.add_public_derived_account(None, window, cx);
@@ -674,7 +675,7 @@ impl WalletRoot {
 
     fn add_public_derived_account(
         &mut self,
-        touch_id_password: Option<Zeroizing<String>>,
+        device_auth_password: Option<Zeroizing<String>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -725,7 +726,7 @@ impl WalletRoot {
             );
             return;
         }
-        let password = match touch_id_password {
+        let password = match device_auth_password {
             Some(password) => password,
             None => Self::read_and_clear_input(&self.public_form.add_password_input, window, cx),
         };
@@ -906,7 +907,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.touch_id_in_progress {
+        if self.device_auth_in_progress {
             return;
         }
         self.import_public_account(None, window, cx);
@@ -914,7 +915,7 @@ impl WalletRoot {
 
     fn import_public_account(
         &mut self,
-        touch_id_password: Option<Zeroizing<String>>,
+        device_auth_password: Option<Zeroizing<String>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -945,7 +946,7 @@ impl WalletRoot {
         }
         let private_key =
             Self::read_and_clear_input(&self.public_form.import_private_key_input, window, cx);
-        let password = match touch_id_password {
+        let password = match device_auth_password {
             Some(password) => password,
             None => Self::read_and_clear_input(&self.public_form.import_password_input, window, cx),
         };
@@ -1248,15 +1249,16 @@ impl WalletRoot {
             })
     }
 
-    /// Runs the add or import form with the vault password from Touch ID.
-    fn submit_public_account_with_touch_id(
+    /// Runs the add or import form with the vault password from device authentication.
+    fn submit_public_account_with_device_auth(
         &mut self,
+        method: DeviceAuthMethod,
         kind: PublicAccountDialogKind,
         lease: Weak<Cell<bool>>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.touch_id_in_progress
+        if self.device_auth_in_progress
             || self.public_form.adding_account
             || self.public_form.importing_account
             || !lease.upgrade().is_some_and(|open| open.get())
@@ -1277,7 +1279,7 @@ impl WalletRoot {
             ),
             PublicAccountDialogKind::EditLabel => return,
         };
-        // Check the other fields first so Touch ID is not asked for a form that
+        // Check the other fields before asking for device approval on a form that
         // cannot be submitted.
         let error = if label_input.read(cx).value().trim().is_empty() {
             Some("Enter an account label")
@@ -1289,34 +1291,37 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        let Some(prompt) = self.touch_id_prompt() else {
+        let Some(prompt) = self.device_auth_prompt() else {
             cx.notify();
             return;
         };
-        self.touch_id_in_progress = true;
+        self.device_auth_in_progress = true;
         self.public_form.error = None;
         let generation = self.active_wallet_generation;
         cx.notify();
         prompt.run(
-            TOUCH_ID_REASON_PUBLIC_ACCOUNT,
+            method,
+            DEVICE_AUTH_REASON_PUBLIC_ACCOUNT,
             window,
             cx,
             move |root, outcome, window, cx| {
-                root.finish_public_account_touch_id(kind, &lease, generation, outcome, window, cx);
+                root.finish_public_account_device_auth(
+                    kind, &lease, generation, outcome, window, cx,
+                );
             },
         );
     }
 
-    fn finish_public_account_touch_id(
+    fn finish_public_account_device_auth(
         &mut self,
         kind: PublicAccountDialogKind,
         lease: &Weak<Cell<bool>>,
         generation: u64,
-        outcome: TouchIdPassword,
+        outcome: DeviceAuthPassword,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.touch_id_in_progress = false;
+        self.device_auth_in_progress = false;
         cx.notify();
         if !lease.upgrade().is_some_and(|open| open.get())
             || self.active_wallet_generation != generation
@@ -1324,7 +1329,7 @@ impl WalletRoot {
             return;
         }
         match outcome {
-            TouchIdPassword::Password(password) => match kind {
+            DeviceAuthPassword::Password(password) => match kind {
                 PublicAccountDialogKind::Derive => {
                     self.add_public_derived_account(Some(password), window, cx);
                 }
@@ -1333,31 +1338,38 @@ impl WalletRoot {
                 }
                 PublicAccountDialogKind::EditLabel => {}
             },
-            TouchIdPassword::Cancelled => {}
-            TouchIdPassword::Failed(message) => {
-                self.refresh_touch_id_status();
+            DeviceAuthPassword::Cancelled => {}
+            DeviceAuthPassword::Failed(message) => {
+                self.refresh_device_auth_status();
                 self.public_form.error = Some(message);
             }
         }
     }
 
-    fn public_account_touch_id_button(
+    fn public_account_device_auth_buttons(
         &self,
         root: Entity<Self>,
         kind: PublicAccountDialogKind,
         id: &'static str,
         busy: bool,
         lease: Weak<Cell<bool>>,
-    ) -> Option<InputGroupButton> {
-        self.touch_id_prompt_cached()?;
-        Some(
-            touch_id_button(id, "Touch ID", self.touch_id_in_progress, busy).on_click(
-                move |_event, window, cx| {
-                    root.update(cx, |root, cx| {
-                        root.submit_public_account_with_touch_id(kind, lease.clone(), window, cx);
-                    });
-                },
-            ),
+    ) -> Vec<InputGroupButton> {
+        device_auth_buttons(
+            self.device_auth_prompt_cached().as_ref(),
+            id,
+            self.device_auth_in_progress,
+            busy,
+            move |method, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.submit_public_account_with_device_auth(
+                        method,
+                        kind,
+                        lease.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            },
         )
     }
 
@@ -1366,7 +1378,7 @@ impl WalletRoot {
         root: Entity<Self>,
         kind: PublicAccountDialogKind,
         content_width: Pixels,
-        touch_id_lease: Weak<Cell<bool>>,
+        device_auth_lease: Weak<Cell<bool>>,
     ) -> gpui::Div {
         match kind {
             PublicAccountDialogKind::Derive => {
@@ -1533,17 +1545,17 @@ impl WalletRoot {
                     .child(app_muted_text(next_index))
                     .child(
                         app_input(&self.public_form.add_label_input)
-                            .disabled(self.touch_id_in_progress),
+                            .disabled(self.device_auth_in_progress),
                     )
-                    .child(masked_input_with_touch_id(
+                    .child(masked_input_with_device_auth(
                         &self.public_form.add_password_input,
-                        self.touch_id_in_progress,
-                        self.public_account_touch_id_button(
+                        self.device_auth_in_progress,
+                        self.public_account_device_auth_buttons(
                             add_root.clone(),
                             PublicAccountDialogKind::Derive,
                             "wallet-public-add-derived-touch-id",
                             self.public_form.adding_account,
-                            touch_id_lease,
+                            device_auth_lease,
                         ),
                     ))
                     .children(self.public_form.error.as_ref().map(|message| {
@@ -1561,7 +1573,7 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.adding_account)
-                        .disabled(self.public_form.adding_account || self.touch_id_in_progress)
+                        .disabled(self.public_form.adding_account || self.device_auth_in_progress)
                         .on_click(move |_event, window, cx| {
                             add_root.update(cx, |root, cx| {
                                 root.add_public_derived_account_from_input(window, cx);
@@ -1582,21 +1594,21 @@ impl WalletRoot {
                     ))
                     .child(
                         app_input(&self.public_form.import_label_input)
-                            .disabled(self.touch_id_in_progress),
+                            .disabled(self.device_auth_in_progress),
                     )
                     .child(app_masked_input(
                         &self.public_form.import_private_key_input,
-                        self.touch_id_in_progress,
+                        self.device_auth_in_progress,
                     ))
-                    .child(masked_input_with_touch_id(
+                    .child(masked_input_with_device_auth(
                         &self.public_form.import_password_input,
-                        self.touch_id_in_progress,
-                        self.public_account_touch_id_button(
+                        self.device_auth_in_progress,
+                        self.public_account_device_auth_buttons(
                             import_root.clone(),
                             PublicAccountDialogKind::Import,
                             "wallet-public-import-touch-id",
                             self.public_form.importing_account,
-                            touch_id_lease,
+                            device_auth_lease,
                         ),
                     ))
                     .child(
@@ -1604,7 +1616,7 @@ impl WalletRoot {
                             .label("Global account")
                             .checked(self.public_form.import_global)
                             .small()
-                            .disabled(self.touch_id_in_progress)
+                            .disabled(self.device_auth_in_progress)
                             .on_click(move |checked, _window, cx| {
                                 let checked = *checked;
                                 global_root.update(cx, |root, cx| {
@@ -1628,7 +1640,9 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.importing_account)
-                        .disabled(self.public_form.importing_account || self.touch_id_in_progress)
+                        .disabled(
+                            self.public_form.importing_account || self.device_auth_in_progress,
+                        )
                         .on_click(move |_event, window, cx| {
                             import_root.update(cx, |root, cx| {
                                 root.import_public_account_from_input(window, cx);

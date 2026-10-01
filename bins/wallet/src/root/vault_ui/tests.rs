@@ -5,7 +5,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use gpui_kit::test::TestWindowExt as _;
-use wallet_ops::vault::BiometricUnlockStatus;
+use wallet_ops::vault::DeviceAuthStatus;
 
 struct UnlockWindow(Entity<WalletRoot>);
 
@@ -30,7 +30,7 @@ fn press_key(cx: &mut VisualTestContext, key: &str) {
 }
 
 #[gpui::test]
-fn unlock_touch_id_is_inside_the_password_field_and_activates_from_the_keyboard(
+fn unlock_device_auth_is_inside_the_password_field_and_activates_from_the_keyboard(
     cx: &mut TestAppContext,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -63,9 +63,9 @@ fn unlock_touch_id_is_inside_the_password_field_and_activates_from_the_keyboard(
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 root.lock_vault(window, cx);
-                // Display the macOS action without requiring a biometric record in the fixture.
+                // Display the macOS action without requiring a device_auth record in the fixture.
                 root.touch_id_supported = true;
-                root.touch_id_status = BiometricUnlockStatus::Enabled;
+                root.touch_id_status = DeviceAuthStatus::Enabled;
                 root.unlock_password_input.update(cx, |input, cx| {
                     input.set_value("unsubmitted password", window, cx);
                     input.focus(window, cx);
@@ -83,7 +83,7 @@ fn unlock_touch_id_is_inside_the_password_field_and_activates_from_the_keyboard(
                 input.value().is_none(),
                 "the password must stay out of accessibility values"
             );
-            let group_id = ("vault-password-touch-id", input_id);
+            let group_id = ("vault-password-device-auth", input_id);
             let group = window.find(group_id).bounds();
             let button = window.within(group_id).find("unlock-wallet-vault-touch-id");
             let bounds = button.bounds();
@@ -121,13 +121,13 @@ fn unlock_touch_id_is_inside_the_password_field_and_activates_from_the_keyboard(
         });
     }
 
-    for (password_pending, touch_id_pending) in [(true, false), (false, true)] {
+    for (password_pending, device_auth_pending) in [(true, false), (false, true)] {
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 root.touch_id_supported = true;
-                root.touch_id_status = BiometricUnlockStatus::Enabled;
+                root.touch_id_status = DeviceAuthStatus::Enabled;
                 root.unlock_in_progress = password_pending;
-                root.touch_id_in_progress = touch_id_pending;
+                root.device_auth_in_progress = device_auth_pending;
                 root.unlock_password_input.update(cx, |input, cx| {
                     input.focus(window, cx);
                 });

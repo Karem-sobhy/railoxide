@@ -76,11 +76,11 @@ pub enum VaultError {
     #[error("unlock failed")]
     UnlockFailed,
     #[error(transparent)]
-    Biometric(#[from] crate::biometric::BiometricError),
-    #[error("Touch ID unlock is not enabled")]
-    BiometricUnlockDisabled,
-    #[error("Touch ID unlock data is corrupt")]
-    BiometricUnlockCorrupt,
+    DeviceAuth(#[from] crate::device_auth::DeviceAuthError),
+    #[error("Device authentication is not enabled")]
+    DeviceAuthDisabled,
+    #[error("Device authentication data is corrupt")]
+    DeviceAuthCorrupt,
     #[error("spend grant is invalid")]
     InvalidSpendGrant,
     #[error("invalid gateway permission")]

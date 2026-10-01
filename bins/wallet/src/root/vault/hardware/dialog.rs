@@ -67,7 +67,7 @@ impl WalletRoot {
             }
         }
 
-        let password = match self.hardware_profile_touch_id_password.take() {
+        let password = match self.hardware_profile_device_auth_password.take() {
             Some(password) => password,
             None => Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx),
         };
@@ -86,13 +86,13 @@ impl WalletRoot {
                 let store = Arc::clone(store);
                 let join = self
                     .runtime
-                    .spawn_blocking(move || Self::renew_touch_id(&store, password.as_str()));
+                    .spawn_blocking(move || Self::renew_device_auth(&store, password.as_str()));
                 cx.spawn(async move |this, cx| {
                     if let Err(error) = join.await {
-                        tracing::warn!(%error, "Touch ID renewal task failed");
+                        tracing::warn!(%error, "device authentication renewal task failed");
                     }
                     let _ = this.update(cx, |root, cx| {
-                        root.refresh_touch_id_status();
+                        root.refresh_device_auth_status();
                         cx.notify();
                     });
                 })
@@ -818,7 +818,7 @@ impl WalletRoot {
 mod tests {
     use super::*;
     use gpui::{AppContext as _, IntoElement, Render, TestAppContext, div};
-    use wallet_ops::vault::BiometricUnlockStatus;
+    use wallet_ops::vault::DeviceAuthStatus;
 
     struct TestWindow;
 
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn hardware_password_unlock_refreshes_touch_id_after_dialog_closes(cx: &mut TestAppContext) {
+    fn hardware_password_unlock_refreshes_device_auth_after_dialog_closes(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -860,7 +860,7 @@ mod tests {
                 root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
                 let store = root.vault_store.clone().unwrap();
                 // Completion must replace this stale cache with the fixture's actual status.
-                root.touch_id_status = BiometricUnlockStatus::NeedsReenrollment;
+                root.touch_id_status = DeviceAuthStatus::NeedsReenrollment;
                 root.hardware_profile_password_input
                     .update(cx, |input, cx| {
                         input.set_value("public list test password", window, cx);
@@ -875,7 +875,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while root.read_with(cx, |root, _| root.touch_id_status)
-            == BiometricUnlockStatus::NeedsReenrollment
+            == DeviceAuthStatus::NeedsReenrollment
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -892,7 +892,7 @@ mod tests {
                 root.vault_store
                     .as_ref()
                     .unwrap()
-                    .biometric_unlock_status()
+                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
                     .unwrap()
             );
             assert!(root.vault_view_unlock.is_some());

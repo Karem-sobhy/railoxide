@@ -18,9 +18,9 @@ use ui::theme;
 use wallet_ops::vault::VaultError;
 use zeroize::Zeroizing;
 
-use super::super::touch_id::{
-    TOUCH_ID_REASON_CHANGE_PASSWORD, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
-    touch_id_button,
+use super::super::device_auth::{
+    DEVICE_AUTH_REASON_CHANGE_PASSWORD, DeviceAuthMethod, DeviceAuthPassword, DeviceAuthPrompt,
+    device_auth_buttons, masked_input_with_device_auth,
 };
 use super::super::{WalletRoot, new_masked_input, secondary_dialog_content_width};
 use super::VaultState;
@@ -34,8 +34,8 @@ struct ChangeVaultPasswordDialogContent {
     confirm_password_input: Entity<InputState>,
     pending: bool,
     error: Option<Arc<str>>,
-    touch_id: Option<TouchIdPrompt>,
-    touch_id_pending: bool,
+    device_auth: Option<DeviceAuthPrompt>,
+    device_auth_pending: bool,
     lease: Weak<Cell<bool>>,
     wallet_generation: u64,
 }
@@ -55,12 +55,12 @@ impl ChangeVaultPasswordDialogContent {
     ) -> Entity<Self> {
         window.close_all_dialogs(cx);
         let entity = cx.entity();
-        let touch_id = root.touch_id_prompt();
+        let device_auth = root.device_auth_prompt();
         let lease = Rc::new(Cell::new(true));
         let identity = Rc::downgrade(&lease);
         let wallet_generation = root.active_wallet_generation;
         let content =
-            cx.new(|cx| Self::new(entity, touch_id, identity, wallet_generation, window, cx));
+            cx.new(|cx| Self::new(entity, device_auth, identity, wallet_generation, window, cx));
         let focus_content = content.clone();
         let dialog_content = content.clone();
         let dialog_width =
@@ -89,7 +89,7 @@ impl ChangeVaultPasswordDialogContent {
 
     fn new(
         root: Entity<WalletRoot>,
-        touch_id: Option<TouchIdPrompt>,
+        device_auth: Option<DeviceAuthPrompt>,
         lease: Weak<Cell<bool>>,
         wallet_generation: u64,
         window: &mut Window,
@@ -136,8 +136,8 @@ impl ChangeVaultPasswordDialogContent {
             confirm_password_input,
             pending: false,
             error: None,
-            touch_id,
-            touch_id_pending: false,
+            device_auth,
+            device_auth_pending: false,
             lease,
             wallet_generation,
         }
@@ -163,7 +163,7 @@ impl ChangeVaultPasswordDialogContent {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.pending || self.touch_id_pending || !self.is_current(cx) {
+        if self.pending || self.device_auth_pending || !self.is_current(cx) {
             return;
         }
         match enter_action {
@@ -184,7 +184,7 @@ impl ChangeVaultPasswordDialogContent {
     }
 
     fn submit(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.touch_id_pending || !self.is_current(cx) {
+        if self.pending || self.device_auth_pending || !self.is_current(cx) {
             return;
         }
         let current_password =
@@ -197,12 +197,17 @@ impl ChangeVaultPasswordDialogContent {
         self.submit_with_current_password(current_password, window, cx);
     }
 
-    /// Uses Touch ID for the current password once the new password is valid.
-    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.touch_id_pending || !self.is_current(cx) {
+    /// Uses the selected device for the current password once the new password is valid.
+    fn submit_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.pending || self.device_auth_pending || !self.is_current(cx) {
             return;
         }
-        let Some(prompt) = self.touch_id.clone() else {
+        let Some(prompt) = self.device_auth.clone() else {
             return;
         };
         if let Err(message) = self.new_password(cx) {
@@ -210,37 +215,42 @@ impl ChangeVaultPasswordDialogContent {
             cx.notify();
             return;
         }
-        self.touch_id_pending = true;
+        self.device_auth_pending = true;
         self.error = None;
         cx.notify();
         prompt.run(
-            TOUCH_ID_REASON_CHANGE_PASSWORD,
+            method,
+            DEVICE_AUTH_REASON_CHANGE_PASSWORD,
             window,
             cx,
-            |dialog, outcome, window, cx| {
-                dialog.finish_touch_id(outcome, window, cx);
+            move |dialog, outcome, window, cx| {
+                dialog.finish_device_auth(method, outcome, window, cx);
             },
         );
     }
 
-    fn finish_touch_id(
+    fn finish_device_auth(
         &mut self,
-        outcome: TouchIdPassword,
+        method: DeviceAuthMethod,
+        outcome: DeviceAuthPassword,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.touch_id_pending = false;
+        self.device_auth_pending = false;
         cx.notify();
         if !self.is_current(cx) {
             return;
         }
         match outcome {
-            TouchIdPassword::Password(current_password) => {
+            DeviceAuthPassword::Password(current_password) => {
                 self.submit_with_current_password(current_password, window, cx);
             }
-            TouchIdPassword::Cancelled => {}
-            TouchIdPassword::Failed(message) => {
-                self.touch_id = None;
+            DeviceAuthPassword::Cancelled => {}
+            DeviceAuthPassword::Failed(message) => {
+                self.device_auth = self
+                    .device_auth
+                    .take()
+                    .and_then(|prompt| prompt.without(method));
                 self.error = Some(message);
                 self.focus_current_password(window, cx);
             }
@@ -315,7 +325,7 @@ impl ChangeVaultPasswordDialogContent {
                         let root = dialog.root.clone();
                         root.update(cx, |root, cx| {
                             root.clear_spend_authorization(cx);
-                            root.refresh_touch_id_status();
+                            root.refresh_device_auth_status();
                         });
                         window.close_dialog(cx);
                     }
@@ -351,19 +361,19 @@ impl ChangeVaultPasswordDialogContent {
 impl Render for ChangeVaultPasswordDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
-        let touch_id_dialog = dialog.clone();
-        let busy = self.pending || self.touch_id_pending;
-        let touch_id = self.touch_id.is_some().then(|| {
-            touch_id_button(
-                "wallet-change-vault-password-touch-id",
-                "Touch ID",
-                self.touch_id_pending,
-                self.pending,
-            )
-            .on_click(move |_event, window, cx| {
-                touch_id_dialog.update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
-            })
-        });
+        let device_auth_dialog = dialog.clone();
+        let busy = self.pending || self.device_auth_pending;
+        let device_auth = device_auth_buttons(
+            self.device_auth.as_ref(),
+            "wallet-change-vault-password-touch-id",
+            self.device_auth_pending,
+            self.pending,
+            move |method, window, cx| {
+                device_auth_dialog.update(cx, |dialog, cx| {
+                    dialog.submit_with_device_auth(method, window, cx);
+                });
+            },
+        );
         div()
             .w_full()
             .flex()
@@ -373,24 +383,24 @@ impl Render for ChangeVaultPasswordDialogContent {
                 "Current password",
                 &self.current_password_input,
                 busy,
-                touch_id,
+                device_auth,
             ))
             .child(password_field(
                 "New password",
                 &self.new_password_input,
                 busy,
-                None,
+                Vec::new(),
             ))
             .child(password_field(
                 "Confirm new password",
                 &self.confirm_password_input,
                 busy,
-                None,
+                Vec::new(),
             ))
-            .when(self.touch_id.is_some(), |this| {
+            .when(self.device_auth.is_some(), |this| {
                 this.child(
                     app_muted_text(
-                        "Enter the new password twice, then use Touch ID or the current password to confirm.",
+                        "Enter the new password twice, then approve with an enabled device or the current password.",
                     )
                     .text_xs()
                     .whitespace_normal(),
@@ -454,7 +464,7 @@ fn password_field(
     label: &'static str,
     input: &Entity<InputState>,
     disabled: bool,
-    touch_id: Option<InputGroupButton>,
+    device_auth: Vec<InputGroupButton>,
 ) -> gpui::Div {
     div()
         .w_full()
@@ -462,7 +472,7 @@ fn password_field(
         .flex_col()
         .gap_1()
         .child(app_muted_text(label))
-        .child(masked_input_with_touch_id(input, disabled, touch_id))
+        .child(masked_input_with_device_auth(input, disabled, device_auth))
 }
 
 fn change_vault_password_error_message(error: &VaultError) -> Arc<str> {
@@ -493,7 +503,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn change_password_touch_id_ignores_closed_dialogs_and_wallet_changes(cx: &mut TestAppContext) {
+    fn change_password_device_auth_ignores_closed_dialogs_and_wallet_changes(
+        cx: &mut TestAppContext,
+    ) {
         const PASSWORD: &str = "public list test password";
         const NEW_PASSWORD: &str = "replacement vault password";
         let directory = tempfile::tempdir().unwrap();
@@ -552,7 +564,7 @@ mod tests {
             });
             cx.update(|window, cx| window.draw(cx).clear(cx));
             content.update(cx, |dialog, cx| {
-                dialog.touch_id_pending = true;
+                dialog.device_auth_pending = true;
                 cx.notify();
             });
             // Model the entity ownership of callbacks retained by the rendered frame.
@@ -571,8 +583,9 @@ mod tests {
                 }
                 // Deliver before another draw can drop the rendered button callbacks.
                 retained.update(cx, |dialog, cx| {
-                    dialog.finish_touch_id(
-                        TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                    dialog.finish_device_auth(
+                        DeviceAuthMethod::TouchId,
+                        DeviceAuthPassword::Password(Zeroizing::new(PASSWORD.into())),
                         window,
                         cx,
                     );
@@ -606,9 +619,10 @@ mod tests {
                 dialog
                     .confirm_password_input
                     .update(cx, |input, cx| input.set_value(NEW_PASSWORD, window, cx));
-                dialog.touch_id_pending = true;
-                dialog.finish_touch_id(
-                    TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                dialog.device_auth_pending = true;
+                dialog.finish_device_auth(
+                    DeviceAuthMethod::TouchId,
+                    DeviceAuthPassword::Password(Zeroizing::new(PASSWORD.into())),
                     window,
                     cx,
                 );

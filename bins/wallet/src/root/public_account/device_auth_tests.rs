@@ -23,7 +23,7 @@ fn account_count(root: &WalletRoot) -> usize {
 }
 
 #[gpui::test]
-fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet_change(
+fn device_auth_public_account_ignores_results_after_dismissal_replacement_or_wallet_change(
     cx: &mut TestAppContext,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -50,8 +50,8 @@ fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet
 
     for invalidate in ["dismiss", "replace", "wallet"] {
         for outcome in [
-            TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
-            TouchIdPassword::Failed(Arc::from("stale prompt failure")),
+            DeviceAuthPassword::Password(Zeroizing::new("public list test password".into())),
+            DeviceAuthPassword::Failed(Arc::from("stale prompt failure")),
         ] {
             let (lease, generation) = cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
@@ -60,7 +60,7 @@ fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet
                         window,
                         cx,
                     );
-                    root.touch_id_in_progress = true;
+                    root.device_auth_in_progress = true;
                     (lease, root.active_wallet_generation)
                 })
             });
@@ -88,7 +88,7 @@ fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
                     root.public_form.error = Some(Arc::from("current form error"));
-                    root.finish_public_account_touch_id(
+                    root.finish_public_account_device_auth(
                         PublicAccountDialogKind::Derive,
                         &lease,
                         generation,
@@ -96,7 +96,7 @@ fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet
                         window,
                         cx,
                     );
-                    assert!(!root.touch_id_in_progress);
+                    assert!(!root.device_auth_in_progress);
                     assert_eq!(
                         account_count(root),
                         before,
@@ -116,7 +116,7 @@ fn touch_id_public_account_ignores_results_after_dismissal_replacement_or_wallet
 }
 
 #[gpui::test]
-fn touch_id_public_account_blocks_typed_submission_then_creates_one_account(
+fn device_auth_public_account_blocks_typed_submission_then_creates_one_account(
     cx: &mut TestAppContext,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -159,7 +159,7 @@ fn touch_id_public_account_blocks_typed_submission_then_creates_one_account(
                 root.public_form
                     .import_private_key_input
                     .update(cx, |input, cx| input.set_value("11".repeat(32), window, cx));
-                root.touch_id_in_progress = true;
+                root.device_auth_in_progress = true;
                 // These are also the entry points used by the input Enter subscriptions.
                 match kind {
                     PublicAccountDialogKind::Derive => {
@@ -172,11 +172,13 @@ fn touch_id_public_account_blocks_typed_submission_then_creates_one_account(
                 }
                 assert_eq!(account_count(root), before);
                 assert!(window.has_active_dialog(cx));
-                root.finish_public_account_touch_id(
+                root.finish_public_account_device_auth(
                     kind,
                     &lease,
                     generation,
-                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                    DeviceAuthPassword::Password(Zeroizing::new(
+                        "public list test password".into(),
+                    )),
                     window,
                     cx,
                 );
@@ -186,7 +188,7 @@ fn touch_id_public_account_blocks_typed_submission_then_creates_one_account(
                     "{:?}",
                     root.public_form.error
                 );
-                assert!(!root.touch_id_in_progress);
+                assert!(!root.device_auth_in_progress);
                 assert!(!window.has_active_dialog(cx));
             });
         });

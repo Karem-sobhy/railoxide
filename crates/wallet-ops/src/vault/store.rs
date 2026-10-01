@@ -61,9 +61,9 @@ use super::{
 
 mod address_book;
 mod base;
-mod biometric;
 mod broadcaster_preferences;
 mod chain_cache;
+mod device_auth;
 mod gateway;
 mod hardware;
 mod key_export;
@@ -74,6 +74,6 @@ mod wallet_metadata;
 mod walletconnect;
 mod wallets;
 
-pub use biometric::BiometricUnlockStatus;
+pub use device_auth::DeviceAuthStatus;
 pub use gateway::GatewayPermission;
 pub use software_context::SoftwareContextMatch;

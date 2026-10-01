@@ -17,9 +17,9 @@ use wallet_ops::vault::{
 };
 use zeroize::Zeroizing;
 
-use super::touch_id::{
-    TOUCH_ID_REASON_KEY_EXPORT, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
-    touch_id_button,
+use super::device_auth::{
+    DEVICE_AUTH_REASON_KEY_EXPORT, DeviceAuthMethod, DeviceAuthPassword, DeviceAuthPrompt,
+    device_auth_buttons, masked_input_with_device_auth,
 };
 use super::{
     APP_TEXT_SIZE, WalletRoot, dialog_max_height, new_masked_input, secondary_dialog_content_width,
@@ -81,8 +81,8 @@ struct KeyExportPasswordDialogContent {
     kind: KeyExportSecretKind,
     password_input: Entity<gpui_component::input::InputState>,
     error: Option<Arc<str>>,
-    touch_id: Option<TouchIdPrompt>,
-    touch_id_pending: bool,
+    device_auth: Option<DeviceAuthPrompt>,
+    device_auth_pending: bool,
     lease: Weak<Cell<bool>>,
 }
 
@@ -90,7 +90,7 @@ impl KeyExportPasswordDialogContent {
     fn new(
         root: Entity<WalletRoot>,
         kind: KeyExportSecretKind,
-        touch_id: Option<TouchIdPrompt>,
+        device_auth: Option<DeviceAuthPrompt>,
         lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -114,8 +114,8 @@ impl KeyExportPasswordDialogContent {
             kind,
             password_input,
             error: None,
-            touch_id,
-            touch_id_pending: false,
+            device_auth,
+            device_auth_pending: false,
             lease,
         }
     }
@@ -132,7 +132,7 @@ impl KeyExportPasswordDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.touch_id_pending || !self.is_open() {
+        if self.device_auth_pending || !self.is_open() {
             return;
         }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
@@ -144,44 +144,58 @@ impl KeyExportPasswordDialogContent {
         self.submit_password(&password, window, cx);
     }
 
-    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+    fn submit_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if !self.is_open() {
             return;
         }
-        let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
+        let Some(prompt) = self
+            .device_auth
+            .clone()
+            .filter(|_| !self.device_auth_pending)
+        else {
             return;
         };
-        self.touch_id_pending = true;
+        self.device_auth_pending = true;
         self.error = None;
         cx.notify();
         prompt.run(
-            TOUCH_ID_REASON_KEY_EXPORT,
+            method,
+            DEVICE_AUTH_REASON_KEY_EXPORT,
             window,
             cx,
-            |dialog, outcome, window, cx| {
-                dialog.finish_touch_id(outcome, window, cx);
+            move |dialog, outcome, window, cx| {
+                dialog.finish_device_auth(method, outcome, window, cx);
             },
         );
     }
 
-    fn finish_touch_id(
+    fn finish_device_auth(
         &mut self,
-        outcome: TouchIdPassword,
+        method: DeviceAuthMethod,
+        outcome: DeviceAuthPassword,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.touch_id_pending = false;
+        self.device_auth_pending = false;
         cx.notify();
         if !self.is_open() {
             return;
         }
         match outcome {
-            TouchIdPassword::Password(password) => {
+            DeviceAuthPassword::Password(password) => {
                 self.submit_password(&password, window, cx);
             }
-            TouchIdPassword::Cancelled => self.focus_password(window, cx),
-            TouchIdPassword::Failed(message) => {
-                self.touch_id = None;
+            DeviceAuthPassword::Cancelled => self.focus_password(window, cx),
+            DeviceAuthPassword::Failed(message) => {
+                self.device_auth = self
+                    .device_auth
+                    .take()
+                    .and_then(|prompt| prompt.without(method));
                 self.error = Some(message);
                 self.focus_password(window, cx);
             }
@@ -218,28 +232,27 @@ impl KeyExportPasswordDialogContent {
 impl Render for KeyExportPasswordDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
-        let touch_id_dialog = dialog.clone();
+        let device_auth_dialog = dialog.clone();
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
             .child(app_muted_text(key_export_password_prompt_copy(self.kind)).whitespace_normal())
-            .child(masked_input_with_touch_id(
+            .child(masked_input_with_device_auth(
                 &self.password_input,
-                self.touch_id_pending,
-                self.touch_id.is_some().then(|| {
-                    touch_id_button(
-                        "wallet-key-export-password-touch-id",
-                        "Touch ID",
-                        self.touch_id_pending,
-                        false,
-                    )
-                    .on_click(move |_event, window, cx| {
-                        touch_id_dialog
-                            .update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
-                    })
-                }),
+                self.device_auth_pending,
+                device_auth_buttons(
+                    self.device_auth.as_ref(),
+                    "wallet-key-export-password-touch-id",
+                    self.device_auth_pending,
+                    false,
+                    move |method, window, cx| {
+                        device_auth_dialog.update(cx, |dialog, cx| {
+                            dialog.submit_with_device_auth(method, window, cx);
+                        });
+                    },
+                ),
             ))
             .when_some(self.error.as_ref(), |this, error| {
                 this.child(
@@ -328,11 +341,18 @@ impl WalletRoot {
     ) -> Entity<KeyExportPasswordDialogContent> {
         let root = cx.entity();
         let content_root = root;
-        let touch_id = self.touch_id_prompt();
+        let device_auth = self.device_auth_prompt();
         let lease = Rc::new(Cell::new(true));
         let identity = Rc::downgrade(&lease);
         let content = cx.new(|cx| {
-            KeyExportPasswordDialogContent::new(content_root, kind, touch_id, identity, window, cx)
+            KeyExportPasswordDialogContent::new(
+                content_root,
+                kind,
+                device_auth,
+                identity,
+                window,
+                cx,
+            )
         });
         let focus_content = content.clone();
         let dialog_content = content.clone();
@@ -753,7 +773,7 @@ const fn key_export_warning_copy() -> &'static str {
 }
 
 #[cfg(test)]
-mod touch_id_tests {
+mod device_auth_tests {
     use super::*;
 
     struct DialogWindow;
@@ -769,7 +789,7 @@ mod touch_id_tests {
     }
 
     #[gpui::test]
-    fn key_export_touch_id_cannot_reveal_secrets_after_dismissal(cx: &mut gpui::TestAppContext) {
+    fn key_export_device_auth_cannot_reveal_secrets_after_dismissal(cx: &mut gpui::TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -800,13 +820,13 @@ mod touch_id_tests {
         };
         for dismissal in ["cancel", "settings"] {
             for outcome in [
-                TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
-                TouchIdPassword::Failed(Arc::from("old prompt failure")),
+                DeviceAuthPassword::Password(Zeroizing::new("public list test password".into())),
+                DeviceAuthPassword::Failed(Arc::from("old prompt failure")),
             ] {
                 // Model the entity retained by the rendered password dialog.
                 let dialog = open_prompt(cx);
                 cx.run_until_parked();
-                dialog.update(cx, |dialog, _| dialog.touch_id_pending = true);
+                dialog.update(cx, |dialog, _| dialog.device_auth_pending = true);
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 if dismissal == "cancel" {
                     let cancel = cx
@@ -818,7 +838,9 @@ mod touch_id_tests {
                     if dismissal == "settings" {
                         root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
                     }
-                    dialog.update(cx, |dialog, cx| dialog.finish_touch_id(outcome, window, cx));
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.finish_device_auth(DeviceAuthMethod::TouchId, outcome, window, cx);
+                    });
                     assert!(
                         root.read(cx).key_export.mnemonic.is_none(),
                         "dismissed prompt retained a mnemonic"
@@ -837,8 +859,11 @@ mod touch_id_tests {
         let dialog = open_prompt(cx);
         cx.update(|window, cx| {
             dialog.update(cx, |dialog, cx| {
-                dialog.finish_touch_id(
-                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                dialog.finish_device_auth(
+                    DeviceAuthMethod::TouchId,
+                    DeviceAuthPassword::Password(Zeroizing::new(
+                        "public list test password".into(),
+                    )),
                     window,
                     cx,
                 );

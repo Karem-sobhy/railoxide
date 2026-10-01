@@ -30,9 +30,9 @@ use wallet_ops::vault::TrezorPassphraseMode;
 
 #[cfg(feature = "hardware")]
 use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
+use super::device_auth::{device_auth_buttons, masked_input_with_device_auth};
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
-use super::touch_id::{masked_input_with_touch_id, touch_id_button};
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
@@ -173,10 +173,12 @@ impl WalletRoot {
     }
 
     fn open_pre_unlock_settings_dialog(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut gpui::Context<'_, Self>,
     ) {
+        self.refresh_device_auth_status();
+        cx.notify();
         window.close_all_dialogs(cx);
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
         let editor = self.settings_editor.clone();
@@ -220,6 +222,7 @@ impl WalletRoot {
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
             window.close_all_dialogs(cx);
             self.clear_settings_transient_status(cx);
+            self.refresh_device_auth_status();
             self.active_activity = Activity::Settings;
             cx.notify();
         } else if should_show_pre_unlock_settings_action(&self.vault_state) {
@@ -246,7 +249,7 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        let touch_id_root = root.clone();
+        let device_auth_root = root.clone();
         body.child(app_masked_input(&self.new_password_input, false))
             .child(app_masked_input(&self.confirm_password_input, false))
             .when(self.touch_id_supported, |this| {
@@ -257,7 +260,7 @@ impl WalletRoot {
                         .small()
                         .on_click(move |checked, _window, cx| {
                             let checked = *checked;
-                            touch_id_root.update(cx, |root, cx| {
+                            device_auth_root.update(cx, |root, cx| {
                                 root.set_enable_touch_id_on_create(checked, cx);
                             });
                         }),
@@ -363,11 +366,11 @@ impl WalletRoot {
 
     fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::Div {
         let submit_root = root.clone();
-        let touch_id_root = root;
-        let touch_id = self.touch_id_prompt_cached().is_some();
-        let busy = self.unlock_in_progress || self.touch_id_in_progress;
-        let mut body = vault_dialog_body(if touch_id {
-            "Use Touch ID or enter the vault password to view wallet balances and history."
+        let device_auth_root = root;
+        let device_auth = self.device_auth_prompt_cached().is_some();
+        let busy = self.unlock_in_progress || self.device_auth_in_progress;
+        let mut body = vault_dialog_body(if device_auth {
+            "Use an enabled device or enter the vault password to view wallet balances and history."
         } else {
             "Enter the vault password to view wallet balances and history."
         });
@@ -375,22 +378,20 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        let password = masked_input_with_touch_id(
+        let password = masked_input_with_device_auth(
             &self.unlock_password_input,
             busy,
-            touch_id.then(|| {
-                touch_id_button(
-                    "unlock-wallet-vault-touch-id",
-                    "Unlock with Touch ID",
-                    self.touch_id_in_progress,
-                    self.unlock_in_progress,
-                )
-                .on_click(move |_event, window, cx| {
-                    touch_id_root.update(cx, |root, cx| {
-                        root.unlock_vault_with_touch_id(window, cx);
+            device_auth_buttons(
+                self.device_auth_prompt_cached().as_ref(),
+                "unlock-wallet-vault-touch-id",
+                self.device_auth_in_progress,
+                self.unlock_in_progress,
+                move |method, window, cx| {
+                    device_auth_root.update(cx, |root, cx| {
+                        root.unlock_vault_with_device_auth(method, window, cx);
                     });
-                })
-            }),
+                },
+            ),
         );
 
         body.child(password).child(
@@ -789,22 +790,13 @@ impl WalletRoot {
 
         content = content
             .when(requires_password, |this| {
-                let touch_id_root = root.clone();
-                this.child(masked_input_with_touch_id(
+                let device_auth_root = root.clone();
+                this.child(masked_input_with_device_auth(
                     &self.hardware_profile_password_input,
-                    self.hardware_profile_unlock.in_progress || self.touch_id_in_progress,
-                    self.touch_id_prompt_cached().is_some().then(|| {
-                        touch_id_button(
-                            "hardware-profile-unlock-touch-id",
-                            "Touch ID",
-                            self.touch_id_in_progress,
-                            self.hardware_profile_unlock.in_progress,
-                        )
-                        .on_click(move |_event, window, cx| {
-                            touch_id_root.update(cx, |root, cx| {
-                                root.unlock_hardware_profile_with_touch_id(window, cx);
-                            });
-                        })
+                    self.hardware_profile_unlock.in_progress || self.device_auth_in_progress,
+                    device_auth_buttons(self.device_auth_prompt_cached().as_ref(), "hardware-profile-unlock-touch-id", self.device_auth_in_progress, self.hardware_profile_unlock.in_progress,
+                    move |method, window, cx| {
+                        device_auth_root.update(cx, |root, cx| root.unlock_hardware_profile_with_device_auth(method, window, cx));
                     }),
                 ))
             })

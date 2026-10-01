@@ -15884,6 +15884,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bip39",
+ "block2 0.6.2",
  "broadcaster-core",
  "broadcaster-monitor",
  "bs58",

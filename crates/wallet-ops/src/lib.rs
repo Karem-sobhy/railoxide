@@ -94,11 +94,11 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 
 mod amounts;
 mod anchors;
-pub mod biometric;
 mod block_observer;
 pub mod cow;
 pub mod dapp_request;
 mod desktop;
+pub mod device_auth;
 pub mod gateway;
 mod governance;
 mod governance_actions;

@@ -1279,7 +1279,7 @@ impl WalletRoot {
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
-        self.add_wallet_touch_id_password = None;
+        self.add_wallet_device_auth_password = None;
         self.vault_view_unlock = None;
         self.auto_lock.disarm();
         self.generated_seed = None;
@@ -1300,7 +1300,7 @@ impl WalletRoot {
         self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = true;
-        self.refresh_touch_id_status();
+        self.refresh_device_auth_status();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }

@@ -33,7 +33,7 @@ use wallet_ops::{
     },
     subscribe_prover_cache_build,
     vault::{
-        BiometricUnlockStatus, BroadcasterPreferences, DesktopVaultStore, DesktopViewSession,
+        BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, DeviceAuthStatus,
         GeneratedSeedMaterial, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
         PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
     },
@@ -48,6 +48,7 @@ mod broadcaster_preferences;
 mod broadcaster_view;
 mod chain_load;
 mod dapp_request;
+mod device_auth;
 mod dialogs;
 mod gas_fee;
 mod gateway;
@@ -83,7 +84,6 @@ mod startup;
 mod stealth_accounts;
 mod submission_progress;
 mod tokens;
-mod touch_id;
 mod ui_helpers;
 mod utxo;
 mod vault;
@@ -531,17 +531,21 @@ pub(crate) struct WalletRoot {
     focus_vault_input_on_render: bool,
     /// Whether this Mac has usable Touch ID, independent of the vault setting.
     touch_id_supported: bool,
-    touch_id_status: BiometricUnlockStatus,
-    touch_id_in_progress: bool,
+    touch_id_available: bool,
+    touch_id_status: DeviceAuthStatus,
+    apple_watch_supported: bool,
+    apple_watch_available: bool,
+    apple_watch_status: DeviceAuthStatus,
+    device_auth_in_progress: bool,
     touch_id_unlock_on_render: bool,
     enable_touch_id_on_create: bool,
     /// Weak identity of the active add-wallet dialog; its builder owns the lease.
     add_wallet_dialog_lease: std::rc::Weak<Cell<bool>>,
-    /// The vault password Touch ID supplied for the add-wallet form, if any.
-    add_wallet_touch_id_password: Option<Zeroizing<String>>,
-    /// The vault password Touch ID supplied for the hardware profile dialog.
+    /// The vault password device authentication supplied for the add-wallet form, if any.
+    add_wallet_device_auth_password: Option<Zeroizing<String>>,
+    /// The vault password device authentication supplied for the hardware profile dialog.
     #[cfg(feature = "hardware")]
-    hardware_profile_touch_id_password: Option<Zeroizing<String>>,
+    hardware_profile_device_auth_password: Option<Zeroizing<String>>,
     focus_utxo_table_on_render: bool,
     focus_public_account_search_on_render: bool,
     wallet_focus: FocusHandle,
@@ -1167,14 +1171,31 @@ impl WalletRoot {
             vault_state,
             VaultState::CreateVault | VaultState::UnlockVault
         );
-        let touch_id_supported = wallet_ops::biometric::biometric_unlock_supported();
+        let touch_id_supported = wallet_ops::device_auth::device_auth_supported(
+            wallet_ops::device_auth::DeviceAuthMethod::TouchId,
+        );
         let touch_id_status = vault_store
             .as_ref()
-            .and_then(|store| store.biometric_unlock_status().ok())
-            .unwrap_or(BiometricUnlockStatus::Disabled);
+            .and_then(|store| {
+                store
+                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
+                    .ok()
+            })
+            .unwrap_or(DeviceAuthStatus::Disabled);
+        let apple_watch_supported = wallet_ops::device_auth::device_auth_supported(
+            wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
+        );
+        let apple_watch_status = vault_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::AppleWatch)
+                    .ok()
+            })
+            .unwrap_or(DeviceAuthStatus::Disabled);
         let touch_id_unlock_on_render = matches!(vault_state, VaultState::UnlockVault)
             && touch_id_supported
-            && touch_id_status == BiometricUnlockStatus::Enabled;
+            && touch_id_status == DeviceAuthStatus::Enabled;
         let unlock_password_input = new_masked_input(window, cx, "vault password");
         let new_password_input = new_masked_input(window, cx, "new vault password");
         let confirm_password_input = new_masked_input(window, cx, "confirm vault password");
@@ -1570,14 +1591,22 @@ impl WalletRoot {
             utxo_table,
             focus_vault_input_on_render,
             touch_id_supported,
+            touch_id_available: wallet_ops::device_auth::device_auth_available(
+                wallet_ops::device_auth::DeviceAuthMethod::TouchId,
+            ),
             touch_id_status,
-            touch_id_in_progress: false,
+            apple_watch_supported,
+            apple_watch_available: wallet_ops::device_auth::device_auth_available(
+                wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
+            ),
+            apple_watch_status,
+            device_auth_in_progress: false,
             touch_id_unlock_on_render,
             enable_touch_id_on_create: true,
             add_wallet_dialog_lease: std::rc::Weak::new(),
-            add_wallet_touch_id_password: None,
+            add_wallet_device_auth_password: None,
             #[cfg(feature = "hardware")]
-            hardware_profile_touch_id_password: None,
+            hardware_profile_device_auth_password: None,
             focus_utxo_table_on_render: false,
             focus_public_account_search_on_render: false,
             wallet_focus: cx.focus_handle(),
@@ -1588,6 +1617,8 @@ impl WalletRoot {
         cx.observe_window_activation(window, |root, window, cx| {
             if window.is_window_active() {
                 root.enforce_auto_lock(window, cx);
+                root.refresh_device_auth_status();
+                cx.notify();
             }
             root.sync_walletconnect_attention_for_window(window);
         })

@@ -21,9 +21,9 @@ use ui::{icons, theme};
 use wallet_ops::vault::{SoftwareContextSyncIntent, WalletMetadataBundle};
 use zeroize::Zeroizing;
 
-use super::super::touch_id::{
-    TOUCH_ID_REASON_PASSPHRASE_WALLET, TouchIdPassword, TouchIdPrompt, masked_input_with_touch_id,
-    touch_id_button,
+use super::super::device_auth::{
+    DEVICE_AUTH_REASON_PASSPHRASE_WALLET, DeviceAuthMethod, DeviceAuthPassword, DeviceAuthPrompt,
+    device_auth_buttons, masked_input_with_device_auth,
 };
 use super::super::{
     WalletRoot, labeled_field, new_masked_input, new_text_input, secondary_dialog_content_width,
@@ -37,8 +37,8 @@ pub(in crate::root) struct OpenPassphraseWalletAuthorizationUi {
     target_label: Arc<str>,
     password_input: Entity<InputState>,
     error: Option<Arc<str>>,
-    touch_id: Option<TouchIdPrompt>,
-    touch_id_pending: bool,
+    device_auth: Option<DeviceAuthPrompt>,
+    device_auth_pending: bool,
     lease: Weak<Cell<bool>>,
 }
 
@@ -50,7 +50,7 @@ impl OpenPassphraseWalletAuthorizationUi {
         window: &mut Window,
         cx: &mut Context<'_, WalletRoot>,
     ) -> Entity<Self> {
-        let touch_id = root.touch_id_prompt();
+        let device_auth = root.device_auth_prompt();
         let root = cx.entity();
         let lease = Rc::new(Cell::new(true));
         let identity = Rc::downgrade(&lease);
@@ -59,7 +59,7 @@ impl OpenPassphraseWalletAuthorizationUi {
                 root.clone(),
                 target_base_profile_uuid,
                 target_label,
-                touch_id,
+                device_auth,
                 identity,
                 window,
                 cx,
@@ -91,7 +91,7 @@ impl OpenPassphraseWalletAuthorizationUi {
         root: Entity<WalletRoot>,
         target_base_profile_uuid: Arc<str>,
         target_label: Arc<str>,
-        touch_id: Option<TouchIdPrompt>,
+        device_auth: Option<DeviceAuthPrompt>,
         lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -120,8 +120,8 @@ impl OpenPassphraseWalletAuthorizationUi {
             target_label,
             password_input,
             error: None,
-            touch_id,
-            touch_id_pending: false,
+            device_auth,
+            device_auth_pending: false,
             lease,
         }
     }
@@ -138,7 +138,7 @@ impl OpenPassphraseWalletAuthorizationUi {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.touch_id_pending || !self.is_open() {
+        if self.device_auth_pending || !self.is_open() {
             return;
         }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
@@ -154,44 +154,58 @@ impl OpenPassphraseWalletAuthorizationUi {
         self.submit_password(password, window, cx);
     }
 
-    fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+    fn submit_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if !self.is_open() {
             return;
         }
-        let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
+        let Some(prompt) = self
+            .device_auth
+            .clone()
+            .filter(|_| !self.device_auth_pending)
+        else {
             return;
         };
-        self.touch_id_pending = true;
+        self.device_auth_pending = true;
         self.error = None;
         cx.notify();
         prompt.run(
-            TOUCH_ID_REASON_PASSPHRASE_WALLET,
+            method,
+            DEVICE_AUTH_REASON_PASSPHRASE_WALLET,
             window,
             cx,
-            |dialog, outcome, window, cx| {
-                dialog.finish_touch_id(outcome, window, cx);
+            move |dialog, outcome, window, cx| {
+                dialog.finish_device_auth(method, outcome, window, cx);
             },
         );
     }
 
-    fn finish_touch_id(
+    fn finish_device_auth(
         &mut self,
-        outcome: TouchIdPassword,
+        method: DeviceAuthMethod,
+        outcome: DeviceAuthPassword,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.touch_id_pending = false;
+        self.device_auth_pending = false;
         cx.notify();
         if !self.is_open() {
             return;
         }
         match outcome {
-            TouchIdPassword::Password(password) => {
+            DeviceAuthPassword::Password(password) => {
                 self.submit_password(password, window, cx);
             }
-            TouchIdPassword::Cancelled => self.focus_password(window, cx),
-            TouchIdPassword::Failed(message) => {
-                self.touch_id = None;
+            DeviceAuthPassword::Cancelled => self.focus_password(window, cx),
+            DeviceAuthPassword::Failed(message) => {
+                self.device_auth = self
+                    .device_auth
+                    .take()
+                    .and_then(|prompt| prompt.without(method));
                 self.error = Some(message);
                 self.focus_password(window, cx);
             }
@@ -233,7 +247,7 @@ impl OpenPassphraseWalletAuthorizationUi {
 impl Render for OpenPassphraseWalletAuthorizationUi {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
-        let touch_id_dialog = dialog.clone();
+        let device_auth_dialog = dialog.clone();
         div()
             .w_full()
             .flex()
@@ -250,21 +264,13 @@ impl Render for OpenPassphraseWalletAuthorizationUi {
                 "Enter your vault password to continue. You'll enter the mnemonic passphrase for \"{}\" on the next screen.",
                 self.target_label.as_ref()
             )))
-            .child(masked_input_with_touch_id(
+            .child(masked_input_with_device_auth(
                 &self.password_input,
-                self.touch_id_pending,
-                self.touch_id.is_some().then(|| {
-                    touch_id_button(
-                        "open-passphrase-wallet-touch-id",
-                        "Touch ID",
-                        self.touch_id_pending,
-                        false,
-                    )
-                    .on_click(move |_event, window, cx| {
-                        touch_id_dialog
-                            .update(cx, |dialog, cx| dialog.submit_with_touch_id(window, cx));
-                    })
-                }),
+                self.device_auth_pending,
+                device_auth_buttons(self.device_auth.as_ref(), "open-passphrase-wallet-touch-id", self.device_auth_pending, false,
+                    move |method, window, cx| {
+                        device_auth_dialog.update(cx, |dialog, cx| dialog.submit_with_device_auth(method, window, cx));
+                    }),
             ))
             .children(self.render_error(cx))
             .child(
@@ -1049,7 +1055,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn passphrase_touch_id_cannot_reopen_a_dismissed_workflow(cx: &mut gpui::TestAppContext) {
+    fn passphrase_device_auth_cannot_reopen_a_dismissed_workflow(cx: &mut gpui::TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1112,7 +1118,7 @@ mod tests {
             // Model the entity retained by the rendered authorization controls.
             let dialog = open_prompt(cx);
             cx.run_until_parked();
-            dialog.update(cx, |dialog, _| dialog.touch_id_pending = true);
+            dialog.update(cx, |dialog, _| dialog.device_auth_pending = true);
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let generation = root.read_with(cx, |root, _| {
                 root.pending_software_profile_open_operation_generation
@@ -1126,8 +1132,9 @@ mod tests {
                     root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
                 }
                 dialog.update(cx, |dialog, cx| {
-                    dialog.finish_touch_id(
-                        TouchIdPassword::Password(Zeroizing::new(
+                    dialog.finish_device_auth(
+                        DeviceAuthMethod::TouchId,
+                        DeviceAuthPassword::Password(Zeroizing::new(
                             "public list test password".into(),
                         )),
                         window,
@@ -1153,8 +1160,11 @@ mod tests {
         let dialog = open_prompt(cx);
         cx.update(|window, cx| {
             dialog.update(cx, |dialog, cx| {
-                dialog.finish_touch_id(
-                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                dialog.finish_device_auth(
+                    DeviceAuthMethod::TouchId,
+                    DeviceAuthPassword::Password(Zeroizing::new(
+                        "public list test password".into(),
+                    )),
                     window,
                     cx,
                 );
