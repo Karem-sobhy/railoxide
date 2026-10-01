@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -920,6 +920,7 @@ struct SpendAuthorizationDialogContent {
     review_focus: gpui::FocusHandle,
     touch_id: Option<TouchIdPrompt>,
     touch_id_pending: bool,
+    lease: Weak<Cell<bool>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1174,6 +1175,7 @@ impl SpendAuthorizationDialogContent {
         intent: SpendAuthorizationIntent,
         summary: SpendAuthorizationSummary,
         initial_lifetime: SpendAuthorizationLifetime,
+        lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -1217,7 +1219,12 @@ impl SpendAuthorizationDialogContent {
             review_focus: cx.focus_handle(),
             touch_id: None,
             touch_id_pending: false,
+            lease,
         }
+    }
+
+    fn is_open(&self) -> bool {
+        !self.cancelled && self.lease.upgrade().is_some_and(|open| open.get())
     }
 
     fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1232,7 +1239,7 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.cancelled || self.touch_id_pending {
+        if self.pending || !self.is_open() || self.touch_id_pending {
             return;
         }
         if let Some((scope, authorization)) = self.review_authorization.take() {
@@ -1264,7 +1271,7 @@ impl SpendAuthorizationDialogContent {
 
     fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         if self.pending
-            || self.cancelled
+            || !self.is_open()
             || self.touch_id_pending
             || self.review_authorization.is_some()
         {
@@ -1281,24 +1288,33 @@ impl SpendAuthorizationDialogContent {
             window,
             cx,
             |dialog, outcome, window, cx| {
-                dialog.touch_id_pending = false;
-                if dialog.cancelled {
-                    return;
-                }
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        dialog.submit_password(password, window, cx);
-                    }
-                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
-                    TouchIdPassword::Failed(message) => {
-                        dialog.touch_id = None;
-                        dialog.error = Some(message);
-                        dialog.focus_password(window, cx);
-                    }
-                }
-                cx.notify();
+                dialog.finish_touch_id(outcome, window, cx);
             },
         );
+    }
+
+    fn finish_touch_id(
+        &mut self,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_pending = false;
+        if !self.is_open() {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                self.submit_password(password, window, cx);
+            }
+            TouchIdPassword::Cancelled => self.focus_password(window, cx),
+            TouchIdPassword::Failed(message) => {
+                self.touch_id = None;
+                self.error = Some(message);
+                self.focus_password(window, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn submit_password(
@@ -1307,6 +1323,9 @@ impl SpendAuthorizationDialogContent {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.is_open() {
+            return;
+        }
         let root = self.root.read(cx);
         let Some(store) = root.vault_store.clone() else {
             self.error = Some("Wallet vault storage is unavailable".into());
@@ -1342,7 +1361,7 @@ impl SpendAuthorizationDialogContent {
             });
             let _ = this.update_in(cx, |dialog, window, cx| {
                 dialog.pending = false;
-                if dialog.cancelled {
+                if !dialog.is_open() {
                     return;
                 }
                 let root = dialog.root.clone();
@@ -2329,18 +2348,21 @@ impl WalletRoot {
         review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> Entity<SpendAuthorizationDialogContent> {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
         let title_chip = summary.title_chip.clone();
         let touch_id = self.touch_id_prompt_cached();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
                 root,
                 intent,
                 summary,
                 initial_lifetime,
+                identity,
                 window,
                 cx,
             );
@@ -2349,12 +2371,14 @@ impl WalletRoot {
             content
         });
         let focus_content = content.clone();
+        let dialog_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let close_content = content.clone();
+            let close_content = dialog_content.clone();
+            let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
@@ -2364,13 +2388,17 @@ impl WalletRoot {
                     title_chip.as_deref(),
                 ))
                 .on_close(move |_event, _window, cx| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
                     close_content.update(cx, SpendAuthorizationDialogContent::cancel);
                 })
-                .child(div().w(content_width).child(content.clone()))
+                .child(div().w(content_width).child(dialog_content.clone()))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
         });
+        content
     }
 
     pub(super) fn open_hardware_public_action_authorization_dialog(
@@ -3265,6 +3293,112 @@ mod tests {
     #[cfg(not(feature = "hardware"))]
     use ui::controls::app_masked_input;
 
+    struct DialogWindow;
+
+    impl gpui::Render for DialogWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(crate::root::startup::render_wallet_overlay_layers(
+                    window, cx,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn spend_touch_id_cannot_authorize_after_settings_closes_review(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.executor().allow_parking();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        let open_review = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.spend_authorization_lifetime = SpendAuthorizationLifetime::FiveMinutes;
+                    root.open_spend_authorization_dialog_with_review(
+                        // The removed request prevents transaction submission while
+                        // authorization caching still exercises the real completion.
+                        SpendAuthorizationIntent::WalletConnectRequest {
+                            request_key: "removed-request".into(),
+                            review_token: 0,
+                            reviewed_fee: None,
+                        },
+                        SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })
+        };
+        let complete = |dialog: &Entity<SpendAuthorizationDialogContent>,
+                        window: &mut Window,
+                        cx: &mut gpui::App| {
+            dialog.update(cx, |dialog, cx| {
+                dialog.finish_touch_id(
+                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                    window,
+                    cx,
+                );
+            });
+        };
+        let wait_for_password = |dialog: &Entity<SpendAuthorizationDialogContent>,
+                                 cx: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+                assert!(Instant::now() < deadline, "password check did not finish");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+        };
+        for completion in ["touch_id", "password_check"] {
+            // Retain the entity as rendered button callbacks can do until redraw.
+            let dialog = open_review(cx);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                dialog.update(cx, |dialog, _| dialog.touch_id_pending = true);
+                if completion == "password_check" {
+                    complete(&dialog, window, cx);
+                }
+                root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                if completion == "touch_id" {
+                    complete(&dialog, window, cx);
+                }
+            });
+            wait_for_password(&dialog, cx);
+            assert!(
+                root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()),
+                "dismissed review populated the authorization cache"
+            );
+            cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+        }
+        let dialog = open_review(cx);
+        cx.update(|window, cx| complete(&dialog, window, cx));
+        wait_for_password(&dialog, cx);
+        assert!(root.update(cx, |root, cx| {
+            root.valid_spend_authorization_password(cx).is_some()
+        }));
+        cx.update(|window, _| window.remove_window());
+    }
+
     #[gpui::test]
     fn password_check_refreshes_touch_id_without_authorizing_stale_requests(
         cx: &mut gpui::TestAppContext,
@@ -3301,6 +3435,7 @@ mod tests {
                 .unwrap()
         });
         for interruption in ["cancel", "wallet", "drop"] {
+            let lease = Rc::new(Cell::new(true));
             let dialog = cx.update(|window, cx| {
                 cx.new(|cx| {
                     SpendAuthorizationDialogContent::new(
@@ -3314,6 +3449,7 @@ mod tests {
                         },
                         SpendAuthorizationSummary::new("Review", "", Vec::new()),
                         SpendAuthorizationLifetime::FiveMinutes,
+                        Rc::downgrade(&lease),
                         window,
                         cx,
                     )
@@ -3533,6 +3669,7 @@ mod tests {
             gpui_component::Root::new(wallet, window, cx)
         });
         let root = root.unwrap();
+        let lease = Rc::new(Cell::new(true));
         let dialog = cx.update(|window, cx| {
             cx.new(|cx| {
                 SpendAuthorizationDialogContent::new(
@@ -3544,6 +3681,7 @@ mod tests {
                     },
                     SpendAuthorizationSummary::new("Review", "", Vec::new()),
                     SpendAuthorizationLifetime::Once,
+                    Rc::downgrade(&lease),
                     window,
                     cx,
                 )

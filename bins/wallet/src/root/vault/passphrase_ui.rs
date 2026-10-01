@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use gpui::{
     AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
@@ -35,14 +39,60 @@ pub(in crate::root) struct OpenPassphraseWalletAuthorizationUi {
     error: Option<Arc<str>>,
     touch_id: Option<TouchIdPrompt>,
     touch_id_pending: bool,
+    lease: Weak<Cell<bool>>,
 }
 
 impl OpenPassphraseWalletAuthorizationUi {
+    fn open(
+        root: &mut WalletRoot,
+        target_base_profile_uuid: Arc<str>,
+        target_label: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<'_, WalletRoot>,
+    ) -> Entity<Self> {
+        let touch_id = root.touch_id_prompt();
+        let root = cx.entity();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
+        let content = cx.new(|cx| {
+            Self::new(
+                root.clone(),
+                target_base_profile_uuid,
+                target_label,
+                touch_id,
+                identity,
+                window,
+                cx,
+            )
+        });
+        let focus_content = content.clone();
+        let dialog_content = content.clone();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let identity = Rc::downgrade(&lease);
+            dialog
+                .w(dialog_width)
+                .on_ok(|_, _, _| false)
+                .on_close(move |_, _, _| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
+                })
+                .child(div().w(content_width).child(dialog_content.clone()))
+        });
+        cx.defer_in(window, move |_root, window, cx| {
+            focus_content.update(cx, |content, cx| content.focus_password(window, cx));
+        });
+        content
+    }
+
     fn new(
         root: Entity<WalletRoot>,
         target_base_profile_uuid: Arc<str>,
         target_label: Arc<str>,
         touch_id: Option<TouchIdPrompt>,
+        lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -72,7 +122,12 @@ impl OpenPassphraseWalletAuthorizationUi {
             error: None,
             touch_id,
             touch_id_pending: false,
+            lease,
         }
+    }
+
+    fn is_open(&self) -> bool {
+        self.lease.upgrade().is_some_and(|open| open.get())
     }
 
     fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -83,7 +138,7 @@ impl OpenPassphraseWalletAuthorizationUi {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.touch_id_pending {
+        if self.touch_id_pending || !self.is_open() {
             return;
         }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
@@ -100,6 +155,9 @@ impl OpenPassphraseWalletAuthorizationUi {
     }
 
     fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if !self.is_open() {
+            return;
+        }
         let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
             return;
         };
@@ -111,21 +169,33 @@ impl OpenPassphraseWalletAuthorizationUi {
             window,
             cx,
             |dialog, outcome, window, cx| {
-                dialog.touch_id_pending = false;
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        dialog.submit_password(password, window, cx);
-                    }
-                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
-                    TouchIdPassword::Failed(message) => {
-                        dialog.touch_id = None;
-                        dialog.error = Some(message);
-                        dialog.focus_password(window, cx);
-                    }
-                }
-                cx.notify();
+                dialog.finish_touch_id(outcome, window, cx);
             },
         );
+    }
+
+    fn finish_touch_id(
+        &mut self,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_pending = false;
+        cx.notify();
+        if !self.is_open() {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                self.submit_password(password, window, cx);
+            }
+            TouchIdPassword::Cancelled => self.focus_password(window, cx),
+            TouchIdPassword::Failed(message) => {
+                self.touch_id = None;
+                self.error = Some(message);
+                self.focus_password(window, cx);
+            }
+        }
     }
 
     fn submit_password(
@@ -134,10 +204,20 @@ impl OpenPassphraseWalletAuthorizationUi {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.is_open() {
+            return;
+        }
         self.error = None;
         let target_base_profile_uuid = self.target_base_profile_uuid.clone();
+        let lease = self.lease.clone();
         self.root.update(cx, |root, cx| {
-            root.begin_open_passphrase_wallet(target_base_profile_uuid, password, window, cx);
+            root.begin_open_passphrase_wallet(
+                target_base_profile_uuid,
+                password,
+                lease,
+                window,
+                cx,
+            );
         });
         cx.notify();
     }
@@ -195,6 +275,7 @@ impl Render for OpenPassphraseWalletAuthorizationUi {
                     .gap_2()
                     .child(
                         app_button("open-passphrase-wallet-cancel", "Cancel")
+                            .debug_selector(|| "open-passphrase-wallet-cancel".into())
                             .on_click(move |_event, window, cx| window.close_dialog(cx)),
                     )
                     .child(
@@ -227,30 +308,13 @@ impl WalletRoot {
         }
         let target_label: Arc<str> = Arc::from(eligible.label.clone());
         self.vault_error = None;
-        let touch_id = self.touch_id_prompt();
-        let root = cx.entity();
-        let content = cx.new(|cx| {
-            OpenPassphraseWalletAuthorizationUi::new(
-                root.clone(),
-                target_base_profile_uuid,
-                target_label,
-                touch_id,
-                window,
-                cx,
-            )
-        });
-        let focus_content = content.clone();
-        let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
-        let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(dialog_width)
-                .on_ok(|_, _, _| false)
-                .child(div().w(content_width).child(content.clone()))
-        });
-        cx.defer_in(window, move |_root, window, cx| {
-            focus_content.update(cx, |content, cx| content.focus_password(window, cx));
-        });
+        OpenPassphraseWalletAuthorizationUi::open(
+            self,
+            target_base_profile_uuid,
+            target_label,
+            window,
+            cx,
+        );
     }
 }
 
@@ -971,6 +1035,142 @@ pub(in crate::root) const fn creation_chain_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DialogWindow;
+
+    impl Render for DialogWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(crate::root::startup::render_wallet_overlay_layers(
+                    window, cx,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn passphrase_touch_id_cannot_reopen_a_dismissed_workflow(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.executor().allow_parking();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        root.update(cx, |root, _| {
+            root.vault_view_unlock = Some(Arc::new(
+                root.vault_store
+                    .as_ref()
+                    .unwrap()
+                    .unlock_view("public list test password")
+                    .unwrap(),
+            ));
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        let open_prompt = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    OpenPassphraseWalletAuthorizationUi::open(
+                        root,
+                        Arc::from("preview"),
+                        Arc::from("Public list test"),
+                        window,
+                        cx,
+                    )
+                })
+            })
+        };
+        let wait_for_open = |cx: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while root.read_with(cx, |root, _| {
+                root.pending_software_profile_open.is_none() && root.vault_error.is_none()
+            }) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "passphrase authorization did not finish"
+                );
+                runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                });
+                cx.run_until_parked();
+            }
+        };
+        for dismissal in ["cancel", "settings"] {
+            // Model the entity retained by the rendered authorization controls.
+            let dialog = open_prompt(cx);
+            cx.run_until_parked();
+            dialog.update(cx, |dialog, _| dialog.touch_id_pending = true);
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let generation = root.read_with(cx, |root, _| {
+                root.pending_software_profile_open_operation_generation
+            });
+            if dismissal == "cancel" {
+                let cancel = cx.debug_bounds("open-passphrase-wallet-cancel").unwrap();
+                cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+            }
+            cx.update(|window, cx| {
+                if dismissal == "settings" {
+                    root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                }
+                dialog.update(cx, |dialog, cx| {
+                    dialog.finish_touch_id(
+                        TouchIdPassword::Password(Zeroizing::new(
+                            "public list test password".into(),
+                        )),
+                        window,
+                        cx,
+                    );
+                });
+            });
+            if root.read_with(cx, |root, _| {
+                root.pending_software_profile_open_operation_generation != generation
+            }) {
+                wait_for_open(cx);
+            }
+            assert!(
+                root.read_with(cx, |root, _| root.pending_software_profile_open.is_none()),
+                "dismissed prompt started passphrase authorization"
+            );
+            assert!(root.read_with(cx, |root, _| matches!(
+                root.vault_state,
+                VaultState::ViewUnlocked
+            )));
+            cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+        }
+        let dialog = open_prompt(cx);
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| {
+                dialog.finish_touch_id(
+                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                    window,
+                    cx,
+                );
+            });
+        });
+        wait_for_open(cx);
+        assert!(root.read_with(cx, |root, _| root.pending_software_profile_open.is_some()));
+        assert!(root.read_with(cx, |root, _| matches!(
+            root.vault_state,
+            VaultState::PendingSoftwareProfileOpen
+        )));
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            window.remove_window();
+        });
+    }
 
     #[test]
     fn passphrase_input_preserves_case_and_whitespace() {

@@ -1,8 +1,12 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use gpui::{
-    AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Pixels, Render,
-    SharedString, Styled, Window, div, prelude::FluentBuilder, px, rgb,
+    AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
+    Render, SharedString, Styled, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, input::InputEvent};
 use ui::clipboard::clipboard_with_toast;
@@ -79,6 +83,7 @@ struct KeyExportPasswordDialogContent {
     error: Option<Arc<str>>,
     touch_id: Option<TouchIdPrompt>,
     touch_id_pending: bool,
+    lease: Weak<Cell<bool>>,
 }
 
 impl KeyExportPasswordDialogContent {
@@ -86,6 +91,7 @@ impl KeyExportPasswordDialogContent {
         root: Entity<WalletRoot>,
         kind: KeyExportSecretKind,
         touch_id: Option<TouchIdPrompt>,
+        lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -110,7 +116,12 @@ impl KeyExportPasswordDialogContent {
             error: None,
             touch_id,
             touch_id_pending: false,
+            lease,
         }
+    }
+
+    fn is_open(&self) -> bool {
+        self.lease.upgrade().is_some_and(|open| open.get())
     }
 
     fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -121,7 +132,7 @@ impl KeyExportPasswordDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.touch_id_pending {
+        if self.touch_id_pending || !self.is_open() {
             return;
         }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
@@ -134,6 +145,9 @@ impl KeyExportPasswordDialogContent {
     }
 
     fn submit_with_touch_id(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if !self.is_open() {
+            return;
+        }
         let Some(prompt) = self.touch_id.clone().filter(|_| !self.touch_id_pending) else {
             return;
         };
@@ -145,21 +159,33 @@ impl KeyExportPasswordDialogContent {
             window,
             cx,
             |dialog, outcome, window, cx| {
-                dialog.touch_id_pending = false;
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        dialog.submit_password(&password, window, cx);
-                    }
-                    TouchIdPassword::Cancelled => dialog.focus_password(window, cx),
-                    TouchIdPassword::Failed(message) => {
-                        dialog.touch_id = None;
-                        dialog.error = Some(message);
-                        dialog.focus_password(window, cx);
-                    }
-                }
-                cx.notify();
+                dialog.finish_touch_id(outcome, window, cx);
             },
         );
+    }
+
+    fn finish_touch_id(
+        &mut self,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_pending = false;
+        cx.notify();
+        if !self.is_open() {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                self.submit_password(&password, window, cx);
+            }
+            TouchIdPassword::Cancelled => self.focus_password(window, cx),
+            TouchIdPassword::Failed(message) => {
+                self.touch_id = None;
+                self.error = Some(message);
+                self.focus_password(window, cx);
+            }
+        }
     }
 
     fn submit_password(
@@ -168,6 +194,9 @@ impl KeyExportPasswordDialogContent {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.is_open() {
+            return;
+        }
         let kind = self.kind;
         let result = self.root.update(cx, |root, cx| {
             root.reveal_key_export_secret(kind, password, cx)
@@ -228,6 +257,7 @@ impl Render for KeyExportPasswordDialogContent {
                     .gap_2()
                     .child(
                         app_button("wallet-key-export-password-cancel", "Cancel")
+                            .debug_selector(|| "wallet-key-export-password-cancel".into())
                             .flex_none()
                             .on_click(move |_event, window, cx| {
                                 window.close_dialog(cx);
@@ -295,27 +325,37 @@ impl WalletRoot {
         kind: KeyExportSecretKind,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> Entity<KeyExportPasswordDialogContent> {
         let root = cx.entity();
         let content_root = root;
         let touch_id = self.touch_id_prompt();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
         let content = cx.new(|cx| {
-            KeyExportPasswordDialogContent::new(content_root, kind, touch_id, window, cx)
+            KeyExportPasswordDialogContent::new(content_root, kind, touch_id, identity, window, cx)
         });
         let focus_content = content.clone();
+        let dialog_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(KEY_EXPORT_PASSWORD_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
+            let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .title(app_strong_text(key_export_password_dialog_title(kind)))
-                .child(div().w(content_width).child(content.clone()))
+                .on_close(move |_, _, _| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
+                })
+                .child(div().w(content_width).child(dialog_content.clone()))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
         });
+        content
     }
 
     fn selected_key_export_wallet(&self) -> Option<&WalletMetadataBundle> {
@@ -710,4 +750,102 @@ pub(in crate::root) fn key_export_error_message(
 
 const fn key_export_warning_copy() -> &'static str {
     "Revealed keys can compromise wallet funds, balances, and transaction history. Clipboard contents may be visible outside the wallet app after copying. Only reveal keys on a trusted device and close this dialog when finished."
+}
+
+#[cfg(test)]
+mod touch_id_tests {
+    use super::*;
+
+    struct DialogWindow;
+
+    impl Render for DialogWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(crate::root::startup::render_wallet_overlay_layers(
+                    window, cx,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn key_export_touch_id_cannot_reveal_secrets_after_dismissal(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        let open_prompt = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_key_export_dialog(window, cx);
+                    root.open_key_export_password_dialog(KeyExportSecretKind::Mnemonic, window, cx)
+                })
+            })
+        };
+        for dismissal in ["cancel", "settings"] {
+            for outcome in [
+                TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                TouchIdPassword::Failed(Arc::from("old prompt failure")),
+            ] {
+                // Model the entity retained by the rendered password dialog.
+                let dialog = open_prompt(cx);
+                cx.run_until_parked();
+                dialog.update(cx, |dialog, _| dialog.touch_id_pending = true);
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                if dismissal == "cancel" {
+                    let cancel = cx
+                        .debug_bounds("wallet-key-export-password-cancel")
+                        .unwrap();
+                    cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+                }
+                cx.update(|window, cx| {
+                    if dismissal == "settings" {
+                        root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                    }
+                    dialog.update(cx, |dialog, cx| dialog.finish_touch_id(outcome, window, cx));
+                    assert!(
+                        root.read(cx).key_export.mnemonic.is_none(),
+                        "dismissed prompt retained a mnemonic"
+                    );
+                    assert!(root.read(cx).key_export.shareable_viewing_key.is_none());
+                    assert_eq!(
+                        window.has_active_dialog(cx),
+                        dismissal == "cancel",
+                        "late authentication closed the surviving export dialog"
+                    );
+                    assert!(dialog.read(cx).error.is_none());
+                    window.close_all_dialogs(cx);
+                });
+            }
+        }
+        let dialog = open_prompt(cx);
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| {
+                dialog.finish_touch_id(
+                    TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+                    window,
+                    cx,
+                );
+            });
+            assert!(root.read(cx).key_export.mnemonic.is_some());
+            assert!(window.has_active_dialog(cx));
+            window.remove_window();
+        });
+    }
 }
