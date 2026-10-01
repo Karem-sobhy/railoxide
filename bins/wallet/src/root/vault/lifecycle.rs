@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::rc::Rc;
 use std::time::Duration;
 
 use super::super::chain_load::{
@@ -197,13 +199,22 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
+        let lease = Rc::new(Cell::new(true));
+        self.add_wallet_dialog_lease = Rc::downgrade(&lease);
         window.open_dialog(cx, move |dialog, _window, cx| {
+            // Builder ownership also invalidates programmatically closed dialogs.
+            let identity = Rc::downgrade(&lease);
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Add wallet"))
+                .on_close(move |_, _, _| {
+                    if let Some(lease) = identity.upgrade() {
+                        lease.set(false);
+                    }
+                })
                 .child(
                     content_root
                         .read(cx)

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -535,6 +535,8 @@ pub(crate) struct WalletRoot {
     touch_id_in_progress: bool,
     touch_id_unlock_on_render: bool,
     enable_touch_id_on_create: bool,
+    /// Weak identity of the active add-wallet dialog; its builder owns the lease.
+    add_wallet_dialog_lease: std::rc::Weak<Cell<bool>>,
     /// The vault password Touch ID supplied for the add-wallet form, if any.
     add_wallet_touch_id_password: Option<Zeroizing<String>>,
     /// The vault password Touch ID supplied for the hardware profile dialog.
@@ -1571,6 +1573,7 @@ impl WalletRoot {
             touch_id_in_progress: false,
             touch_id_unlock_on_render,
             enable_touch_id_on_create: true,
+            add_wallet_dialog_lease: std::rc::Weak::new(),
             add_wallet_touch_id_password: None,
             #[cfg(feature = "hardware")]
             hardware_profile_touch_id_password: None,

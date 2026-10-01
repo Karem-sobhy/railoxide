@@ -1325,6 +1325,7 @@ impl SpendAuthorizationDialogContent {
         });
         self.pending = true;
         self.error = None;
+        let root = self.root.downgrade();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = match join.await {
@@ -1334,6 +1335,11 @@ impl SpendAuthorizationDialogContent {
                 }),
                 Err(_) => Err("Password check failed. Try again.".into()),
             };
+            // Password verification can reseal Touch ID even after the review closes.
+            let _ = root.update(cx, |root, cx| {
+                root.refresh_touch_id_status();
+                cx.notify();
+            });
             let _ = this.update_in(cx, |dialog, window, cx| {
                 dialog.pending = false;
                 if dialog.cancelled {
@@ -3260,7 +3266,7 @@ mod tests {
     use ui::controls::app_masked_input;
 
     #[gpui::test]
-    fn password_check_cannot_authorize_after_cancel_or_wallet_change(
+    fn password_check_refreshes_touch_id_without_authorizing_stale_requests(
         cx: &mut gpui::TestAppContext,
     ) {
         // Password verification wakes GPUI from Tokio's blocking pool.
@@ -3287,7 +3293,14 @@ mod tests {
             gpui_component::Root::new(wallet, window, cx)
         });
         let root = root.unwrap();
-        for cancel in [true, false] {
+        let current_touch_id_status = root.read_with(cx, |root, _| {
+            root.vault_store
+                .as_ref()
+                .unwrap()
+                .biometric_unlock_status()
+                .unwrap()
+        });
+        for interruption in ["cancel", "wallet", "drop"] {
             let dialog = cx.update(|window, cx| {
                 cx.new(|cx| {
                     SpendAuthorizationDialogContent::new(
@@ -3307,28 +3320,53 @@ mod tests {
                 })
             });
             cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    root.touch_id_status =
+                        wallet_ops::vault::BiometricUnlockStatus::NeedsReenrollment;
+                });
                 dialog.update(cx, |dialog, cx| {
                     dialog.password_input.update(cx, |input, cx| {
                         input.set_value("public list test password", window, cx);
                     });
                     dialog.submit(window, cx);
                     assert!(dialog.pending);
-                    if cancel {
-                        dialog.cancel(cx);
-                    } else {
+                    if interruption == "wallet" {
                         root.update(cx, |root, _| root.advance_active_wallet_generation());
+                    } else if interruption == "cancel" {
+                        dialog.cancel(cx);
                     }
                 });
             });
+            let old_dialog = dialog.downgrade();
+            let dialog = (interruption != "drop").then_some(dialog);
             let deadline = Instant::now() + Duration::from_secs(5);
-            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+            while dialog.as_ref().map_or_else(
+                || {
+                    root.read_with(cx, |root, _| {
+                        root.touch_id_status != current_touch_id_status
+                    })
+                },
+                |dialog| dialog.read_with(cx, |dialog, _| dialog.pending),
+            ) {
                 assert!(Instant::now() < deadline, "password check did not finish");
                 runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
                 cx.run_until_parked();
             }
+            assert_eq!(
+                root.read_with(cx, |root, _| root.touch_id_status),
+                current_touch_id_status,
+                "password verification did not refresh persisted biometric status"
+            );
             assert!(root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()));
-            if !cancel {
-                assert!(dialog.read_with(cx, |dialog, _| dialog.error.is_some()));
+            if interruption == "drop" {
+                assert!(old_dialog.upgrade().is_none());
+            }
+            if interruption == "wallet" {
+                assert!(
+                    dialog
+                        .unwrap()
+                        .read_with(cx, |dialog, _| dialog.error.is_some())
+                );
             }
         }
         cx.update(|window, _| window.remove_window());

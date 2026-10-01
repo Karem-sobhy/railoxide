@@ -263,7 +263,12 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.touch_id_in_progress {
+        if self.touch_id_in_progress
+            || !self
+                .add_wallet_dialog_lease
+                .upgrade()
+                .is_some_and(|open| open.get())
+        {
             return;
         }
         let Some(prompt) = self.touch_id_prompt() else {
@@ -272,32 +277,49 @@ impl WalletRoot {
         };
         self.touch_id_in_progress = true;
         self.vault_error = None;
+        let lease = self.add_wallet_dialog_lease.clone();
+        let generation = self.active_wallet_generation;
         cx.notify();
         prompt.run(
             TOUCH_ID_REASON_ADD_WALLET,
             window,
             cx,
-            |root, outcome, window, cx| {
-                root.touch_id_in_progress = false;
-                if !matches!(root.vault_state, VaultState::ViewUnlocked) {
-                    cx.notify();
-                    return;
-                }
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        root.add_wallet_password_input
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        root.add_wallet_touch_id_password = Some(password);
-                    }
-                    TouchIdPassword::Cancelled => {}
-                    TouchIdPassword::Failed(message) => {
-                        root.refresh_touch_id_status();
-                        root.vault_error = Some(message);
-                    }
-                }
-                cx.notify();
+            move |root, outcome, window, cx| {
+                root.finish_add_wallet_touch_id(&lease, generation, outcome, window, cx);
             },
         );
+    }
+
+    fn finish_add_wallet_touch_id(
+        &mut self,
+        lease: &Weak<Cell<bool>>,
+        generation: u64,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_in_progress = false;
+        if matches!(&outcome, TouchIdPassword::Failed(_)) {
+            self.refresh_touch_id_status();
+        }
+        cx.notify();
+        if !lease.upgrade().is_some_and(|open| open.get())
+            || self.active_wallet_generation != generation
+            || !matches!(self.vault_state, VaultState::ViewUnlocked)
+        {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                self.add_wallet_password_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.add_wallet_touch_id_password = Some(password);
+            }
+            TouchIdPassword::Cancelled => {}
+            TouchIdPassword::Failed(message) => {
+                self.vault_error = Some(message);
+            }
+        }
     }
 
     #[cfg(feature = "hardware")]
