@@ -14,6 +14,203 @@ impl Render for DialogWindow {
 }
 
 #[gpui::test]
+fn vault_touch_id_ignores_results_after_password_unlock_and_relock(cx: &mut TestAppContext) {
+    const PASSWORD: &str = "public list test password";
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        root = Some(crate::root::tests::public_accounts::fixture_root(
+            directory.path(),
+            &runtime,
+            window,
+            cx,
+        ));
+        let view = cx.new(|_| DialogWindow);
+        gpui_component::Root::new(view, window, cx)
+    });
+    let root = root.unwrap();
+    cx.executor().allow_parking();
+    let wait_for_password_unlock = |cx: &mut gpui::VisualTestContext| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.read_with(cx, |root, _| {
+            matches!(root.vault_state, VaultState::ViewUnlocked)
+        }) {
+            assert!(std::time::Instant::now() < deadline, "unlock timed out");
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    if matches!(root.vault_state, VaultState::PendingSoftwareProfileOpen) {
+                        root.continue_pending_without_passphrase(false, window, cx);
+                    }
+                });
+            });
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            cx.run_until_parked();
+        }
+        assert!(root.read_with(cx, |root, _| matches!(
+            root.vault_state,
+            VaultState::ViewUnlocked
+        )));
+    };
+
+    for outcome in [
+        TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+        TouchIdPassword::Failed(Arc::from("old prompt failure")),
+    ] {
+        let generation = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.lock_vault(window, cx);
+                root.touch_id_in_progress = true;
+                let generation = root.active_wallet_generation;
+                // The gateway uses this password path while Touch ID is pending.
+                root.unlock_vault_with_password(Zeroizing::new(PASSWORD.into()), None, window, cx);
+                generation
+            })
+        });
+        wait_for_password_unlock(cx);
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.lock_vault(window, cx);
+                root.vault_error = Some(Arc::from("current unlock error"));
+                root.focus_vault_input_on_render = false;
+                root.finish_vault_touch_id_unlock(generation, outcome, window, cx);
+                assert!(!root.touch_id_in_progress);
+                assert!(
+                    !root.unlock_in_progress,
+                    "stale result restarted vault unlock"
+                );
+                assert!(matches!(root.vault_state, VaultState::UnlockVault));
+                assert!(root.vault_view_unlock.is_none());
+                assert_eq!(root.vault_error.as_deref(), Some("current unlock error"));
+                assert!(!root.focus_vault_input_on_render);
+            });
+        });
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, _| matches!(
+            root.vault_state,
+            VaultState::UnlockVault
+        )));
+    }
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.touch_id_in_progress = true;
+            root.finish_vault_touch_id_unlock(
+                root.active_wallet_generation,
+                TouchIdPassword::Password(Zeroizing::new(PASSWORD.into())),
+                window,
+                cx,
+            );
+        });
+    });
+    wait_for_password_unlock(cx);
+    cx.update(|window, _| window.remove_window());
+}
+
+#[cfg(feature = "hardware")]
+#[gpui::test]
+fn hardware_touch_id_ignores_results_after_dialog_replacement(cx: &mut TestAppContext) {
+    use wallet_ops::hardware::HardwareDeviceKind;
+
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        root = Some(crate::root::tests::public_accounts::fixture_root(
+            directory.path(),
+            &runtime,
+            window,
+            cx,
+        ));
+        let view = cx.new(|_| DialogWindow);
+        gpui_component::Root::new(view, window, cx)
+    });
+    let root = root.unwrap();
+    cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+    cx.update(|window, cx| root.update(cx, |root, cx| root.lock_vault(window, cx)));
+
+    for outcome in [
+        TouchIdPassword::Password(Zeroizing::new("public list test password".into())),
+        TouchIdPassword::Failed(Arc::from("old prompt failure")),
+    ] {
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let generation = root.update(cx, |root, _| {
+            root.touch_id_in_progress = true;
+            root.hardware_wallet_creation_generation
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            root.update(cx, |root, cx| {
+                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.hardware_profile_password_input
+                    .update(cx, |input, cx| {
+                        input.set_value("replacement typed password", window, cx);
+                    });
+                root.hardware_profile_unlock.error = Some(Arc::from("replacement error"));
+                root.finish_hardware_profile_touch_id_unlock(generation, outcome, window, cx);
+                assert!(!root.touch_id_in_progress);
+                assert!(!root.hardware_profile_unlock.in_progress);
+                assert!(root.hardware_profile_unlock.vault_view_unlock.is_none());
+                assert!(root.vault_view_unlock.is_none());
+                assert_eq!(
+                    root.hardware_profile_unlock.error.as_deref(),
+                    Some("replacement error")
+                );
+                assert_eq!(
+                    root.hardware_profile_password_input.read(cx).value(),
+                    "replacement typed password"
+                );
+                assert!(window.has_active_dialog(cx));
+                window.close_all_dialogs(cx);
+            });
+        });
+    }
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+            root.touch_id_in_progress = true;
+            root.finish_hardware_profile_touch_id_unlock(
+                root.hardware_wallet_creation_generation,
+                TouchIdPassword::Failed(Arc::from("current prompt failure")),
+                window,
+                cx,
+            );
+            assert_eq!(
+                root.hardware_profile_unlock.error.as_deref(),
+                Some("current prompt failure")
+            );
+            window.close_all_dialogs(cx);
+        });
+    });
+    cx.update(|window, _| window.remove_window());
+}
+
+#[gpui::test]
 fn add_wallet_touch_id_ignores_results_after_dismissal_reopening_or_wallet_change(
     cx: &mut TestAppContext,
 ) {

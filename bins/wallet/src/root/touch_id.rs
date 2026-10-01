@@ -227,33 +227,47 @@ impl WalletRoot {
         };
         self.touch_id_in_progress = true;
         self.vault_error = None;
+        let generation = self.active_wallet_generation;
         cx.notify();
         prompt.run(
             TOUCH_ID_REASON_UNLOCK,
             window,
             cx,
-            |root, outcome, window, cx| {
-                root.touch_id_in_progress = false;
-                if !matches!(root.vault_state, VaultState::UnlockVault) {
-                    cx.notify();
-                    return;
-                }
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        root.unlock_vault_with_password(password, None, window, cx);
-                    }
-                    TouchIdPassword::Cancelled => {
-                        root.focus_vault_input_on_render = true;
-                    }
-                    TouchIdPassword::Failed(message) => {
-                        root.refresh_touch_id_status();
-                        root.focus_vault_input_on_render = true;
-                        root.vault_error = Some(message);
-                    }
-                }
-                cx.notify();
+            move |root, outcome, window, cx| {
+                root.finish_vault_touch_id_unlock(generation, outcome, window, cx);
             },
         );
+    }
+
+    fn finish_vault_touch_id_unlock(
+        &mut self,
+        generation: u64,
+        outcome: TouchIdPassword,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_in_progress = false;
+        if matches!(&outcome, TouchIdPassword::Failed(_)) {
+            self.refresh_touch_id_status();
+        }
+        cx.notify();
+        if self.active_wallet_generation != generation
+            || !matches!(self.vault_state, VaultState::UnlockVault)
+        {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                self.unlock_vault_with_password(password, None, window, cx);
+            }
+            TouchIdPassword::Cancelled => {
+                self.focus_vault_input_on_render = true;
+            }
+            TouchIdPassword::Failed(message) => {
+                self.focus_vault_input_on_render = true;
+                self.vault_error = Some(message);
+            }
+        }
     }
 
     /// Lets Touch ID stand in for the add-wallet password field. The user still
@@ -337,32 +351,49 @@ impl WalletRoot {
         };
         self.touch_id_in_progress = true;
         self.hardware_profile_unlock.error = None;
+        let generation = self.hardware_wallet_creation_generation;
         cx.notify();
         prompt.run(
             TOUCH_ID_REASON_UNLOCK,
             window,
             cx,
-            |root, outcome, window, cx| {
-                root.touch_id_in_progress = false;
-                match outcome {
-                    TouchIdPassword::Password(password) => {
-                        if root.hardware_profile_unlock_requires_password()
-                            && !root.hardware_profile_unlock.in_progress
-                        {
-                            root.hardware_profile_touch_id_password = Some(password);
-                            root.unlock_hardware_profile_from_dialog(window, cx);
-                            root.hardware_profile_touch_id_password = None;
-                        }
-                    }
-                    TouchIdPassword::Cancelled => {}
-                    TouchIdPassword::Failed(message) => {
-                        root.refresh_touch_id_status();
-                        root.hardware_profile_unlock.error = Some(message);
-                    }
-                }
-                cx.notify();
+            move |root, outcome, window, cx| {
+                root.finish_hardware_profile_touch_id_unlock(generation, outcome, window, cx);
             },
         );
+    }
+
+    #[cfg(feature = "hardware")]
+    fn finish_hardware_profile_touch_id_unlock(
+        &mut self,
+        generation: u64,
+        outcome: TouchIdPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.touch_id_in_progress = false;
+        if matches!(&outcome, TouchIdPassword::Failed(_)) {
+            self.refresh_touch_id_status();
+        }
+        cx.notify();
+        if self.hardware_wallet_creation_generation != generation {
+            return;
+        }
+        match outcome {
+            TouchIdPassword::Password(password) => {
+                if self.hardware_profile_unlock_requires_password()
+                    && !self.hardware_profile_unlock.in_progress
+                {
+                    self.hardware_profile_touch_id_password = Some(password);
+                    self.unlock_hardware_profile_from_dialog(window, cx);
+                    self.hardware_profile_touch_id_password = None;
+                }
+            }
+            TouchIdPassword::Cancelled => {}
+            TouchIdPassword::Failed(message) => {
+                self.hardware_profile_unlock.error = Some(message);
+            }
+        }
     }
 
     pub(in crate::root) fn clear_add_wallet_password(
