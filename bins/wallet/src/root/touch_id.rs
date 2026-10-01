@@ -26,7 +26,7 @@ use gpui_component::{
 use tokio::runtime::Handle;
 use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
 use ui::theme;
-use wallet_ops::biometric::{BiometricError, biometric_unlock_available};
+use wallet_ops::biometric::{BiometricError, biometric_unlock_supported};
 use wallet_ops::vault::{BiometricUnlockStatus, DesktopVaultStore, VaultError};
 use zeroize::Zeroizing;
 
@@ -94,6 +94,9 @@ impl TouchIdPrompt {
 fn touch_id_failure(error: &VaultError) -> TouchIdPassword {
     match error {
         VaultError::Biometric(BiometricError::Cancelled) => TouchIdPassword::Cancelled,
+        VaultError::Biometric(BiometricError::LockedOut) => {
+            TouchIdPassword::Failed(Arc::from(error.to_string()))
+        }
         VaultError::Biometric(BiometricError::Unavailable) => TouchIdPassword::Failed(Arc::from(
             "Touch ID is not available right now. Enter the vault password instead.",
         )),
@@ -148,7 +151,7 @@ pub(in crate::root) fn masked_input_with_touch_id(
 
 impl WalletRoot {
     pub(in crate::root) fn refresh_touch_id_status(&mut self) {
-        self.touch_id_supported = biometric_unlock_available();
+        self.touch_id_supported = biometric_unlock_supported();
         self.touch_id_status = self
             .vault_store
             .as_ref()
@@ -161,7 +164,8 @@ impl WalletRoot {
             .unwrap_or(BiometricUnlockStatus::Disabled);
     }
 
-    /// Returns a prompt only when Touch ID can supply the vault password now.
+    /// Returns a prompt when this device supports the saved Touch ID enrollment.
+    /// Temporary macOS lockout is reported when the user attempts authentication.
     pub(in crate::root) fn touch_id_prompt(&mut self) -> Option<TouchIdPrompt> {
         self.refresh_touch_id_status();
         self.touch_id_prompt_cached()
@@ -169,7 +173,7 @@ impl WalletRoot {
 
     /// Like [`Self::touch_id_prompt`] without re-reading the status, for render.
     pub(in crate::root) fn touch_id_prompt_cached(&self) -> Option<TouchIdPrompt> {
-        if self.touch_id_status != BiometricUnlockStatus::Enabled {
+        if !self.touch_id_supported || self.touch_id_status != BiometricUnlockStatus::Enabled {
             return None;
         }
         Some(TouchIdPrompt {
@@ -738,6 +742,7 @@ fn enable_touch_id_error_message(error: &VaultError) -> Arc<str> {
         VaultError::Biometric(BiometricError::Unavailable) => {
             Arc::from("Touch ID is not available on this Mac right now.")
         }
+        VaultError::Biometric(BiometricError::LockedOut) => Arc::from(error.to_string()),
         error => {
             tracing::warn!(%error, "failed to turn on Touch ID unlock");
             Arc::from(format!("Failed to turn on Touch ID: {error}"))

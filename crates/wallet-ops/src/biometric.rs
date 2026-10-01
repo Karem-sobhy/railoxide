@@ -15,6 +15,10 @@ pub enum BiometricError {
     Unavailable,
     #[error("Touch ID was cancelled")]
     Cancelled,
+    #[error(
+        "Touch ID is locked. Unlock your Mac with its login password, then try Touch ID again."
+    )]
+    LockedOut,
     #[error("Touch ID failed: {0}")]
     Failed(String),
 }
@@ -30,6 +34,12 @@ pub struct SealedSecret {
 #[must_use]
 pub fn biometric_unlock_available() -> bool {
     platform::available()
+}
+
+/// Whether this device supports Touch ID, even when it is temporarily unavailable.
+#[must_use]
+pub fn biometric_unlock_supported() -> bool {
+    platform::supported()
 }
 
 /// An opaque value that changes whenever enrolled fingers are added or removed.
@@ -85,12 +95,16 @@ mod platform {
 
     /// `LAPolicyDeviceOwnerAuthenticationWithBiometrics`
     const LA_POLICY_BIOMETRICS: isize = 1;
+    /// `LABiometryTypeTouchID`
+    const LA_BIOMETRY_TOUCH_ID: isize = 1;
     const ALGORITHM: Algorithm = Algorithm::ECIESEncryptionCofactorVariableIVX963SHA256AESGCM;
     /// `kSecAttrTokenOID`: the Secure Enclave key handle. The SDK does not export
     /// the constant, but `SecKeyCopyAttributes` returns it under this name and
     /// `SecKeyCreateWithData` accepts it to reopen the key.
     const TOKEN_OBJECT_ID: &str = "toid";
     const LA_ERROR_DOMAIN: &str = "com.apple.LocalAuthentication";
+    /// `LAErrorBiometryLockout`
+    const LA_BIOMETRY_LOCKOUT: isize = -8;
     const LA_CANCEL_CODES: [isize; 4] = [
         -2, // LAErrorUserCancel
         -3, // LAErrorUserFallback
@@ -107,33 +121,53 @@ mod platform {
         Some(unsafe { msg_send![class, new] })
     }
 
-    fn can_evaluate_biometrics(context: &AnyObject) -> bool {
-        unsafe {
+    fn can_evaluate_biometrics(context: &AnyObject) -> Result<(), BiometricError> {
+        let mut error: Option<Retained<AnyObject>> = None;
+        let available: bool = unsafe {
             msg_send![
                 context,
                 canEvaluatePolicy: LA_POLICY_BIOMETRICS,
-                error: std::ptr::null_mut::<*mut AnyObject>()
+                error: &mut error
             ]
+        };
+        if available {
+            return Ok(());
         }
+        if let Some(error) = error {
+            let domain: Retained<NSString> = unsafe { msg_send![&*error, domain] };
+            let code: isize = unsafe { msg_send![&*error, code] };
+            if domain.to_string() == LA_ERROR_DOMAIN && code == LA_BIOMETRY_LOCKOUT {
+                return Err(BiometricError::LockedOut);
+            }
+        }
+        Err(BiometricError::Unavailable)
     }
 
     pub(super) fn available() -> bool {
-        la_context().is_some_and(|context| can_evaluate_biometrics(&context))
+        la_context().is_some_and(|context| can_evaluate_biometrics(&context).is_ok())
+    }
+
+    pub(super) fn supported() -> bool {
+        la_context().is_some_and(|context| {
+            // The type is populated even when the policy check reports lockout.
+            let _ = can_evaluate_biometrics(&context);
+            let biometry_type: isize = unsafe { msg_send![&*context, biometryType] };
+            biometry_type == LA_BIOMETRY_TOUCH_ID
+        })
     }
 
     pub(super) fn domain_state() -> Option<Vec<u8>> {
         let context = la_context()?;
         // The state is only populated after a policy check, whatever its result.
-        can_evaluate_biometrics(&context);
+        let _ = can_evaluate_biometrics(&context);
         let state: Option<Retained<NSData>> =
             unsafe { msg_send![&*context, evaluatedPolicyDomainState] };
         state.map(|state| state.to_vec())
     }
 
     pub(super) fn seal(secret: &[u8]) -> Result<SealedSecret, BiometricError> {
-        if !available() {
-            return Err(BiometricError::Unavailable);
-        }
+        let context = la_context().ok_or(BiometricError::Unavailable)?;
+        can_evaluate_biometrics(&context)?;
         let access_control = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
             kSecAccessControlBiometryCurrentSet | kSecAccessControlPrivateKeyUsage,
@@ -169,9 +203,7 @@ mod platform {
         reason: &str,
     ) -> Result<Zeroizing<Vec<u8>>, BiometricError> {
         let context = la_context().ok_or(BiometricError::Unavailable)?;
-        if !can_evaluate_biometrics(&context) {
-            return Err(BiometricError::Unavailable);
-        }
+        can_evaluate_biometrics(&context)?;
         let reason = NSString::from_str(reason);
         let no_fallback = NSString::from_str("");
         unsafe {
@@ -242,6 +274,9 @@ mod platform {
     }
 
     fn failed(error: &CFError) -> BiometricError {
+        if error.domain().to_string() == LA_ERROR_DOMAIN && error.code() == LA_BIOMETRY_LOCKOUT {
+            return BiometricError::LockedOut;
+        }
         BiometricError::Failed(format!(
             "{} ({} {})",
             error.description(),
@@ -261,6 +296,10 @@ mod platform {
     use super::{BiometricError, SealedSecret};
 
     pub(super) fn available() -> bool {
+        false
+    }
+
+    pub(super) fn supported() -> bool {
         false
     }
 

@@ -1167,12 +1167,13 @@ impl WalletRoot {
             vault_state,
             VaultState::CreateVault | VaultState::UnlockVault
         );
-        let touch_id_supported = wallet_ops::biometric::biometric_unlock_available();
+        let touch_id_supported = wallet_ops::biometric::biometric_unlock_supported();
         let touch_id_status = vault_store
             .as_ref()
             .and_then(|store| store.biometric_unlock_status().ok())
             .unwrap_or(BiometricUnlockStatus::Disabled);
         let touch_id_unlock_on_render = matches!(vault_state, VaultState::UnlockVault)
+            && touch_id_supported
             && touch_id_status == BiometricUnlockStatus::Enabled;
         let unlock_password_input = new_masked_input(window, cx, "vault password");
         let new_password_input = new_masked_input(window, cx, "new vault password");

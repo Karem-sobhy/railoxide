@@ -19,8 +19,9 @@ const PASSWORD_PADDING_BLOCK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BiometricUnlockStatus {
-    /// Touch ID is unavailable on this Mac or was never turned on.
+    /// Touch ID was never turned on or was explicitly turned off.
     Disabled,
+    /// A current enrollment exists. macOS may still temporarily lock Touch ID.
     Enabled,
     /// Touch ID was turned on, but the sealed password no longer matches the
     /// vault or the enrolled fingers. The next verified password reseals it.
@@ -42,9 +43,7 @@ impl DesktopVaultStore {
         let Some(record) = self.biometric_unlock_record()? else {
             return Ok(BiometricUnlockStatus::Disabled);
         };
-        if !biometric::biometric_unlock_available() {
-            return Ok(BiometricUnlockStatus::Disabled);
-        }
+        // Enrollment is a saved setting, independent of temporary macOS lockout.
         Ok(if self.biometric_unlock_is_current(&record)? {
             BiometricUnlockStatus::Enabled
         } else {
@@ -194,7 +193,65 @@ fn unpad_password(padded: &[u8]) -> Result<Zeroizing<String>, VaultError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PASSWORD_PADDING_BLOCK, pad_password, unpad_password};
+    use super::{
+        BIOMETRIC_UNLOCK_VERSION, BiometricUnlockStatus, DesktopVaultStore, PASSWORD_PADDING_BLOCK,
+        StoredBiometricUnlock, VaultError, pad_password, unpad_password,
+    };
+    use crate::biometric::{BiometricError, biometric_unlock_available};
+    use crate::vault::KdfParams;
+
+    #[test]
+    fn biometric_enrollment_remains_recoverable_when_biometrics_are_unavailable() {
+        let directory = std::env::temp_dir().join(format!(
+            "railoxide-biometric-enrollment-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = DesktopVaultStore::open(directory.clone()).unwrap();
+        let created = store
+            .create_vault_with_params("test password", KdfParams::new(1024, 1, 1))
+            .unwrap();
+        // Status needs only enrollment metadata, not a usable Secure Enclave key.
+        let mut record = StoredBiometricUnlock {
+            version: BIOMETRIC_UNLOCK_VERSION,
+            vault_salt: created.metadata.salt,
+            domain_state: None,
+            key_handle: vec![1],
+            ciphertext: vec![2],
+            stale: false,
+        };
+        store.put_biometric_unlock_record(&record).unwrap();
+        assert_eq!(
+            store.biometric_unlock_status().unwrap(),
+            BiometricUnlockStatus::Enabled,
+            "temporary unavailability must not report saved enrollment as disabled"
+        );
+
+        record.stale = true;
+        store.put_biometric_unlock_record(&record).unwrap();
+        store.unlock_view("test password").unwrap();
+        if !biometric_unlock_available() {
+            assert!(matches!(
+                store.renew_biometric_unlock("test password"),
+                Err(VaultError::Biometric(
+                    BiometricError::Unavailable | BiometricError::LockedOut
+                ))
+            ));
+        }
+        assert_eq!(
+            store.biometric_unlock_status().unwrap(),
+            BiometricUnlockStatus::NeedsReenrollment,
+            "failed renewal after password unlock must leave enrollment visible for recovery"
+        );
+
+        store.disable_biometric_unlock().unwrap();
+        assert_eq!(
+            store.biometric_unlock_status().unwrap(),
+            BiometricUnlockStatus::Disabled
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn padded_password_round_trips_and_hides_its_length() {

@@ -39,6 +39,7 @@ fn biometric_unlock_survives_password_changes_until_disabled() {
             result,
             Err(VaultError::Biometric(
                 crate::biometric::BiometricError::Unavailable
+                    | crate::biometric::BiometricError::LockedOut
             ))
         ));
         fs::remove_dir_all(root_dir).expect("cleanup");
