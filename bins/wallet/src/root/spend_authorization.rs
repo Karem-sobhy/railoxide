@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,9 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text, app_text};
+#[cfg(feature = "hardware")]
+use ui::controls::app_masked_input;
+use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
 use ui::private_action::asset_row;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
@@ -46,6 +48,10 @@ use zeroize::Zeroizing;
 use crate::assets::WalletIconSource;
 use crate::root::ui_helpers::dialog_footer;
 
+use super::device_auth::{
+    DEVICE_AUTH_REASON_SPEND, DeviceAuthMethod, DeviceAuthPassword, DeviceAuthPrompt,
+    device_auth_buttons, masked_input_with_device_auth,
+};
 use super::governance_action::GovernanceSpendDraft;
 use super::private_action::UnshieldAssetKey;
 use super::public_action::{PublicSendDraft, PublicShieldDraft};
@@ -912,6 +918,9 @@ struct SpendAuthorizationDialogContent {
     cancelled: bool,
     review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
     review_focus: gpui::FocusHandle,
+    device_auth: Option<DeviceAuthPrompt>,
+    device_auth_pending: bool,
+    lease: Weak<Cell<bool>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1166,6 +1175,7 @@ impl SpendAuthorizationDialogContent {
         intent: SpendAuthorizationIntent,
         summary: SpendAuthorizationSummary,
         initial_lifetime: SpendAuthorizationLifetime,
+        lease: Weak<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -1207,7 +1217,14 @@ impl SpendAuthorizationDialogContent {
             cancelled: false,
             review_authorization: None,
             review_focus: cx.focus_handle(),
+            device_auth: None,
+            device_auth_pending: false,
+            lease,
         }
+    }
+
+    fn is_open(&self) -> bool {
+        !self.cancelled && self.lease.upgrade().is_some_and(|open| open.get())
     }
 
     fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1222,7 +1239,7 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.pending || self.cancelled {
+        if self.pending || !self.is_open() || self.device_auth_pending {
             return;
         }
         if let Some((scope, authorization)) = self.review_authorization.take() {
@@ -1249,7 +1266,83 @@ impl SpendAuthorizationDialogContent {
             cx.notify();
             return;
         }
+        self.submit_password(password, self.lifetime, window, cx);
+    }
 
+    fn submit_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.pending
+            || !self.is_open()
+            || self.device_auth_pending
+            || self.review_authorization.is_some()
+        {
+            return;
+        }
+        let Some(prompt) = self.device_auth.clone() else {
+            return;
+        };
+        self.device_auth_pending = true;
+        self.error = None;
+        cx.notify();
+        prompt.run(
+            method,
+            DEVICE_AUTH_REASON_SPEND,
+            window,
+            cx,
+            move |dialog, outcome, window, cx| {
+                dialog.finish_device_auth(method, outcome, window, cx);
+            },
+        );
+    }
+
+    fn finish_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        outcome: DeviceAuthPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.device_auth_pending = false;
+        if !self.is_open() {
+            return;
+        }
+        match outcome {
+            DeviceAuthPassword::Password(password) => {
+                // Watch approval is for this action only. It must never seed
+                // the reusable password authorization cache.
+                let lifetime = match method {
+                    DeviceAuthMethod::AppleWatch => SpendAuthorizationLifetime::Once,
+                    DeviceAuthMethod::TouchId => self.lifetime,
+                };
+                self.submit_password(password, lifetime, window, cx);
+            }
+            DeviceAuthPassword::Cancelled => self.focus_password(window, cx),
+            DeviceAuthPassword::Failed(message) => {
+                self.device_auth = self
+                    .device_auth
+                    .take()
+                    .and_then(|prompt| prompt.without(method));
+                self.error = Some(message);
+                self.focus_password(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit_password(
+        &mut self,
+        password: Zeroizing<String>,
+        lifetime: SpendAuthorizationLifetime,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.is_open() {
+            return;
+        }
         let root = self.root.read(cx);
         let Some(store) = root.vault_store.clone() else {
             self.error = Some("Wallet vault storage is unavailable".into());
@@ -1258,15 +1351,16 @@ impl SpendAuthorizationDialogContent {
         };
         let approved_scope = root.current_spend_authorization_scope();
         let approved_generation = root.active_wallet_generation;
-        let lifetime = self.lifetime;
         // Check the password before dismissing the review or starting an operation.
         // The operation still obtains its own scoped spend grant when it runs.
         let join = root.runtime.spawn_blocking(move || {
             store.create_spend_grant(&password).map(drop)?;
+            WalletRoot::renew_device_auth(&store, &password);
             Ok::<_, VaultError>(password)
         });
         self.pending = true;
         self.error = None;
+        let root = self.root.downgrade();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = match join.await {
@@ -1276,9 +1370,14 @@ impl SpendAuthorizationDialogContent {
                 }),
                 Err(_) => Err("Password check failed. Try again.".into()),
             };
+            // Password verification can reseal device enrollments even after the review closes.
+            let _ = root.update(cx, |root, cx| {
+                root.refresh_device_auth_status();
+                cx.notify();
+            });
             let _ = this.update_in(cx, |dialog, window, cx| {
                 dialog.pending = false;
-                if dialog.cancelled {
+                if !dialog.is_open() {
                     return;
                 }
                 let root = dialog.root.clone();
@@ -1324,7 +1423,7 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn set_lifetime(&mut self, lifetime: SpendAuthorizationLifetime, cx: &mut Context<'_, Self>) {
-        if !self.pending && self.lifetime != lifetime {
+        if !self.pending && !self.device_auth_pending && self.lifetime != lifetime {
             self.lifetime = lifetime;
             cx.notify();
         }
@@ -1347,6 +1446,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
         let cancel_dialog = dialog.clone();
         let payload_dialog = dialog.clone();
         let details_dialog = dialog.clone();
+        let device_auth_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
@@ -1397,14 +1497,38 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             )
             .children(payload)
             .when(self.review_authorization.is_none(), |this| {
-                this.child(app_masked_input(
+                let device_auth_dialog = device_auth_dialog.clone();
+                this.child(masked_input_with_device_auth(
                     &self.password_input,
-                    self.pending || self.cancelled,
+                    self.pending || self.cancelled || self.device_auth_pending,
+                    device_auth_buttons(
+                        self.device_auth.as_ref(),
+                        "wallet-spend-auth-touch-id",
+                        self.device_auth_pending,
+                        self.pending || self.cancelled,
+                        move |method, window, cx| {
+                            device_auth_dialog.update(cx, |dialog, cx| {
+                                dialog.submit_with_device_auth(method, window, cx);
+                            });
+                        },
+                    ),
                 ))
                 .child(render_spend_authorization_lifetime_row(
                     &self.lifetime_select,
-                    self.pending || self.cancelled,
+                    self.pending || self.cancelled || self.device_auth_pending,
                 ))
+                .when(
+                    self.device_auth
+                        .as_ref()
+                        .is_some_and(|prompt| prompt.includes(DeviceAuthMethod::AppleWatch)),
+                    |this| {
+                        this.child(
+                            app_muted_text("Apple Watch always authorizes only this spend.")
+                                .text_xs()
+                                .whitespace_normal(),
+                        )
+                    },
+                )
                 .when_some(once_lifetime_note, |this, note| {
                     this.child(
                         app_muted_text(note.to_string())
@@ -1458,7 +1582,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         .primary()
                         .flex_none()
                         .loading(self.pending)
-                        .disabled(self.pending || self.cancelled)
+                        .disabled(self.pending || self.cancelled || self.device_auth_pending)
                         .on_click(move |_event, window, cx| {
                             dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
                         }),
@@ -2251,30 +2375,37 @@ impl WalletRoot {
         review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> Entity<SpendAuthorizationDialogContent> {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
         let title_chip = summary.title_chip.clone();
+        let device_auth = self.device_auth_prompt_cached();
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
                 root,
                 intent,
                 summary,
                 initial_lifetime,
+                identity,
                 window,
                 cx,
             );
             content.review_authorization = review_authorization;
+            content.device_auth = device_auth;
             content
         });
         let focus_content = content.clone();
+        let dialog_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let close_content = content.clone();
+            let close_content = dialog_content.clone();
+            let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
@@ -2284,13 +2415,17 @@ impl WalletRoot {
                     title_chip.as_deref(),
                 ))
                 .on_close(move |_event, _window, cx| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
                     close_content.update(cx, SpendAuthorizationDialogContent::cancel);
                 })
-                .child(div().w(content_width).child(content.clone()))
+                .child(div().w(content_width).child(dialog_content.clone()))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
         });
+        content
     }
 
     pub(super) fn open_hardware_public_action_authorization_dialog(
@@ -3182,9 +3317,288 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "hardware"))]
+    use ui::controls::app_masked_input;
+
+    struct DialogWindow;
+
+    impl gpui::Render for DialogWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(crate::root::startup::render_wallet_overlay_layers(
+                    window, cx,
+                ))
+        }
+    }
 
     #[gpui::test]
-    fn password_check_cannot_authorize_after_cancel_or_wallet_change(
+    fn spend_device_auth_is_inside_the_password_field_and_activates_from_the_keyboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use wallet_ops::vault::DeviceAuthStatus;
+
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.executor().allow_parking();
+        cx.update(gpui_component::init);
+        cx.update(crate::root::install_wallet_action_bindings);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+
+        for (method, key, button_id) in [
+            (
+                DeviceAuthMethod::TouchId,
+                "enter",
+                "wallet-spend-auth-touch-id",
+            ),
+            (
+                DeviceAuthMethod::AppleWatch,
+                "space",
+                "wallet-spend-auth-apple-watch",
+            ),
+        ] {
+            let dialog = cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_spend_authorization_dialog_with_review(
+                        SpendAuthorizationIntent::WalletConnectRequest {
+                            request_key: "removed-request".into(),
+                            review_token: 0,
+                            reviewed_fee: None,
+                        },
+                        SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.update(|window, cx| {
+                let prompt = root.update(cx, |root, _| {
+                    // Show the action without enrolling or opening a native device_auth prompt.
+                    root.touch_id_supported = true;
+                    root.apple_watch_supported = true;
+                    root.apple_watch_status = DeviceAuthStatus::Enabled;
+                    root.touch_id_status = DeviceAuthStatus::Enabled;
+                    root.device_auth_prompt_cached()
+                });
+                dialog.update(cx, |dialog, cx| {
+                    dialog.device_auth = prompt;
+                    dialog.password_input.update(cx, |input, cx| {
+                        input.set_value("unsubmitted password", window, cx);
+                    });
+                    dialog.focus_password(window, cx);
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                let input_id = dialog.read(cx).password_input.entity_id();
+                let group_id = ("vault-password-device-auth", input_id);
+                let group = window.find(group_id).bounds();
+                let button = window.within(group_id).find(button_id);
+                let bounds = button.bounds();
+                assert!(
+                    group.left() <= bounds.left()
+                        && group.top() <= bounds.top()
+                        && bounds.right() <= group.right()
+                        && bounds.bottom() <= group.bottom()
+                );
+                assert_eq!(
+                    bounds.size.width, bounds.size.height,
+                    "the action is icon-only"
+                );
+                let fingerprint = window
+                    .within(group_id)
+                    .find("wallet-spend-auth-touch-id")
+                    .bounds();
+                let watch = window
+                    .within(group_id)
+                    .find("wallet-spend-auth-apple-watch")
+                    .bounds();
+                assert!(
+                    fingerprint.right() <= watch.left(),
+                    "authentication buttons overlap"
+                );
+                window.press("tab", cx);
+                if method == DeviceAuthMethod::AppleWatch {
+                    window.press("tab", cx);
+                }
+                assert_eq!(window.find(button_id).focused(), Some(true));
+            });
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            cx.run_until_parked();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.device_auth_pending) {
+                assert!(
+                    Instant::now() < deadline,
+                    "device authentication did not finish"
+                );
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+            cx.update(|window, cx| {
+                let dialog = dialog.read(cx);
+                // The fixture has no sealed password, so activation takes the failure path.
+                assert!(
+                    dialog
+                        .device_auth
+                        .as_ref()
+                        .is_some_and(|prompt| !prompt.includes(method)
+                            && prompt.includes(match method {
+                                DeviceAuthMethod::TouchId => DeviceAuthMethod::AppleWatch,
+                                DeviceAuthMethod::AppleWatch => DeviceAuthMethod::TouchId,
+                            })),
+                    "the selected method must fail without removing the other method"
+                );
+                assert!(dialog.error.is_some());
+                assert_eq!(
+                    dialog.password_input.read(cx).value(),
+                    "unsubmitted password"
+                );
+                assert!(!dialog.pending);
+                assert!(root.read(cx).spend_authorization_cache.is_none());
+                assert!(window.has_active_dialog(cx));
+                window.close_all_dialogs(cx);
+            });
+        }
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
+    fn spend_device_auth_requires_open_review_and_watch_never_caches_approval(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.executor().allow_parking();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| DialogWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        let open_review = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.spend_authorization_lifetime = SpendAuthorizationLifetime::FiveMinutes;
+                    root.open_spend_authorization_dialog_with_review(
+                        // The removed request prevents transaction submission while
+                        // authorization caching still exercises the real completion.
+                        SpendAuthorizationIntent::WalletConnectRequest {
+                            request_key: "removed-request".into(),
+                            review_token: 0,
+                            reviewed_fee: None,
+                        },
+                        SpendAuthorizationSummary::new("Review", "", Vec::new()),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })
+        };
+        let complete = |dialog: &Entity<SpendAuthorizationDialogContent>,
+                        method: DeviceAuthMethod,
+                        window: &mut Window,
+                        cx: &mut gpui::App| {
+            dialog.update(cx, |dialog, cx| {
+                dialog.finish_device_auth(
+                    method,
+                    DeviceAuthPassword::Password(Zeroizing::new(
+                        "public list test password".into(),
+                    )),
+                    window,
+                    cx,
+                );
+            });
+        };
+        let wait_for_password = |dialog: &Entity<SpendAuthorizationDialogContent>,
+                                 cx: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+                assert!(Instant::now() < deadline, "password check did not finish");
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+        };
+        for completion in ["device_auth", "password_check"] {
+            // Retain the entity as rendered button callbacks can do until redraw.
+            let dialog = open_review(cx);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                dialog.update(cx, |dialog, _| dialog.device_auth_pending = true);
+                if completion == "password_check" {
+                    complete(&dialog, DeviceAuthMethod::TouchId, window, cx);
+                }
+                root.update(cx, |root, cx| root.open_settings_from_shortcut(window, cx));
+                if completion == "device_auth" {
+                    complete(&dialog, DeviceAuthMethod::TouchId, window, cx);
+                }
+            });
+            wait_for_password(&dialog, cx);
+            assert!(
+                root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()),
+                "dismissed review populated the authorization cache"
+            );
+            cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+        }
+        // Both completions pass the real password check. The selected five-minute
+        // lifetime applies to Touch ID, but Watch must leave no reusable approval,
+        // including when a previous Touch ID approval is still cached.
+        for method in DeviceAuthMethod::ALL {
+            let dialog = open_review(cx);
+            cx.update(|window, cx| complete(&dialog, method, window, cx));
+            wait_for_password(&dialog, cx);
+            assert!(dialog.read_with(cx, |dialog, _| dialog.error.is_none()));
+            assert_eq!(
+                root.update(cx, |root, cx| {
+                    root.valid_spend_authorization_password(cx).is_some()
+                }),
+                method == DeviceAuthMethod::TouchId
+            );
+        }
+        cx.update(|window, _| window.remove_window());
+    }
+
+    #[gpui::test]
+    fn password_check_refreshes_device_auth_without_authorizing_stale_requests(
         cx: &mut gpui::TestAppContext,
     ) {
         // Password verification wakes GPUI from Tokio's blocking pool.
@@ -3211,7 +3625,15 @@ mod tests {
             gpui_component::Root::new(wallet, window, cx)
         });
         let root = root.unwrap();
-        for cancel in [true, false] {
+        let current_touch_id_status = root.read_with(cx, |root, _| {
+            root.vault_store
+                .as_ref()
+                .unwrap()
+                .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
+                .unwrap()
+        });
+        for interruption in ["cancel", "wallet", "drop"] {
+            let lease = Rc::new(Cell::new(true));
             let dialog = cx.update(|window, cx| {
                 cx.new(|cx| {
                     SpendAuthorizationDialogContent::new(
@@ -3225,34 +3647,59 @@ mod tests {
                         },
                         SpendAuthorizationSummary::new("Review", "", Vec::new()),
                         SpendAuthorizationLifetime::FiveMinutes,
+                        Rc::downgrade(&lease),
                         window,
                         cx,
                     )
                 })
             });
             cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    root.touch_id_status = wallet_ops::vault::DeviceAuthStatus::NeedsReenrollment;
+                });
                 dialog.update(cx, |dialog, cx| {
                     dialog.password_input.update(cx, |input, cx| {
                         input.set_value("public list test password", window, cx);
                     });
                     dialog.submit(window, cx);
                     assert!(dialog.pending);
-                    if cancel {
-                        dialog.cancel(cx);
-                    } else {
+                    if interruption == "wallet" {
                         root.update(cx, |root, _| root.advance_active_wallet_generation());
+                    } else if interruption == "cancel" {
+                        dialog.cancel(cx);
                     }
                 });
             });
+            let old_dialog = dialog.downgrade();
+            let dialog = (interruption != "drop").then_some(dialog);
             let deadline = Instant::now() + Duration::from_secs(5);
-            while dialog.read_with(cx, |dialog, _| dialog.pending) {
+            while dialog.as_ref().map_or_else(
+                || {
+                    root.read_with(cx, |root, _| {
+                        root.touch_id_status != current_touch_id_status
+                    })
+                },
+                |dialog| dialog.read_with(cx, |dialog, _| dialog.pending),
+            ) {
                 assert!(Instant::now() < deadline, "password check did not finish");
                 runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
                 cx.run_until_parked();
             }
+            assert_eq!(
+                root.read_with(cx, |root, _| root.touch_id_status),
+                current_touch_id_status,
+                "password verification did not refresh persisted device_auth status"
+            );
             assert!(root.read_with(cx, |root, _| root.spend_authorization_cache.is_none()));
-            if !cancel {
-                assert!(dialog.read_with(cx, |dialog, _| dialog.error.is_some()));
+            if interruption == "drop" {
+                assert!(old_dialog.upgrade().is_none());
+            }
+            if interruption == "wallet" {
+                assert!(
+                    dialog
+                        .unwrap()
+                        .read_with(cx, |dialog, _| dialog.error.is_some())
+                );
             }
         }
         cx.update(|window, _| window.remove_window());
@@ -3419,6 +3866,7 @@ mod tests {
             gpui_component::Root::new(wallet, window, cx)
         });
         let root = root.unwrap();
+        let lease = Rc::new(Cell::new(true));
         let dialog = cx.update(|window, cx| {
             cx.new(|cx| {
                 SpendAuthorizationDialogContent::new(
@@ -3430,6 +3878,7 @@ mod tests {
                     },
                     SpendAuthorizationSummary::new("Review", "", Vec::new()),
                     SpendAuthorizationLifetime::Once,
+                    Rc::downgrade(&lease),
                     window,
                     cx,
                 )
