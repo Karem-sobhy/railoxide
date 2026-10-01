@@ -400,12 +400,14 @@ impl Render for WalletSettingsEditor {
         let discard_editor = editor.clone();
         let reset_editor = editor.clone();
         let apply_editor = editor.clone();
-        let security_page = SettingPage::new("Security").group(
-            settings_group().item(
-                SettingItem::new("Auto-lock vault", auto_lock_timeout)
-                    .description("Lock the vault after this long without wallet activity."),
-            ),
+        let mut security_group = settings_group().item(
+            SettingItem::new("Auto-lock vault", auto_lock_timeout)
+                .description("Lock the vault after this long without wallet activity."),
         );
+        if let Some(touch_id) = self.touch_id_setting(cx) {
+            security_group = security_group.item(touch_id);
+        }
+        let security_page = SettingPage::new("Security").group(security_group);
         let mut privacy_group = settings_group()
             .item(SettingItem::new("Network mode", network_mode))
             .item(
@@ -706,5 +708,41 @@ impl Render for WalletSettingsEditor {
                             }),
                     ),
             )
+    }
+}
+
+impl WalletSettingsEditor {
+    fn touch_id_setting(&self, cx: &App) -> Option<SettingItem> {
+        let root = self.active_root.as_ref()?.upgrade()?;
+        let checked = root.read(cx).touch_id_setting_state()?;
+        let description = if root.read(cx).touch_id_status
+            == wallet_ops::vault::BiometricUnlockStatus::NeedsReenrollment
+        {
+            "Enter your vault password when prompted to restore Touch ID. Changes apply immediately."
+        } else {
+            "Use Touch ID instead of your vault password on this Mac. Changes apply immediately."
+        };
+        Some(
+            SettingItem::new(
+                "Use Touch ID",
+                SettingField::<SharedString>::render(move |options, _window, _cx| {
+                    let root = root.clone();
+                    Switch::new("wallet-settings-touch-id")
+                        .accessibility_label("Use Touch ID")
+                        .checked(checked)
+                        .with_size(options.size())
+                        .on_change(move |enabled, window, cx| {
+                            root.update(cx, |root, cx| {
+                                if *enabled {
+                                    WalletRoot::open_enable_touch_id_dialog(window, cx);
+                                } else {
+                                    root.disable_touch_id(window, cx);
+                                }
+                            });
+                        })
+                }),
+            )
+            .description(description),
+        )
     }
 }

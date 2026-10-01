@@ -475,3 +475,136 @@ fn touch_id_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dialog
     }
     cx.update(|window, _| window.remove_window());
 }
+
+#[gpui_kit::test]
+fn touch_id_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppContext) {
+    use crate::root::settings::WalletSettingsEditor;
+    use gpui_kit::test::TestWindowExt as _;
+
+    struct SettingsWindow(Entity<WalletSettingsEditor>);
+    impl Render for SettingsWindow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone()).children(
+                crate::root::startup::render_wallet_overlay_layers(window, cx),
+            )
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_kit::init);
+    cx.update(crate::root::install_wallet_action_bindings);
+    let mut root = None;
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = crate::root::tests::public_accounts::fixture_root(
+            directory.path(),
+            &runtime,
+            window,
+            cx,
+        );
+        wallet.update(cx, |root, _| root.touch_id_supported = true);
+        let editor = wallet.read(cx).settings_editor.clone().unwrap();
+        editor.update(cx, |editor, cx| {
+            editor.draft.runtime.auto_lock_timeout_secs = Some(600);
+            editor.programmatic_draft_changed(cx);
+        });
+        root = Some(wallet);
+        let view = cx.new(|_| SettingsWindow(editor));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let root = root.unwrap();
+    let editor = root.read_with(cx, |root, _| root.settings_editor.clone().unwrap());
+    let draft = editor.read_with(cx, |editor, _| editor.draft.clone());
+    cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("wallet-settings-touch-id").checked(),
+            Some(false)
+        );
+        window.click("wallet-settings-touch-id", cx);
+        assert!(window.has_active_dialog(cx));
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("wallet-enable-touch-id-submit").visible());
+        assert_eq!(
+            window.find("wallet-settings-touch-id").checked(),
+            Some(false)
+        );
+        window.click("wallet-enable-touch-id-cancel", cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert_eq!(
+            window.find("wallet-settings-touch-id").focused(),
+            Some(true)
+        );
+    });
+    let keystroke = gpui::Keystroke::parse("space").unwrap();
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(gpui::KeyUpEvent { keystroke });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        // Invalid enrollment must leave both the setting and the draft unchanged.
+        window.click("wallet-enable-touch-id-submit", cx);
+        assert!(window.has_active_dialog(cx));
+        assert_eq!(
+            window.find("wallet-settings-touch-id").checked(),
+            Some(false)
+        );
+        window.click("wallet-enable-touch-id-cancel", cx);
+        assert_eq!(editor.read(cx).draft, draft);
+    });
+
+    // Completion notifies the wallet root. Settings must observe that owner without
+    // copying the enrollment flag into its Save/Discard draft.
+    for status in [
+        BiometricUnlockStatus::Enabled,
+        BiometricUnlockStatus::NeedsReenrollment,
+    ] {
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                root.touch_id_status = status;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("wallet-settings-touch-id").checked(),
+                Some(true)
+            );
+            assert_eq!(editor.read(cx).draft, draft);
+        });
+    }
+    cx.update(|window, cx| {
+        window.click("wallet-settings-discard", cx);
+        assert!(!editor.read(cx).is_dirty());
+        assert_eq!(
+            window.find("wallet-settings-touch-id").checked(),
+            Some(true)
+        );
+        window.click("wallet-settings-touch-id", cx);
+        assert!(!window.has_active_dialog(cx));
+        assert_eq!(
+            root.read(cx).touch_id_status,
+            BiometricUnlockStatus::Disabled
+        );
+        assert!(!editor.read(cx).is_dirty());
+        window.remove_window();
+    });
+}

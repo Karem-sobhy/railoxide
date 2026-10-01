@@ -191,8 +191,8 @@ impl WalletRoot {
         })
     }
 
-    /// Whether the wallet menu offers to turn Touch ID on or off.
-    pub(in crate::root) const fn touch_id_menu_state(&self) -> Option<bool> {
+    /// The saved enrollment state for the Touch ID setting, when supported.
+    pub(in crate::root) const fn touch_id_setting_state(&self) -> Option<bool> {
         match self.touch_id_status {
             BiometricUnlockStatus::Enabled | BiometricUnlockStatus::NeedsReenrollment => Some(true),
             BiometricUnlockStatus::Disabled if self.touch_id_supported => Some(false),
