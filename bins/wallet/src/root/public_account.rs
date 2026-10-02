@@ -34,6 +34,7 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 mod assets;
+mod batch;
 mod commands;
 mod components;
 #[cfg(test)]
@@ -48,6 +49,7 @@ pub(super) use components::{
     next_public_account_label_number, public_account_display_label, public_account_matches_search,
     public_account_source_label,
 };
+pub(super) use batch::{default_derive_batch_state};
 #[cfg(feature = "hardware")]
 use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
 pub(super) use hardware::{
@@ -411,6 +413,7 @@ impl WalletRoot {
         self.public_form.adding_account = false;
         self.public_form.hardware_derivation_status = HardwarePublicAccountDerivationStatus::Idle;
         self.public_form.hardware_confirmation_address = None;
+        self.public_form.reset_derive_batch();
         self.public_form.importing_account = false;
         self.public_form.sending = false;
         self.public_form.shielding = false;
@@ -462,6 +465,19 @@ impl WalletRoot {
         match kind {
             PublicAccountDialogKind::Derive => {
                 self.public_form.adding_account = false;
+                self.public_form.reset_derive_batch();
+                self.public_form
+                    .batch
+                    .page_input
+                    .update(cx, |input, cx| input.set_value("1", window, cx));
+                self.public_form
+                    .batch
+                    .range_start_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form
+                    .batch
+                    .range_count_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
                 self.public_form.hardware_derivation_status =
                     HardwarePublicAccountDerivationStatus::Idle;
                 self.public_form.hardware_confirmation_address = None;
@@ -1534,52 +1550,98 @@ impl WalletRoot {
                             },
                         );
                 }
-                div()
+                let mode = self.public_form.batch.mode;
+                let mut content = div()
                     .w(content_width)
                     .flex()
                     .flex_col()
                     .gap_3()
                     .child(app_muted_text(
-                        "Derive a Public EVM account from the selected Private wallet mnemonic.",
+                        "Derive Public EVM accounts from the selected Private wallet mnemonic.",
                     ))
                     .child(app_muted_text(next_index))
-                    .child(
-                        app_input(&self.public_form.add_label_input)
-                            .disabled(self.device_auth_in_progress),
-                    )
-                    .child(masked_input_with_device_auth(
-                        &self.public_form.add_password_input,
-                        self.device_auth_in_progress,
-                        self.public_account_device_auth_buttons(
-                            add_root.clone(),
-                            PublicAccountDialogKind::Derive,
-                            "wallet-public-add-derived-touch-id",
-                            self.public_form.adding_account,
-                            device_auth_lease,
-                        ),
-                    ))
-                    .children(self.public_form.error.as_ref().map(|message| {
-                        Alert::error("wallet-public-add-derived-error", message.to_string()).small()
-                    }))
-                    .child(
-                        app_button(
-                            "wallet-public-add-derived-submit",
-                            if self.public_form.adding_account {
-                                "Deriving..."
-                            } else {
-                                "Derive account"
-                            },
-                        )
-                        .primary()
-                        .small()
-                        .loading(self.public_form.adding_account)
-                        .disabled(self.public_form.adding_account || self.device_auth_in_progress)
-                        .on_click(move |_event, window, cx| {
-                            add_root.update(cx, |root, cx| {
-                                root.add_public_derived_account_from_input(window, cx);
-                            });
-                        }),
-                    )
+                    .child(self.render_derive_mode_selector(&add_root, content_width));
+                match mode {
+                    batch::DeriveAccountMode::Single => {
+                        let single_root = add_root.clone();
+                        content = content
+                            .child(
+                                app_input(&self.public_form.add_label_input)
+                                    .disabled(self.device_auth_in_progress),
+                            )
+                            .child(masked_input_with_device_auth(
+                                &self.public_form.add_password_input,
+                                self.device_auth_in_progress,
+                                self.public_account_device_auth_buttons(
+                                    single_root.clone(),
+                                    PublicAccountDialogKind::Derive,
+                                    "wallet-public-add-derived-touch-id",
+                                    self.public_form.adding_account,
+                                    device_auth_lease,
+                                ),
+                            ))
+                            .children(self.public_form.error.as_ref().map(|message| {
+                                Alert::error(
+                                    "wallet-public-add-derived-error",
+                                    message.to_string(),
+                                )
+                                .small()
+                            }))
+                            .child(
+                                app_button(
+                                    "wallet-public-add-derived-submit",
+                                    if self.public_form.adding_account {
+                                        "Deriving..."
+                                    } else {
+                                        "Derive account"
+                                    },
+                                )
+                                .primary()
+                                .small()
+                                .loading(self.public_form.adding_account)
+                                .disabled(
+                                    self.public_form.adding_account
+                                        || self.device_auth_in_progress,
+                                )
+                                .on_click(move |_event, window, cx| {
+                                    single_root.update(cx, |root, cx| {
+                                        root.add_public_derived_account_from_input(window, cx);
+                                    });
+                                }),
+                            );
+                    }
+                    batch::DeriveAccountMode::Browse => {
+                        content = content
+                            .child(app_masked_input(
+                                &self.public_form.add_password_input,
+                                self.device_auth_in_progress,
+                            ))
+                            .children(self.public_form.error.as_ref().map(|message| {
+                                Alert::error(
+                                    "wallet-public-add-derived-error",
+                                    message.to_string(),
+                                )
+                                .small()
+                            }))
+                            .child(self.render_derive_browse_section(&add_root, content_width));
+                    }
+                    batch::DeriveAccountMode::Range => {
+                        content = content
+                            .child(app_masked_input(
+                                &self.public_form.add_password_input,
+                                self.device_auth_in_progress,
+                            ))
+                            .children(self.public_form.error.as_ref().map(|message| {
+                                Alert::error(
+                                    "wallet-public-add-derived-error",
+                                    message.to_string(),
+                                )
+                                .small()
+                            }))
+                            .child(self.render_derive_range_section(&add_root, content_width));
+                    }
+                }
+                content
             }
             PublicAccountDialogKind::Import => {
                 let import_root = root.clone();

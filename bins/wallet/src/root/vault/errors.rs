@@ -79,6 +79,9 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
             "invalid_hardware_account_recovery_range"
         }
         VaultError::HardwareWalletReceiveAddress => "hardware_wallet_receive_address",
+        VaultError::InvalidDerivedAddressPage => "invalid_derived_address_page",
+        VaultError::InvalidDerivedAddressRange => "invalid_derived_address_range",
+        VaultError::DerivedAddressBatchTooLarge(_) => "derived_address_batch_too_large",
     }
 }
 
@@ -148,6 +151,15 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::InvalidHardwareAccountRecoveryRange => {
             "Enter a valid bounded hardware account recovery range.".into()
+        }
+        VaultError::InvalidDerivedAddressPage => {
+            "Enter a valid page number (starting at 1).".into()
+        }
+        VaultError::InvalidDerivedAddressRange => {
+            "Enter a valid start index and count (max 100 addresses per batch).".into()
+        }
+        VaultError::DerivedAddressBatchTooLarge(max) => {
+            format!("Derivation batch exceeds the per-batch limit of {max} addresses.").into()
         }
         _ => "Wallet vault operation failed. See logs for non-sensitive diagnostics.".into(),
     }

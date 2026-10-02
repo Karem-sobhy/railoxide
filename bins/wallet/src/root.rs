@@ -1252,6 +1252,11 @@ impl WalletRoot {
             error: None,
         };
         let public_list_scroll = gpui::ScrollHandle::new();
+        let derive_batch_state = public_account::default_derive_batch_state(
+            new_prefilled_input(window, cx, "page", "1"),
+            new_text_input(window, cx, "start index"),
+            new_text_input(window, cx, "count"),
+        );
         let public_form = PublicAccountFormState {
             add_label_input: new_text_input(window, cx, "account label"),
             add_password_input: new_masked_input(window, cx, "vault password"),
@@ -1326,6 +1331,7 @@ impl WalletRoot {
             asset_menu: None,
             asset_menu_subscription: None,
             open_section: wallet_ops::vault::PublicAccountStatus::Active,
+            batch: derive_batch_state,
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");

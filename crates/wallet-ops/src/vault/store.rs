@@ -23,8 +23,8 @@ use super::{
     WalletConnectSessionRecord, WalletKeys, WalletMeta, WalletMetadataBundle,
     WalletPrivateNamespaceId, WalletSoftwareContext, WalletSoftwareContextKind, WalletSource,
     WalletSpendBundle, WalletSpendSource, WalletStatus, WalletViewBundle, Zeroizing,
-    assign_missing_display_orders, bip39_entropy_from_mnemonic, bip39_mnemonic_from_entropy,
-    bip39_seed_from_mnemonic_zeroizing, broadcaster_banned_record_entry,
+    MAX_DERIVED_ADDRESS_BATCH_COUNT, assign_missing_display_orders, bip39_entropy_from_mnemonic,
+    bip39_mnemonic_from_entropy, bip39_seed_from_mnemonic_zeroizing, broadcaster_banned_record_entry,
     broadcaster_banned_record_key, broadcaster_favorite_record_entry,
     broadcaster_favorite_record_key, broadcaster_preference_entry_identity, create_spend_grant,
     create_with_params, current_vault_version, default_wallet_label_for_metadata,
@@ -37,18 +37,19 @@ use super::{
     hardware_profile_record_entry, hardware_wallet_account_index_record_entry,
     initial_derived_public_account, initial_derived_public_account_from_seed,
     next_derived_public_account_index, next_private_address_book_display_order,
-    next_public_account_display_order, next_public_address_book_display_order,
+    next_public_account_display_order, next_public_account_label_number, next_public_address_book_display_order,
     next_wallet_display_order, normalize_public_account_label, parse_public_evm_private_key,
     private_address_book_record_entry, private_address_book_record_key,
-    public_account_metadata_record_entry, public_account_metadata_record_key,
-    public_account_secret_record_entry, public_account_secret_record_key,
-    public_address_book_record_entry, public_address_book_record_key,
-    public_evm_address_from_private_key, reencrypt_metadata, serialize_wallet_utxo,
-    sort_broadcaster_preference_entries, sort_hardware_profile_metadata,
+    public_account_default_label, public_account_metadata_record_entry,
+    public_account_metadata_record_key, public_account_secret_record_entry,
+    public_account_secret_record_key, public_address_book_record_entry,
+    public_address_book_record_key, public_evm_address_from_private_key, reencrypt_metadata,
+    serialize_wallet_utxo, sort_broadcaster_preference_entries, sort_hardware_profile_metadata,
     sort_private_address_book_entries, sort_public_account_metadata,
     sort_public_address_book_entries, sort_wallet_metadata, sort_walletconnect_sessions,
     unlock_spend, unlock_view, validate_address_book_label,
-    validate_broadcaster_preference_address, validate_private_address_book_address,
+    validate_broadcaster_preference_address, validate_derived_address_page,
+    validate_derived_address_range, validate_private_address_book_address,
     validate_public_address_book_address, validate_wallet_label, vault_error_from_wallet_cache,
     wallet_chain_index_complete_record_entry, wallet_chain_index_complete_record_key,
     wallet_chain_index_prefix, wallet_chain_index_record_key, wallet_chain_metadata_record_key,
@@ -76,4 +77,5 @@ mod wallets;
 
 pub use device_auth::DeviceAuthStatus;
 pub use gateway::GatewayPermission;
+pub use public_accounts::{DerivedAddressPreview, DerivedBatchAddOutcome};
 pub use software_context::SoftwareContextMatch;

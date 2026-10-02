@@ -74,6 +74,7 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) action_contract_address: Option<Arc<str>>,
     pub(in crate::root) next_derived_index: Option<u32>,
     pub(in crate::root) next_account_label_number: u32,
+    pub(in crate::root) batch: super::batch::DeriveBatchState,
     pub(in crate::root) error: Option<Arc<str>>,
     pub(in crate::root) send_error: Option<Arc<str>>,
     pub(in crate::root) shield_error: Option<Arc<str>>,

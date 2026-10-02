@@ -672,6 +672,78 @@ pub(super) fn next_derived_public_account_index(
         })
 }
 
+/// Number of derived addresses shown per browse page in the Add Account flow.
+pub const DERIVED_ADDRESS_BROWSE_PAGE_SIZE: u32 = 20;
+
+/// Upper bound for a single preview/add batch. Derivation itself is cheap
+/// (BIP32 + keccak per index), but this keeps dialog interactions responsive
+/// and avoids accidental multi-thousand account creation.
+pub const MAX_DERIVED_ADDRESS_BATCH_COUNT: u32 = 100;
+
+/// Highest derivable public-account index. BIP32 non-hardened children live
+/// below 2^31, so anything at or above the hardened bit is rejected.
+pub const MAX_DERIVED_ADDRESS_INDEX: u32 = 0x7FFF_FFFF;
+
+/// 1-indexed browse page → first derivation index. Page 1 starts at 0.
+/// Returns `None` for page 0 or arithmetic overflow.
+#[must_use]
+pub fn derived_address_page_start_index(page: u32) -> Option<u32> {
+    let zero_based = page.checked_sub(1)?;
+    zero_based.checked_mul(DERIVED_ADDRESS_BROWSE_PAGE_SIZE)
+}
+
+/// 1-indexed browse page → the derivation indexes on that page (up to
+/// [`DERIVED_ADDRESS_BROWSE_PAGE_SIZE`]). Returns `None` for page 0 or when
+/// the page starts past [`MAX_DERIVED_ADDRESS_INDEX`]. A trailing partial
+/// page near the index ceiling yields fewer than a full page.
+#[must_use]
+pub fn derived_address_page_indexes(page: u32) -> Option<Vec<u32>> {
+    let start = derived_address_page_start_index(page)?;
+    if start > MAX_DERIVED_ADDRESS_INDEX {
+        return None;
+    }
+    let remaining = MAX_DERIVED_ADDRESS_INDEX - start + 1;
+    let count = remaining.min(DERIVED_ADDRESS_BROWSE_PAGE_SIZE);
+    Some((0..count).map(|offset| start + offset).collect())
+}
+
+/// `start..start+count` derivation indexes. Returns `None` when `count` is
+/// zero, exceeds [`MAX_DERIVED_ADDRESS_BATCH_COUNT`], or the range would run
+/// past [`MAX_DERIVED_ADDRESS_INDEX`].
+#[must_use]
+pub fn derived_address_range_indexes(start: u32, count: u32) -> Option<Vec<u32>> {
+    if count == 0 || count > MAX_DERIVED_ADDRESS_BATCH_COUNT {
+        return None;
+    }
+    if start > MAX_DERIVED_ADDRESS_INDEX {
+        return None;
+    }
+    let end_exclusive = u64::from(start) + u64::from(count);
+    if end_exclusive > u64::from(MAX_DERIVED_ADDRESS_INDEX) + 1 {
+        return None;
+    }
+    Some((0..count).map(|offset| start + offset).collect())
+}
+
+/// Validated form of [`derived_address_range_indexes`] with descriptive errors.
+pub fn validate_derived_address_range(start: u32, count: u32) -> Result<Vec<u32>, VaultError> {
+    if count == 0 {
+        return Err(VaultError::InvalidDerivedAddressRange);
+    }
+    if count > MAX_DERIVED_ADDRESS_BATCH_COUNT {
+        return Err(VaultError::DerivedAddressBatchTooLarge(
+            MAX_DERIVED_ADDRESS_BATCH_COUNT,
+        ));
+    }
+    derived_address_range_indexes(start, count)
+        .ok_or(VaultError::InvalidDerivedAddressRange)
+}
+
+/// Validated form of [`derived_address_page_indexes`] with descriptive errors.
+pub fn validate_derived_address_page(page: u32) -> Result<Vec<u32>, VaultError> {
+    derived_address_page_indexes(page).ok_or(VaultError::InvalidDerivedAddressPage)
+}
+
 pub(super) fn ensure_public_account_address_available(
     metadata: &[PublicAccountMetadata],
     address: Address,

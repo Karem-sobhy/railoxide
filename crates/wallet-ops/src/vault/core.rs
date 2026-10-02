@@ -131,6 +131,12 @@ pub enum VaultError {
     InvalidPublicAccountOperation,
     #[error("public account display order overflow")]
     PublicAccountDisplayOrderOverflow,
+    #[error("invalid derived address page")]
+    InvalidDerivedAddressPage,
+    #[error("invalid derived address range")]
+    InvalidDerivedAddressRange,
+    #[error("derived address batch too large (max {0})")]
+    DerivedAddressBatchTooLarge(u32),
     #[error("invalid public EVM private key")]
     InvalidPublicEvmPrivateKey,
     #[error("public EVM key derivation failed")]
