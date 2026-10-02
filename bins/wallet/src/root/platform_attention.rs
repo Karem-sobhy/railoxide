@@ -104,7 +104,7 @@ mod imp {
             }
         }
 
-        pub(super) fn sync_badge_count(&self, _count: usize) {}
+        pub(super) const fn sync_badge_count(&self, _count: usize) {}
 
         pub(super) fn request_attention(&mut self) {
             let Some(hwnd) = self.hwnd else {

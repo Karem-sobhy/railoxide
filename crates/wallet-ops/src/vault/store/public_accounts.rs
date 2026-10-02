@@ -372,7 +372,9 @@ impl DesktopVaultStore {
         }
 
         let mut added = Vec::with_capacity(fresh.len());
-        if !fresh.is_empty() {
+        if fresh.is_empty() {
+            skipped_indexes.sort_unstable();
+        } else {
             let mut next_display_order = next_public_account_display_order(&accounts)?;
             let mut next_label = next_public_account_label_number(&accounts, wallet_id);
             let mut entries = Vec::with_capacity(fresh.len());
@@ -401,8 +403,6 @@ impl DesktopVaultStore {
             }
             skipped_indexes.sort_unstable();
             self.db.put_desktop_wallet_vault_records(&entries)?;
-        } else {
-            skipped_indexes.sort_unstable();
         }
         Ok(DerivedBatchAddOutcome {
             added,

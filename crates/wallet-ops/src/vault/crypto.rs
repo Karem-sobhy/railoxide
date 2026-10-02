@@ -149,7 +149,7 @@ pub fn generate_opaque_id() -> Result<String, VaultError> {
     Ok(alloy::hex::encode(bytes))
 }
 
-pub fn enable_best_effort_runtime_hardening() {
+pub const fn enable_best_effort_runtime_hardening() {
     disable_core_dumps();
 }
 

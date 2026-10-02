@@ -97,7 +97,7 @@ impl DeriveBatchState {
     }
 }
 
-pub(in crate::root) fn default_derive_batch_state(
+pub(in crate::root) const fn default_derive_batch_state(
     page_input: Entity<gpui_component::input::InputState>,
     range_start_input: Entity<gpui_component::input::InputState>,
     range_count_input: Entity<gpui_component::input::InputState>,
@@ -222,7 +222,7 @@ impl WalletRoot {
     }
 
     fn derive_batch_store_preview(
-        &mut self,
+        &self,
         password: &str,
         indexes: &[u32],
     ) -> Result<Vec<DerivedBrowseRow>, String> {
@@ -252,7 +252,7 @@ impl WalletRoot {
     pub(in crate::root) fn set_derive_account_mode(
         &mut self,
         mode: DeriveAccountMode,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         self.public_form.batch.mode = mode;
@@ -274,7 +274,7 @@ impl WalletRoot {
     pub(in crate::root) fn preview_derived_browse_page(
         &mut self,
         device_auth_password: Option<Zeroizing<String>>,
-        window: &mut Window,
+        _window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.batch.loading {
@@ -325,13 +325,12 @@ impl WalletRoot {
                 self.public_form.batch.feedback = Some(Arc::from(message));
             }
         }
-        let _ = window;
         cx.notify();
     }
 
     pub(in crate::root) fn goto_derived_browse_page_from_input(
         &mut self,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         let text = self
@@ -341,22 +340,19 @@ impl WalletRoot {
             .read(cx)
             .value()
             .to_string();
-        match parse_browse_page(&text) {
-            Some(page) => {
-                if derived_address_page_indexes(page).is_none() {
-                    self.public_form.batch.feedback =
-                        Some(Arc::from("Enter a valid page number (starting at 1)"));
-                    cx.notify();
-                    return;
-                }
-                self.public_form.batch.page = page;
-                self.preview_derived_browse_page(None, window, cx);
-            }
-            None => {
+        if let Some(page) = parse_browse_page(&text) {
+            if derived_address_page_indexes(page).is_none() {
                 self.public_form.batch.feedback =
                     Some(Arc::from("Enter a valid page number (starting at 1)"));
                 cx.notify();
+                return;
             }
+            self.public_form.batch.page = page;
+            self.preview_derived_browse_page(None, window, cx);
+        } else {
+            self.public_form.batch.feedback =
+                Some(Arc::from("Enter a valid page number (starting at 1)"));
+            cx.notify();
         }
     }
 
@@ -407,7 +403,7 @@ impl WalletRoot {
 
     fn finish_derived_batch_add(
         &mut self,
-        outcome: wallet_ops::vault::DerivedBatchAddOutcome,
+        outcome: &wallet_ops::vault::DerivedBatchAddOutcome,
         submitted: &[u32],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -507,7 +503,7 @@ impl WalletRoot {
             protected.as_deref(),
         );
         match result {
-            Ok(outcome) => self.finish_derived_batch_add(outcome, &selected, window, cx),
+            Ok(outcome) => self.finish_derived_batch_add(&outcome, &selected, window, cx),
             Err(error) => {
                 self.public_form.batch.loading = false;
                 self.public_form.batch.feedback = Some(Arc::from(error.to_string()));
@@ -579,7 +575,7 @@ impl WalletRoot {
         match result {
             Ok(outcome) => {
                 let submitted: Vec<u32> = (0..count).map(|offset| start + offset).collect();
-                self.finish_derived_batch_add(outcome, &submitted, window, cx);
+                self.finish_derived_batch_add(&outcome, &submitted, window, cx);
             }
             Err(error) => {
                 self.public_form.batch.loading = false;
@@ -679,10 +675,7 @@ impl WalletRoot {
                     .read(cx)
                     .value()
                     .to_string();
-                match parse_range_inputs(&start_text, &count_text) {
-                    Ok(_) => None,
-                    Err(message) => Some(message),
-                }
+                parse_range_inputs(&start_text, &count_text).err()
             }
         };
         if let Some(error) = error {
@@ -902,7 +895,7 @@ impl WalletRoot {
                                     let page = root.public_form.batch.page.saturating_sub(1).max(1);
                                     root.public_form.batch.page = page;
                                     root.public_form.batch.page_input.update(cx, |input, cx| {
-                                        input.set_value(&page.to_string(), window, cx)
+                                        input.set_value(page.to_string(), window, cx);
                                     });
                                     root.run_derive_batch_action(
                                         DeriveBatchDeviceAction::PreviewPage,
@@ -951,7 +944,7 @@ impl WalletRoot {
                                     let page = root.public_form.batch.page.saturating_add(1).max(1);
                                     root.public_form.batch.page = page;
                                     root.public_form.batch.page_input.update(cx, |input, cx| {
-                                        input.set_value(&page.to_string(), window, cx)
+                                        input.set_value(page.to_string(), window, cx);
                                     });
                                     root.run_derive_batch_action(
                                         DeriveBatchDeviceAction::PreviewPage,

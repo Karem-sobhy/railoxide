@@ -1563,7 +1563,7 @@ impl WalletRoot {
                     .child(self.render_derive_mode_selector(&add_root, content_width));
                 match mode {
                     batch::DeriveAccountMode::Single => {
-                        let single_root = add_root.clone();
+                        let single_root = add_root;
                         content = content
                             .child(
                                 app_input(&self.public_form.add_label_input)
@@ -1628,7 +1628,7 @@ impl WalletRoot {
                             .child(self.render_derive_browse_section(
                                 &add_root,
                                 content_width,
-                                device_auth_lease.clone(),
+                                device_auth_lease,
                             ));
                     }
                     batch::DeriveAccountMode::Range => {
@@ -1651,7 +1651,7 @@ impl WalletRoot {
                             .child(self.render_derive_range_section(
                                 &add_root,
                                 content_width,
-                                device_auth_lease.clone(),
+                                device_auth_lease,
                             ));
                     }
                 }
