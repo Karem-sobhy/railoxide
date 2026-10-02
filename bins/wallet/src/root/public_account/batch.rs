@@ -1,13 +1,16 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::rc::Weak;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use gpui::{Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, prelude::FluentBuilder as _};
+use gpui::{
+    Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _,
+};
 use gpui_component::{
-    Disableable, Sizable, Selectable,
-    button::ButtonVariants,
-    checkbox::Checkbox,
-    scroll::ScrollableElement,
+    Disableable, Selectable, Sizable, button::ButtonVariants, checkbox::Checkbox,
+    input::InputGroupButton, scroll::ScrollableElement,
 };
 use railgun_ui::short_address;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
@@ -20,6 +23,9 @@ use zeroize::Zeroizing;
 
 use super::types::PublicAccountFormState;
 use crate::root::WalletRoot;
+use crate::root::device_auth::{
+    DEVICE_AUTH_REASON_PUBLIC_ACCOUNT, DeviceAuthMethod, DeviceAuthPassword, device_auth_buttons,
+};
 
 /// Which derivation UI the Add Account dialog shows. Single-address
 /// derivation is unchanged; Browse and Range reuse the same current private
@@ -87,10 +93,7 @@ impl DeriveBatchState {
 
     pub(in crate::root) fn page_fully_selected(&self) -> bool {
         let selectable = self.selectable_page_indexes();
-        !selectable.is_empty()
-            && selectable
-                .iter()
-                .all(|index| self.selected.contains(index))
+        !selectable.is_empty() && selectable.iter().all(|index| self.selected.contains(index))
     }
 }
 
@@ -137,9 +140,17 @@ pub(in crate::root) fn parse_range_inputs(
     if count > MAX_DERIVED_ADDRESS_BATCH_COUNT {
         return Err("Count exceeds the per-batch limit (100)");
     }
-    validate_derived_address_range(start, count)
-        .map_err(|_| "Start index is out of range")?;
+    validate_derived_address_range(start, count).map_err(|_| "Start index is out of range")?;
     Ok((start, count))
+}
+
+/// Batch action that can be authorized with device authentication instead of
+/// typing the vault password. Mirrors the single-add device-auth path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::root) enum DeriveBatchDeviceAction {
+    PreviewPage,
+    AddSelected,
+    AddRange,
 }
 
 impl PublicAccountFormState {
@@ -195,8 +206,11 @@ impl WalletRoot {
                         wallet_ops::vault::PublicAccountScope::PrivateWallet {
                             wallet_uuid: scoped,
                         } if scoped == wallet_id
-                    ) && account.derivation_index == Some(preview.derivation_index);
-                    same_derived_index || (account.is_active_for_wallet(wallet_id) && account.address == preview.address)
+                    ) && account.derivation_index
+                        == Some(preview.derivation_index);
+                    same_derived_index
+                        || (account.is_active_for_wallet(wallet_id)
+                            && account.address == preview.address)
                 });
                 DerivedBrowseRow {
                     derivation_index: preview.derivation_index,
@@ -301,7 +315,10 @@ impl WalletRoot {
                     .filter(|row| row.already_added)
                     .map(|row| row.derivation_index)
                     .collect();
-                self.public_form.batch.selected.retain(|index| !added.contains(index));
+                self.public_form
+                    .batch
+                    .selected
+                    .retain(|index| !added.contains(index));
             }
             Err(message) => {
                 self.public_form.batch.rows.clear();
@@ -310,32 +327,6 @@ impl WalletRoot {
         }
         let _ = window;
         cx.notify();
-    }
-
-    pub(in crate::root) fn goto_derived_browse_page(
-        &mut self,
-        page: u32,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if page < 1 {
-            self.public_form.batch.feedback =
-                Some(Arc::from("Enter a valid page number (starting at 1)"));
-            cx.notify();
-            return;
-        }
-        if derived_address_page_indexes(page).is_none() {
-            self.public_form.batch.feedback =
-                Some(Arc::from("Enter a valid page number (starting at 1)"));
-            cx.notify();
-            return;
-        }
-        self.public_form.batch.page = page;
-        self.public_form
-            .batch
-            .page_input
-            .update(cx, |input, cx| input.set_value(&page.to_string(), window, cx));
-        self.preview_derived_browse_page(None, window, cx);
     }
 
     pub(in crate::root) fn goto_derived_browse_page_from_input(
@@ -351,7 +342,16 @@ impl WalletRoot {
             .value()
             .to_string();
         match parse_browse_page(&text) {
-            Some(page) => self.goto_derived_browse_page(page, window, cx),
+            Some(page) => {
+                if derived_address_page_indexes(page).is_none() {
+                    self.public_form.batch.feedback =
+                        Some(Arc::from("Enter a valid page number (starting at 1)"));
+                    cx.notify();
+                    return;
+                }
+                self.public_form.batch.page = page;
+                self.preview_derived_browse_page(None, window, cx);
+            }
             None => {
                 self.public_form.batch.feedback =
                     Some(Arc::from("Enter a valid page number (starting at 1)"));
@@ -360,7 +360,11 @@ impl WalletRoot {
         }
     }
 
-    pub(in crate::root) fn toggle_derived_browse_selection(&mut self, index: u32, cx: &mut Context<'_, Self>) {
+    pub(in crate::root) fn toggle_derived_browse_selection(
+        &mut self,
+        index: u32,
+        cx: &mut Context<'_, Self>,
+    ) {
         let selectable = self
             .public_form
             .batch
@@ -383,7 +387,10 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(in crate::root) fn clear_derived_browse_page_selection(&mut self, cx: &mut Context<'_, Self>) {
+    pub(in crate::root) fn clear_derived_browse_page_selection(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
         let page_indexes: BTreeSet<u32> = self
             .public_form
             .batch
@@ -421,8 +428,7 @@ impl WalletRoot {
         // Refresh already-added flags on the visible page without asking for
         // the password again (it stays in the input until the dialog closes).
         let password = self.derive_batch_password(cx);
-        if !password.trim().is_empty() && self.public_form.batch.mode == DeriveAccountMode::Browse
-        {
+        if !password.trim().is_empty() && self.public_form.batch.mode == DeriveAccountMode::Browse {
             let page = self.public_form.batch.page;
             if let Some(indexes) = derived_address_page_indexes(page) {
                 match self.derive_batch_store_preview(password.as_str(), &indexes) {
@@ -462,8 +468,7 @@ impl WalletRoot {
         }
         let selected: Vec<u32> = self.public_form.batch.selected.iter().copied().collect();
         if selected.is_empty() {
-            self.public_form.batch.feedback =
-                Some(Arc::from("Select at least one address to add"));
+            self.public_form.batch.feedback = Some(Arc::from("Select at least one address to add"));
             cx.notify();
             return;
         }
@@ -584,6 +589,220 @@ impl WalletRoot {
         }
     }
 
+    pub(in crate::root) fn derive_batch_device_auth_buttons(
+        &self,
+        root: Entity<Self>,
+        action: DeriveBatchDeviceAction,
+        id: &'static str,
+        busy: bool,
+        lease: Weak<Cell<bool>>,
+    ) -> Vec<InputGroupButton> {
+        device_auth_buttons(
+            self.device_auth_prompt_cached().as_ref(),
+            id,
+            self.device_auth_in_progress,
+            busy,
+            move |method, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.submit_derive_batch_with_device_auth(
+                        method,
+                        action,
+                        lease.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            },
+        )
+    }
+
+    /// Runs a batch action with the vault password from device authentication.
+    /// Validates first so a form that cannot be submitted never prompts.
+    fn submit_derive_batch_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        action: DeriveBatchDeviceAction,
+        lease: Weak<Cell<bool>>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.device_auth_in_progress
+            || self.public_form.batch.loading
+            || !lease.upgrade().is_some_and(|open| open.get())
+        {
+            return;
+        }
+        if self.selected_hardware_public_device_kind().is_some() {
+            self.public_form.batch.feedback = Some(Arc::from(
+                "Batch derivation is unavailable for hardware wallets",
+            ));
+            cx.notify();
+            return;
+        }
+        let error: Option<&str> = match action {
+            DeriveBatchDeviceAction::PreviewPage => {
+                let text = self
+                    .public_form
+                    .batch
+                    .page_input
+                    .read(cx)
+                    .value()
+                    .to_string();
+                if parse_browse_page(&text).is_none() {
+                    Some("Enter a valid page number (starting at 1)")
+                } else {
+                    None
+                }
+            }
+            DeriveBatchDeviceAction::AddSelected => {
+                let selected = self.public_form.batch.selected.len();
+                if selected == 0 {
+                    Some("Select at least one address to add")
+                } else if selected > MAX_DERIVED_ADDRESS_BATCH_COUNT as usize {
+                    Some("Select at most 100 addresses per batch")
+                } else {
+                    None
+                }
+            }
+            DeriveBatchDeviceAction::AddRange => {
+                let start_text = self
+                    .public_form
+                    .batch
+                    .range_start_input
+                    .read(cx)
+                    .value()
+                    .to_string();
+                let count_text = self
+                    .public_form
+                    .batch
+                    .range_count_input
+                    .read(cx)
+                    .value()
+                    .to_string();
+                match parse_range_inputs(&start_text, &count_text) {
+                    Ok(_) => None,
+                    Err(message) => Some(message),
+                }
+            }
+        };
+        if let Some(error) = error {
+            self.public_form.batch.feedback = Some(Arc::from(error));
+            cx.notify();
+            return;
+        }
+        let Some(prompt) = self.device_auth_prompt() else {
+            cx.notify();
+            return;
+        };
+        self.device_auth_in_progress = true;
+        self.public_form.batch.feedback = None;
+        let generation = self.active_wallet_generation;
+        cx.notify();
+        prompt.run(
+            method,
+            DEVICE_AUTH_REASON_PUBLIC_ACCOUNT,
+            window,
+            cx,
+            move |root, outcome, window, cx| {
+                root.finish_derive_batch_device_auth(
+                    action, &lease, generation, outcome, window, cx,
+                );
+            },
+        );
+    }
+
+    fn finish_derive_batch_device_auth(
+        &mut self,
+        action: DeriveBatchDeviceAction,
+        lease: &Weak<Cell<bool>>,
+        generation: u64,
+        outcome: DeviceAuthPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.device_auth_in_progress = false;
+        cx.notify();
+        if !lease.upgrade().is_some_and(|open| open.get())
+            || self.active_wallet_generation != generation
+        {
+            return;
+        }
+        match outcome {
+            DeviceAuthPassword::Password(password) => match action {
+                DeriveBatchDeviceAction::PreviewPage => {
+                    let text = self
+                        .public_form
+                        .batch
+                        .page_input
+                        .read(cx)
+                        .value()
+                        .to_string();
+                    let Some(page) = parse_browse_page(&text) else {
+                        self.public_form.batch.feedback =
+                            Some(Arc::from("Enter a valid page number (starting at 1)"));
+                        cx.notify();
+                        return;
+                    };
+                    self.public_form.batch.page = page;
+                    self.preview_derived_browse_page(Some(password), window, cx);
+                }
+                DeriveBatchDeviceAction::AddSelected => {
+                    self.add_selected_derived_addresses(Some(password), window, cx);
+                }
+                DeriveBatchDeviceAction::AddRange => {
+                    self.add_derived_address_range(Some(password), window, cx);
+                }
+            },
+            DeviceAuthPassword::Cancelled => {}
+            DeviceAuthPassword::Failed(message) => {
+                self.refresh_device_auth_status();
+                self.public_form.batch.feedback = Some(message);
+            }
+        }
+    }
+
+    /// Entry point for the Browse/Range buttons. Uses the typed password when
+    /// present; otherwise falls back to device authentication when it is set
+    /// up, so device-auth users are never forced to type the password.
+    pub(in crate::root) fn run_derive_batch_action(
+        &mut self,
+        action: DeriveBatchDeviceAction,
+        lease: Weak<Cell<bool>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let typed_empty = self
+            .public_form
+            .add_password_input
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty();
+        if typed_empty {
+            let method = self.device_auth_prompt_cached().and_then(|prompt| {
+                DeviceAuthMethod::ALL
+                    .iter()
+                    .copied()
+                    .find(|method| prompt.includes(*method))
+            });
+            if let Some(method) = method {
+                self.submit_derive_batch_with_device_auth(method, action, lease, window, cx);
+                return;
+            }
+        }
+        match action {
+            DeriveBatchDeviceAction::PreviewPage => {
+                self.goto_derived_browse_page_from_input(window, cx);
+            }
+            DeriveBatchDeviceAction::AddSelected => {
+                self.add_selected_derived_addresses(None, window, cx);
+            }
+            DeriveBatchDeviceAction::AddRange => {
+                self.add_derived_address_range(None, window, cx);
+            }
+        }
+    }
+
     pub(in crate::root) fn render_derive_mode_selector(
         &self,
         root: &Entity<Self>,
@@ -630,15 +849,15 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         content_width: Pixels,
+        lease: Weak<Cell<bool>>,
     ) -> impl IntoElement {
         let state = &self.public_form.batch;
         let loading = state.loading || self.public_form.adding_account;
+        let authenticating = self.device_auth_in_progress;
         let page = state.page;
         let page_start = page
             .checked_sub(1)
-            .and_then(|zero_based| {
-                zero_based.checked_mul(DERIVED_ADDRESS_BROWSE_PAGE_SIZE)
-            })
+            .and_then(|zero_based| zero_based.checked_mul(DERIVED_ADDRESS_BROWSE_PAGE_SIZE))
             .unwrap_or(0);
         let page_end = page_start
             .saturating_add(DERIVED_ADDRESS_BROWSE_PAGE_SIZE)
@@ -648,12 +867,17 @@ impl WalletRoot {
         let fully_selected = state.page_fully_selected();
 
         let prev_root = root.clone();
+        let prev_lease = lease.clone();
         let next_root = root.clone();
+        let next_lease = lease.clone();
         let go_root = root.clone();
+        let go_lease = lease.clone();
         let show_root = root.clone();
+        let show_lease = lease.clone();
         let select_all_root = root.clone();
         let clear_root = root.clone();
         let add_root = root.clone();
+        let add_lease = lease;
 
         let mut section = div()
             .w(content_width)
@@ -676,7 +900,16 @@ impl WalletRoot {
                             .on_click(move |_event, window, cx| {
                                 prev_root.update(cx, |root, cx| {
                                     let page = root.public_form.batch.page.saturating_sub(1).max(1);
-                                    root.goto_derived_browse_page(page, window, cx);
+                                    root.public_form.batch.page = page;
+                                    root.public_form.batch.page_input.update(cx, |input, cx| {
+                                        input.set_value(&page.to_string(), window, cx)
+                                    });
+                                    root.run_derive_batch_action(
+                                        DeriveBatchDeviceAction::PreviewPage,
+                                        prev_lease.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     )
@@ -699,7 +932,12 @@ impl WalletRoot {
                             .disabled(loading)
                             .on_click(move |_event, window, cx| {
                                 go_root.update(cx, |root, cx| {
-                                    root.goto_derived_browse_page_from_input(window, cx);
+                                    root.run_derive_batch_action(
+                                        DeriveBatchDeviceAction::PreviewPage,
+                                        go_lease.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     )
@@ -710,9 +948,17 @@ impl WalletRoot {
                             .disabled(loading)
                             .on_click(move |_event, window, cx| {
                                 next_root.update(cx, |root, cx| {
-                                    let page =
-                                        root.public_form.batch.page.saturating_add(1).max(1);
-                                    root.goto_derived_browse_page(page, window, cx);
+                                    let page = root.public_form.batch.page.saturating_add(1).max(1);
+                                    root.public_form.batch.page = page;
+                                    root.public_form.batch.page_input.update(cx, |input, cx| {
+                                        input.set_value(&page.to_string(), window, cx)
+                                    });
+                                    root.run_derive_batch_action(
+                                        DeriveBatchDeviceAction::PreviewPage,
+                                        next_lease.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     )
@@ -723,7 +969,12 @@ impl WalletRoot {
                             .disabled(loading)
                             .on_click(move |_event, window, cx| {
                                 show_root.update(cx, |root, cx| {
-                                    root.goto_derived_browse_page_from_input(window, cx);
+                                    root.run_derive_batch_action(
+                                        DeriveBatchDeviceAction::PreviewPage,
+                                        show_lease.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     ),
@@ -784,11 +1035,7 @@ impl WalletRoot {
                                     .font_family(APP_MONO_FONT_FAMILY),
                             ),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .child(app_muted_text(status).text_xs()),
-                        ),
+                        .child(div().flex_none().child(app_muted_text(status).text_xs())),
                 );
             }
             section = section.child(list);
@@ -835,19 +1082,20 @@ impl WalletRoot {
             .child(
                 app_button(
                     "wallet-public-derive-add-selected",
-                    if loading {
-                        "Adding…"
-                    } else {
-                        "Add selected"
-                    },
+                    if loading { "Adding…" } else { "Add selected" },
                 )
                 .primary()
                 .small()
                 .loading(loading)
-                .disabled(loading || selected_total == 0)
+                .disabled(loading || authenticating || selected_total == 0)
                 .on_click(move |_event, window, cx| {
                     add_root.update(cx, |root, cx| {
-                        root.add_selected_derived_addresses(None, window, cx);
+                        root.run_derive_batch_action(
+                            DeriveBatchDeviceAction::AddSelected,
+                            add_lease.clone(),
+                            window,
+                            cx,
+                        );
                     });
                 }),
             );
@@ -862,8 +1110,10 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         content_width: Pixels,
+        lease: Weak<Cell<bool>>,
     ) -> impl IntoElement {
         let loading = self.public_form.batch.loading || self.public_form.adding_account;
+        let authenticating = self.device_auth_in_progress;
         let add_root = root.clone();
         let mut section = div()
             .w(content_width)
@@ -907,10 +1157,15 @@ impl WalletRoot {
                 .primary()
                 .small()
                 .loading(loading)
-                .disabled(loading)
+                .disabled(loading || authenticating)
                 .on_click(move |_event, window, cx| {
                     add_root.update(cx, |root, cx| {
-                        root.add_derived_address_range(None, window, cx);
+                        root.run_derive_batch_action(
+                            DeriveBatchDeviceAction::AddRange,
+                            lease.clone(),
+                            window,
+                            cx,
+                        );
                     });
                 }),
             );

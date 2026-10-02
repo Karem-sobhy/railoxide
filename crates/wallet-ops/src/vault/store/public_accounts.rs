@@ -1,18 +1,18 @@
 use super::{
-    ConfirmedHardwarePublicAccount, DesktopVaultStore,
-    DesktopViewSession, EncryptedRecord, KEY_LEN, MAX_DERIVED_ADDRESS_BATCH_COUNT,
-    PUBLIC_ACCOUNT_METADATA_PREFIX, ProtectedSoftwareSeedSession, PublicAccountMetadata,
-    PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
-    SoftwareSeedSessionBinding, SpendGrant, VaultError, ViewUnlock, WalletSoftwareContextKind,
-    Zeroizing, derive_public_evm_address_from_entropy, derive_public_evm_address_from_seed,
-    derive_public_evm_private_key_from_entropy, derive_public_evm_private_key_from_seed,
-    ensure_public_account_address_available, generate_opaque_id, next_derived_public_account_index,
-    next_public_account_display_order, next_public_account_label_number,
-    normalize_public_account_label, parse_public_evm_private_key, public_account_default_label,
-    public_account_metadata_record_entry, public_account_metadata_record_key,
-    public_account_secret_record_entry, public_account_secret_record_key,
-    public_evm_address_from_private_key, sort_public_account_metadata, unlock_spend, unlock_view,
-    validate_derived_address_page, validate_derived_address_range, wallet_spend_record_key,
+    ConfirmedHardwarePublicAccount, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
+    KEY_LEN, MAX_DERIVED_ADDRESS_BATCH_COUNT, PUBLIC_ACCOUNT_METADATA_PREFIX,
+    ProtectedSoftwareSeedSession, PublicAccountMetadata, PublicAccountScope, PublicAccountSecret,
+    PublicAccountSource, PublicAccountStatus, SoftwareSeedSessionBinding, SpendGrant, VaultError,
+    ViewUnlock, WalletSoftwareContextKind, Zeroizing, derive_public_evm_address_from_entropy,
+    derive_public_evm_address_from_seed, derive_public_evm_private_key_from_entropy,
+    derive_public_evm_private_key_from_seed, ensure_public_account_address_available,
+    generate_opaque_id, next_derived_public_account_index, next_public_account_display_order,
+    next_public_account_label_number, normalize_public_account_label, parse_public_evm_private_key,
+    public_account_default_label, public_account_metadata_record_entry,
+    public_account_metadata_record_key, public_account_secret_record_entry,
+    public_account_secret_record_key, public_evm_address_from_private_key,
+    sort_public_account_metadata, unlock_spend, unlock_view, validate_derived_address_page,
+    validate_derived_address_range, wallet_spend_record_key,
 };
 use alloy::primitives::Address;
 use std::collections::BTreeSet;
@@ -218,14 +218,11 @@ impl DesktopVaultStore {
                 indexes
                     .iter()
                     .map(|index| {
-                        derive_public_evm_address_from_entropy(
-                            &spend_bundle.bip39_entropy,
-                            *index,
-                        )
-                        .map(|address| DerivedAddressPreview {
-                            derivation_index: *index,
-                            address,
-                        })
+                        derive_public_evm_address_from_entropy(&spend_bundle.bip39_entropy, *index)
+                            .map(|address| DerivedAddressPreview {
+                                derivation_index: *index,
+                                address,
+                            })
                     })
                     .collect()
             }

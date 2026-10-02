@@ -735,8 +735,7 @@ pub fn validate_derived_address_range(start: u32, count: u32) -> Result<Vec<u32>
             MAX_DERIVED_ADDRESS_BATCH_COUNT,
         ));
     }
-    derived_address_range_indexes(start, count)
-        .ok_or(VaultError::InvalidDerivedAddressRange)
+    derived_address_range_indexes(start, count).ok_or(VaultError::InvalidDerivedAddressRange)
 }
 
 /// Validated form of [`derived_address_page_indexes`] with descriptive errors.

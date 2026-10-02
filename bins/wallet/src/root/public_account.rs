@@ -45,11 +45,11 @@ pub(super) mod list;
 mod qr;
 mod types;
 
+pub(super) use batch::default_derive_batch_state;
 pub(super) use components::{
     next_public_account_label_number, public_account_display_label, public_account_matches_search,
     public_account_source_label,
 };
-pub(super) use batch::{default_derive_batch_state};
 #[cfg(feature = "hardware")]
 use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
 pub(super) use hardware::{
@@ -1581,11 +1581,8 @@ impl WalletRoot {
                                 ),
                             ))
                             .children(self.public_form.error.as_ref().map(|message| {
-                                Alert::error(
-                                    "wallet-public-add-derived-error",
-                                    message.to_string(),
-                                )
-                                .small()
+                                Alert::error("wallet-public-add-derived-error", message.to_string())
+                                    .small()
                             }))
                             .child(
                                 app_button(
@@ -1600,45 +1597,62 @@ impl WalletRoot {
                                 .small()
                                 .loading(self.public_form.adding_account)
                                 .disabled(
-                                    self.public_form.adding_account
-                                        || self.device_auth_in_progress,
+                                    self.public_form.adding_account || self.device_auth_in_progress,
                                 )
-                                .on_click(move |_event, window, cx| {
-                                    single_root.update(cx, |root, cx| {
-                                        root.add_public_derived_account_from_input(window, cx);
-                                    });
-                                }),
+                                .on_click(
+                                    move |_event, window, cx| {
+                                        single_root.update(cx, |root, cx| {
+                                            root.add_public_derived_account_from_input(window, cx);
+                                        });
+                                    },
+                                ),
                             );
                     }
                     batch::DeriveAccountMode::Browse => {
                         content = content
-                            .child(app_masked_input(
+                            .child(masked_input_with_device_auth(
                                 &self.public_form.add_password_input,
                                 self.device_auth_in_progress,
+                                self.derive_batch_device_auth_buttons(
+                                    add_root.clone(),
+                                    batch::DeriveBatchDeviceAction::PreviewPage,
+                                    "wallet-public-derive-browse-touch-id",
+                                    self.public_form.batch.loading,
+                                    device_auth_lease.clone(),
+                                ),
                             ))
                             .children(self.public_form.error.as_ref().map(|message| {
-                                Alert::error(
-                                    "wallet-public-add-derived-error",
-                                    message.to_string(),
-                                )
-                                .small()
+                                Alert::error("wallet-public-add-derived-error", message.to_string())
+                                    .small()
                             }))
-                            .child(self.render_derive_browse_section(&add_root, content_width));
+                            .child(self.render_derive_browse_section(
+                                &add_root,
+                                content_width,
+                                device_auth_lease.clone(),
+                            ));
                     }
                     batch::DeriveAccountMode::Range => {
                         content = content
-                            .child(app_masked_input(
+                            .child(masked_input_with_device_auth(
                                 &self.public_form.add_password_input,
                                 self.device_auth_in_progress,
+                                self.derive_batch_device_auth_buttons(
+                                    add_root.clone(),
+                                    batch::DeriveBatchDeviceAction::AddRange,
+                                    "wallet-public-derive-range-touch-id",
+                                    self.public_form.batch.loading,
+                                    device_auth_lease.clone(),
+                                ),
                             ))
                             .children(self.public_form.error.as_ref().map(|message| {
-                                Alert::error(
-                                    "wallet-public-add-derived-error",
-                                    message.to_string(),
-                                )
-                                .small()
+                                Alert::error("wallet-public-add-derived-error", message.to_string())
+                                    .small()
                             }))
-                            .child(self.render_derive_range_section(&add_root, content_width));
+                            .child(self.render_derive_range_section(
+                                &add_root,
+                                content_width,
+                                device_auth_lease.clone(),
+                            ));
                     }
                 }
                 content

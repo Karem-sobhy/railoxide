@@ -69,8 +69,7 @@ fn derived_range_rejects_overflow_past_index_ceiling() {
     ));
     // A single index at the ceiling is fine.
     assert_eq!(
-        validate_derived_address_range(MAX_DERIVED_ADDRESS_INDEX, 1)
-            .expect("ceiling index"),
+        validate_derived_address_range(MAX_DERIVED_ADDRESS_INDEX, 1).expect("ceiling index"),
         vec![MAX_DERIVED_ADDRESS_INDEX]
     );
 }
@@ -94,9 +93,12 @@ fn preview_page_matches_sequential_derivation() {
     let page = preview_page(&store, &view_session, 1);
     assert_eq!(page.len(), 20);
     for (offset, preview) in page.iter().enumerate() {
-        let expected =
-            derive_public_evm_address_from_mnemonic_with_passphrase(TEST_MNEMONIC, "", offset as u32)
-                .expect("expected address");
+        let expected = derive_public_evm_address_from_mnemonic_with_passphrase(
+            TEST_MNEMONIC,
+            "",
+            offset as u32,
+        )
+        .expect("expected address");
         assert_eq!(preview.derivation_index, offset as u32);
         assert_eq!(preview.address, expected);
     }
@@ -258,10 +260,7 @@ fn batch_add_rejects_invalid_ranges() {
             MAX_DERIVED_ADDRESS_BATCH_COUNT + 1,
             None
         ),
-        Err(
-            VaultError::InvalidDerivedAddressRange
-                | VaultError::DerivedAddressBatchTooLarge(_)
-        )
+        Err(VaultError::InvalidDerivedAddressRange | VaultError::DerivedAddressBatchTooLarge(_))
     ));
     assert!(
         store
